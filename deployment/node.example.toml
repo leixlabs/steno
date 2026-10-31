@@ -1,0 +1,100 @@
+# steno-node example configuration (split deployment).
+#
+# Install path: /etc/steno-monitor/node.toml
+# An alternative path can be passed as the only argument, or via the
+# STENO_NODE_CONFIG environment variable, which is how the systemd unit points at
+# the file.
+#
+# This binary only captures audio and sends it to a server. Recording, detection,
+# storage and the Portal all live there — see
+# docs/decisions/2026-10-29-split-deployment.md.
+
+[node]
+# Shown on the server's status page. Not used for routing.
+device_name = "bedroom"
+# Address of the machine running `steno-monitor` with `[source] kind = "net"`.
+server_host = "192.168.31.10"
+server_port = 8091
+# Must match `source.device_id` on the server once more than one node exists.
+# 0 makes the server accept whichever node announces itself first.
+device_id = 1
+# HELLO is repeated on this interval so a restarted server re-learns the format.
+# PCM is refused until a HELLO has been accepted, so keep this short.
+hello_interval_ms = 1000
+
+[audio]
+# ALSA card name. Empty means "use the only USB capture device"; with more than
+# one present, startup fails instead of guessing. A concrete example:
+alsa_device = "Razer Seiren, USB Audio"
+# A hint, not a demand. The node opens the device at its own default
+# configuration — the only rate ALSA guarantees — and converts to the wire format
+# (16 kHz mono) before anything is archived or sent. Asking for 16 kHz on a
+# microphone that only clocks at 48 kHz used to be accepted anyway: ALSA rounded
+# the rate silently and the node labelled 48 kHz stereo samples as 16 kHz mono,
+# which time-stretches every syllable by six and turns speech into rumble.
+# A rate below the device's minimum is only used when the device default cannot
+# be opened at all.
+preferred_rate_hz = 16000
+channels = 1
+# Rumble filter on the capture path, in Hz; 0 disables it. A condenser
+# microphone at high gain produces a floor that is almost entirely sub-250 Hz
+# airflow and preamp noise — measured at -33 dBFS on the bedside device, only a
+# few dB below speech, which leaves the recogniser nothing to work with. A
+# second-order high pass at 120 Hz drops that floor by 8 dB. Kept low enough that
+# a male fundamental survives: this is a rumble filter, not a telephone band.
+rumble_highpass_hz = 120
+# 20 ms periods keep one datagram per period: 640 B of PCM + a 32 B header, well
+# inside a 1500 B MTU. Raising this risks IP fragmentation on WiFi.
+period_ms = 20
+buffer_ms = 400
+# How much audio the node holds when the network stalls. This is a delay buffer,
+# not a recording buffer: audio that does not fit is dropped and the server
+# records a gap.
+capture_ring_ms = 500
+# Only used to bound the shutdown drain.
+shutdown_timeout_seconds = 10
+
+[archive]
+# The whole night, written on this device. Empty disables it.
+#
+# It exists because the uplink may deliberately stop sending while the room is
+# quiet ([gate] below). The product still promises a whole night, and once the
+# uplink gates the only place that can hold it is here — gating without this is
+# not "saving bandwidth", it is discarding audio and calling it policy, so the
+# node refuses to start with [gate] enabled and no dir.
+#
+# Put it on the USB stick, not the SD card: a night is about 900 MB at 16 kHz
+# mono, and SD writes wear out.
+dir = "/var/lib/steno-node/archive"
+# One file per ten minutes. A power cut can cost at most the open file, and the
+# header is patched every 30 s so even that stays playable.
+segment_seconds = 600
+# Ceiling for the whole directory; oldest files go first. ~20 GiB is about three
+# weeks of nights.
+max_bytes = 21474836480
+
+[gate]
+# Two states: sound opens the uplink, a long quiet closes it. While open every
+# block is sent, so an utterance or a conversation leaves as one contiguous run
+# instead of a spray of fragments. Off by default: it changes what the server
+# receives, and the archive is what makes it safe.
+enabled = false
+# How far above the ambient a block must sit to OPEN. Must stay *below* the
+# server's detector `noise_margin_db` (8 dB by default), or the gate could stay
+# closed through audio the detector would have called an event. 6 dB against
+# 8 dB is the pair that ships. Opening is deliberately jumpy: opening too easily
+# only costs bandwidth, opening too late hides the attack of the event.
+margin_db = 6.0
+# How long the room must stay QUIET before the uplink closes. This is the
+# unit-of-meaning knob, not a tail — measured on a real night, 2000 ms produced a
+# 2.1 s median fragment (one sentence cut into three), 20000 ms kept a turn
+# together while still closing during a real lull. The quiet spent waiting is
+# sent, attached to the run it belongs to, which is what keeps "嗯……" and the
+# pause after it in the same file.
+close_quiet_ms = 20000
+# Always send the first seconds of a session: the server needs them to anchor the
+# timeline and to learn the room's floor for itself.
+warmup_ms = 5000
+# Time constant of the ambient tracker. Long on purpose, so a passing snore
+# cannot drag the threshold up and gate the next one.
+floor_window_ms = 30000

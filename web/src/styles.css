@@ -1,0 +1,993 @@
+/* Control-centre UI: dark, low-glare, high information density.
+   The palette is deliberately narrow — one accent (amber) for the thing you can
+   act on, one positive (teal) for a healthy unit, one red for a unit that is
+   down — so a glance at the operational cards reads correctly without hunting
+   for legend text. */
+
+:root {
+  --bg: #0a0e13;
+  --panel: #111820;
+  --panel-2: #16202b;
+  --line: #1f2b38;
+  --text: #e8eef5;
+  --muted: #8494a5;
+  --accent: #f5a524;
+  --ok: #2dd4a7;
+  --warn: #f0b64b;
+  --danger: #f2705b;
+  --radius: 14px;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(1200px 600px at 20% -10%, #16212c 0%, var(--bg) 60%) no-repeat,
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 28px 24px 64px;
+}
+
+/* --- top bar ------------------------------------------------------------ */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
+  background: linear-gradient(150deg, var(--accent), #b46b12);
+  box-shadow: 0 6px 18px -8px rgba(245, 165, 36, 0.8);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.brand p {
+  margin: 3px 0 0;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.status-strip {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.chip i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.chip.ok i {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(45, 212, 167, 0.16);
+}
+
+.chip.warn i {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(240, 182, 75, 0.16);
+}
+
+.chip.muted {
+  color: var(--muted);
+}
+
+.chip.bad i {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(242, 112, 91, 0.16);
+}
+
+.chip.bad {
+  color: #ffb4a6;
+}
+
+/* Page switch. Two tabs, so a full segmented control would be heavier than the
+   content it navigates. The active one gets the accent underline and nothing
+   else moves. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.tabs button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 12px 6px;
+  border-radius: 8px;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+}
+
+.tabs button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.tabs button.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* --- console page -------------------------------------------------------- */
+
+/* The console ends with a pointer to the other page, because the two documents
+   are now separate: a reader who came here for the audio should not have to
+   guess that it moved. */
+.console-hint {
+  margin-top: 16px;
+  padding: 13px 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.console-hint p {
+  margin: 0;
+}
+
+.console-hint strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.console-hint a {
+  margin-left: 6px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.console-hint a:hover {
+  text-decoration: underline;
+}
+
+/* --- operational cards --------------------------------------------------- */
+
+.topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ops {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  margin: 20px 0 16px;
+}
+
+.card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent), var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 15px 17px 16px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.card-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.card-head .chip {
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+/* The unit name is metadata, not a title: monospace and dim so it does not
+   compete with the state chip beside it. */
+.card-unit {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  letter-spacing: 0.02em;
+}
+
+.facts.tight {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 10px;
+}
+
+.facts.tight div {
+  padding: 5px 0;
+}
+
+.card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.card-actions button {
+  flex: 1;
+  padding: 6px 8px;
+}
+
+.card-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.card-note.live {
+  color: #cfdae5;
+  font-style: italic;
+}
+
+.card-note.bad {
+  color: #ffb4a6;
+}
+
+.card-note code {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.ellipsis {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- storage pool -------------------------------------------------------- */
+
+.pool {
+  margin-bottom: 4px;
+}
+
+.meter {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: #0c1218;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  margin: 4px 0 14px;
+}
+
+.meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, #2f4a63, #3f6b8f);
+  transition: width 0.4s ease;
+}
+
+.meter-fill.pressure {
+  background: linear-gradient(90deg, #7a3d2c, var(--danger));
+}
+
+/* Where retention starts deleting. A tick, not a fill: it is a policy mark, not
+   a second quantity. */
+.meter-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(232, 238, 245, 0.45);
+}
+
+.pool-facts {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* --- launch parameters --------------------------------------------------- */
+
+.launch-panel {
+  margin-bottom: 4px;
+}
+
+.launch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.launch-item {
+  min-width: 0;
+}
+
+.launch-item h3 {
+  margin: 0 0 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The command line is the content here, so it gets its own surface: a wide,
+   scrollable code block is easier to read than a wrapped sentence. */
+.launch-line {
+  display: block;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border-radius: 8px;
+  background: #0c1218;
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: #cfdae5;
+  white-space: pre;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+/* One column, not two: these columns are a third of the page wide and a config
+   path needs the room. Two columns here wrapped the label to "配 / 置". */
+.launch-item .facts.tight {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.launch-item .facts.tight div {
+  padding: 4px 0;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.launch-item .facts.tight dt {
+  flex: none;
+  width: 34px;
+}
+
+/* --- banners ------------------------------------------------------------- */
+
+.banner {
+  margin: 4px 0 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.banner.error,
+.banner.bad {
+  background: rgba(242, 112, 91, 0.1);
+  border: 1px solid rgba(242, 112, 91, 0.35);
+  color: #ffb4a6;
+}
+
+.banner.ok {
+  background: rgba(45, 212, 167, 0.08);
+  border: 1px solid rgba(45, 212, 167, 0.3);
+  color: #a8f0dc;
+}
+
+.banner.warn {
+  background: rgba(240, 182, 75, 0.08);
+  border: 1px solid rgba(240, 182, 75, 0.32);
+  color: #f6d9a2;
+}
+
+/* --- day selector ------------------------------------------------------- */
+
+.daybar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 0;
+}
+
+input[type='date'] {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  color-scheme: dark;
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+button:hover:not(:disabled) {
+  border-color: #31485e;
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+}
+
+button.on {
+  background: rgba(245, 165, 36, 0.16);
+  border-color: rgba(245, 165, 36, 0.5);
+  color: #ffd08a;
+}
+
+.day-scroll {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-left: 6px;
+  scrollbar-width: thin;
+}
+
+.day-chip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 58px;
+  padding: 6px 8px;
+  background: transparent;
+  border-color: transparent;
+}
+
+.day-chip span {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.day-chip b {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.day-chip.active {
+  background: var(--panel);
+  border-color: #2b3d50;
+}
+
+.day-chip.active span {
+  color: var(--text);
+}
+
+/* --- layout ------------------------------------------------------------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  grid-template-areas:
+    'timeline detail'
+    'candidates detail';
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.timeline-panel {
+  grid-area: timeline;
+}
+
+.candidates-panel {
+  grid-area: candidates;
+}
+
+.detail-panel {
+  grid-area: detail;
+}
+
+.utterances-panel {
+  margin-bottom: 0;
+}
+
+.panel {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent), var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px 18px;
+  min-width: 0;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.panel-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.panel-head span {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.empty {
+  margin: 8px 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+/* --- timeline ----------------------------------------------------------- */
+
+.timeline {
+  padding-top: 4px;
+}
+
+.timeline-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+/* Axis labels and zoom controls share one row above the track: the labels are
+   what you zoom *into*, so they belong to the same band, not to the panel head. */
+.timeline-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 8px;
+}
+
+.timeline-zoom {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+
+.timeline-zoom button {
+  appearance: none;
+  min-width: 26px;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.timeline-zoom button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.timeline-zoom button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.timeline-zoom-label {
+  min-width: 46px;
+  text-align: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+/* The viewport. `overflow-x: auto` is what makes dragging and the scrollbar
+   work without a single line of scroll maths on our side. */
+.timeline-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-radius: 10px;
+  cursor: grab;
+  scrollbar-width: thin;
+  /* Keep a swipe from being interpreted as a page-back gesture on a trackpad. */
+  overscroll-behavior-x: contain;
+}
+
+.timeline-scroll.dragging {
+  cursor: grabbing;
+}
+
+/* Dragging must not select text inside the track. */
+.timeline-scroll.dragging,
+.timeline-scroll.dragging * {
+  user-select: none;
+}
+
+.timeline-track {
+  position: relative;
+  height: 54px;
+  border-radius: 10px;
+  background: #0c1218;
+  border: 1px solid var(--line);
+  /* No clipping: at high zoom the segment widths are already exact, and hiding
+     the overflow here would cut the last block at the viewport edge. */
+  box-sizing: border-box;
+}
+
+.timeline-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+}
+
+.segment {
+  position: absolute;
+  top: 22px;
+  height: 22px;
+  min-width: 2px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: #2a3d52;
+  cursor: pointer;
+}
+
+.segment.complete {
+  background: #2f4a63;
+}
+
+.segment.interrupted {
+  background: repeating-linear-gradient(
+    45deg,
+    #4a3a22,
+    #4a3a22 4px,
+    #3a2d1a 4px,
+    #3a2d1a 8px
+  );
+}
+
+.segment.selected {
+  background: var(--accent);
+  box-shadow: 0 0 0 1px rgba(245, 165, 36, 0.6), 0 0 16px -4px rgba(245, 165, 36, 0.7);
+}
+
+.tick {
+  position: absolute;
+  top: 8px;
+  width: 2px;
+  height: 10px;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0.85;
+}
+
+.tick.not_snore {
+  background: #46586b;
+}
+
+.tick.snore {
+  background: var(--ok);
+}
+
+/* --- events ------------------------------------------------------------- */
+
+.event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.event {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+}
+
+.event:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.event.snore {
+  border-color: rgba(45, 212, 167, 0.28);
+}
+
+.event.not_snore {
+  opacity: 0.55;
+}
+
+.event-time {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 66px;
+}
+
+.event-body {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.event-meta {
+  font-size: 12px;
+  color: #c2ced9;
+  font-variant-numeric: tabular-nums;
+}
+
+.event-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.event-actions button {
+  padding: 4px 9px;
+  font-size: 11px;
+}
+
+/* --- detail ------------------------------------------------------------- */
+
+.player {
+  width: 100%;
+  height: 34px;
+  margin-bottom: 14px;
+  filter: invert(0.92) hue-rotate(180deg) saturate(0.7);
+  border-radius: 8px;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+  margin: 0 0 16px;
+}
+
+.facts div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px dashed var(--line);
+}
+
+.facts dt {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'timeline'
+      'candidates'
+      'detail';
+  }
+  .pool-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .app {
+    padding: 20px 14px 48px;
+  }
+}
+
+/* --- streaming transcript ------------------------------------------------ */
+
+/* A transcript is read as prose, so it is one flowing passage rather than a list
+   of timestamped rows. Each phrase stays an inline element with its own title,
+   which is where the timestamps live. */
+.transcript {
+  font-size: 13.5px;
+  line-height: 1.85;
+  color: var(--text);
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.transcript-phrase + .transcript-phrase::before {
+  /* A thin space between phrases: the recogniser's phrases are consecutive
+     parts of one sentence, so a comma or a full stop would be an invention. */
+  content: ' ';
+}
+
+.transcript-live {
+  margin: 10px 0 0;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.transcript-live-mark {
+  display: inline-block;
+  margin-right: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(245, 165, 36, 0.14);
+  border: 1px solid rgba(245, 165, 36, 0.35);
+  color: var(--accent);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
+}
+
+/* The socket's own state. Small and quiet: it is a diagnostic line, not content,
+   but "no text yet" is ambiguous without it. */
+.stream-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.stream-note.bad {
+  color: #ffb4a6;
+}
+
+.stream-note.warn {
+  color: #ffcf8a;
+}
+
+.stream-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.stream-dot.live {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(45, 212, 167, 0.14);
+}
+
+.stream-dot.warn {
+  background: #f5a524;
+}
+
+.stream-dot.bad {
+  background: #f2705b;
+}
+
+.transcript-foot {
+  margin: 10px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.utterance-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.utterance {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.utterance:last-child {
+  border-bottom: none;
+}
+
+.utterance-time {
+  flex: none;
+  width: 62px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.utterance-text {
+  color: var(--text);
+}
+
+/* The phrase being recognised: dimmer, italic, and it disappears on its own. */
+.utterance.live .utterance-text {
+  color: var(--muted);
+  font-style: italic;
+}

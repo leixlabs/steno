@@ -1,0 +1,94 @@
+# systemd unit for steno-monitor (tasks.md T7.1, TECH_SPEC §10).
+#
+# Install to /etc/systemd/system/steno-monitor.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now steno-monitor
+#
+# The service never runs as root and has no ambient capabilities: it only opens
+# the ALSA capture device, its configuration file, the SQLite database and the
+# recordings directory. Everything else on the device stays unreadable to it.
+
+[Unit]
+Description=Steno whole-night recorder (capture, transcription, event review)
+# The recordings live on external storage. Requiring its mount makes systemd hold
+# this unit until the disk is actually mounted, instead of starting and silently
+# filling the root filesystem when the USB device has not appeared yet. The mount
+# unit name is derived from the mount point: replace `mnt-steno\x2dmonitor.mount`
+# if you use a different path (see README.md, "USB storage is not mounted").
+RequiresMountsFor=/mnt/steno-monitor
+After=local-fs.target sound.target network-online.target
+Wants=network-online.target
+# Crash-loop guard. These are unit-level settings: in a systemd older than 229
+# (Raspbian 10 ships 241) putting them in [Service] is silently ignored with
+# "Unknown lvalue ... in section 'Service'", which would let a failing unit
+# restart forever and hammer the storage.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Dedicated unprivileged account, created by the install steps in README.md:
+#   sudo useradd --system --home /var/lib/steno-monitor --shell /usr/sbin/nologin steno-monitor
+User=steno-monitor
+Group=steno-monitor
+# Never root, and no way to gain privileges later.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# The audio devices must remain visible for ALSA; do not enable PrivateDevices.
+ReadWritePaths=/mnt/steno-monitor
+
+# Configuration is passed explicitly rather than relying on the built-in default
+# path, so a deployment mistake is visible in `systemctl cat`.
+Environment=STENO_MONITOR_CONFIG=/etc/steno-monitor/config.toml
+# Refuse to start when the storage is not mounted: without this the service would
+# write recordings to the root filesystem under the (empty) mount point and lose
+# them on reboot. Failing loudly keeps the problem visible in `systemctl status`
+# and in the journal.
+#
+# `mountpoint --quiet` returns non-zero for "not a mount point" and for a missing
+# path alike, which is the right answer in both cases. Adjust the path if
+# `storage.recording_dir` in the configuration points somewhere else.
+#
+# It is invoked through `/bin/sh -c` instead of being named directly: `mountpoint`
+# lives in `/bin` on Debian/Raspbian (util-linux, merged-/usr or not) and in
+# `/usr/bin` elsewhere. A hard-coded `/usr/bin/mountpoint` made the unit fail with
+# status=203/EXEC on Raspbian 10 before the service was ever executed.
+ExecStartPre=/bin/sh -c 'mountpoint --quiet /mnt/steno-monitor'
+ExecStart=/usr/local/bin/steno-monitor
+
+# Files the service creates are group-readable at most; the recordings and the
+# database stay private to the service account.
+UMask=0027
+
+# stdout/stderr are captured by journald; the service logs no audio content
+# (TECH_SPEC §12).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=steno-monitor
+
+# Restart on any failure, but keep a crash loop visible instead of hammering the
+# storage: 5 attempts within 5 minutes, then stop and alert.
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM starts the orderly drain (stop capture, flush the recorder, finish
+# events, drain the database writer). shutdown_timeout_seconds in the config
+# bounds it; if it expires the current segment stays a recoverable .partial.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# The database directory is the only other writable location. systemd creates it
+# if the package did not, which keeps a fresh install working.
+StateDirectory=steno-monitor
+
+[Install]
+WantedBy=multi-user.target

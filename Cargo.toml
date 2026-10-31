@@ -1,34 +1,50 @@
-[package]
-name = "snore-monitor"
+[workspace]
+resolver = "3"
+members = [
+    "crates/lib",
+    "crates/server",
+    "crates/node",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-axum = "0.8.9"
+[workspace.dependencies]
+# --- DSP / audio -------------------------------------------------------------
 biquad = "0.6.0"
+cpal = "0.18.2"
+hound = "3.5.1"
+
+# --- data / config / time ----------------------------------------------------
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
-clap = { version = "4.6.7", features = ["derive"] }
-cpal = "0.18.2"
-futures-util = { version = "0.3.34", default-features = false }
-hound = "3.5.1"
-libc = "0.2.190"
-rusqlite = "0.40.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-thiserror = "2.0.21"
-tempfile = "3.23.0"
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "macros", "signal", "time", "fs", "io-util", "sync"] }
 toml = "1.1.8"
+
+# --- server ------------------------------------------------------------------
+# `ws` is not a default feature; the transcript stream needs the upgrade.
+axum = { version = "0.8.9", features = ["ws"] }
+rusqlite = "0.40.2"
+tokio = { version = "1.53.2", features = [
+    "rt-multi-thread",
+    "net",
+    "macros",
+    "signal",
+    "time",
+    "fs",
+    "io-util",
+    "sync",
+] }
+futures-util = { version = "0.3.34", default-features = false }
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.5"
+
+# --- misc --------------------------------------------------------------------
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.190"
+tempfile = "3.23.0"
+thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-[dev-dependencies]
-# Used by the HTTP API integration tests to drive the router in-process.
-http-body-util = "0.1.5"
-tower = { version = "0.5.3", features = ["util"] }
-
-[[bin]]
-name = "detect-wav"
-path = "src/bin/detect-wav.rs"
-required-features = []

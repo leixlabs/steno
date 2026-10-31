@@ -1,0 +1,219 @@
+# steno-monitor example configuration (TECH_SPEC §11).
+#
+# Install path: /etc/steno-monitor/config.toml
+# An alternative path can be selected with the STENO_MONITOR_CONFIG environment
+# variable, which is how the systemd unit and development runs point at a file.
+# The configuration is read once at startup; every change requires a restart.
+#
+# Validation is strict and field-level: an unknown key, a missing section or an
+# out-of-range value fails startup with the offending key named. There is no
+# silent fallback to another value (TECH_SPEC §11).
+# `tests/config_example.rs` parses and validates this exact file, so it cannot
+# drift away from the validator.
+#
+# Paths are absolute and deployment-specific: the defaults below assume the
+# recording directory is a separate USB storage mount. Adjust both paths on the
+# target device before starting the service.
+
+[server]
+# T0.1 decision: the shipped default listens on loopback only. Set 0.0.0.0 to
+# reach the Portal from a phone on the same trusted LAN — see the threat model
+# in README.md. Never expose this to the public internet.
+bind_address = "127.0.0.1"
+port = 8080
+# HTTP worker threads, 1-8. The audio path is separate and never waits on HTTP.
+http_threads = 2
+# IANA timezone used to turn ?date=YYYY-MM-DD into a UTC range. Empty means
+# "use the host's local timezone", which is the right choice for a single-home
+# deployment (T0.1 decision).
+timezone = ""
+# Directory holding the built UI (Vite `outDir`). Relative paths resolve against
+# the working directory; empty disables the UI and leaves only the JSON API.
+web_dir = "web/dist"
+
+[source]
+# Where audio comes from (docs/decisions/2026-10-29-split-deployment.md).
+#
+#   "alsa" — this process opens the microphone itself (single-box deployment,
+#            the default; nothing below this line is used).
+#   "net"  — a capture node (steno-node on a Pi, or an ESP32) streams PCM here
+#            over UDP and this process only records, detects and serves. The
+#            expected audio layout still comes from [audio]: the node must
+#            announce exactly `preferred_rate_hz` and `channels`, otherwise its
+#            audio is refused rather than reinterpreted.
+kind = "alsa"
+# Only for kind = "net". `0.0.0.0` is required for a node on another host;
+# loopback silently accepts nothing, so the feature would look broken.
+bind_address = "0.0.0.0"
+port = 8091
+# Node id to accept, 0 = accept the first node that announces itself. Set this
+# once more than one node exists, otherwise two bedrooms share one recording tree.
+device_id = 0
+# Reorder window: how long a missing sequence number is held before it is
+# declared lost. Larger tolerates more WiFi reordering at more latency.
+jitter_buffer_ms = 150
+# No packet for this long reports the node as disconnected on the status page.
+# It is also how "the bedroom device died overnight" becomes visible instead of
+# looking like a quiet night.
+idle_timeout_ms = 5000
+
+[audio]
+# ALSA card name. Empty means "use the only USB capture device"; if several are
+# present, startup fails instead of guessing. A concrete example:
+# alsa_device = "hw:1,0"
+alsa_device = ""
+# Requested capture rate. Must be one of 16000, 32000, 44100, 48000, 96000
+# (TECH_SPEC §5.1). If the device cannot deliver it, negotiation falls back to
+# 48 kHz then 44.1 kHz, and the actual rate is recorded per segment.
+preferred_rate_hz = 16000
+# 1 or 2 channels. The recorder always stores every channel; the detector
+# analyses only `mono_channel_index`.
+channels = 1
+# Rumble filter on the capture path, in Hz; 0 disables it. A condenser
+# microphone at high gain produces a floor that is almost entirely sub-250 Hz
+# airflow and preamp noise — measured at -33 dBFS on the bedside device, only a
+# few dB below speech, which leaves the recogniser nothing to work with. A
+# second-order high pass at 120 Hz drops that floor by 8 dB. Kept low enough that
+# a male fundamental survives: this is a rumble filter, not a telephone band.
+rumble_highpass_hz = 120
+# Only S16_LE is supported for capture and recording.
+format = "S16_LE"
+# ALSA period (callback block) and buffer sizes in milliseconds.
+period_ms = 10
+buffer_ms = 200
+# Segment rotation is by stored frame count, not on the hour: one hour at 16 kHz
+# mono. Must keep a segment below 4 GiB (rate x channels x 2 B x seconds).
+segment_duration_seconds = 3600
+# Channel the detector listens to; must be < channels.
+mono_channel_index = 0
+# SPSC capture ring size. Must be at least 2 periods, so is every queue below.
+capture_ring_ms = 500
+recording_queue_ms = 2000
+detection_queue_ms = 1000
+# A gap is registered only when adjacent block timestamps differ by more than
+# this; smaller jitter is normal ALSA behaviour.
+gap_tolerance_ms = 20
+# A single gap longer than this forces a segment rotation.
+gap_rotate_seconds = 5
+# How often the open WAV header is rewritten and fdatasync'd.
+header_flush_interval_seconds = 30
+# SIGTERM drain budget. On timeout the current recording is left as a .partial
+# for the startup recovery scan instead of being completed.
+shutdown_timeout_seconds = 10
+
+[detector]
+# Fixed at 16000 for the MVP; any other value is a validation error.
+detection_rate_hz = 16000
+# Frame length and hop. 10 ms at 16 kHz is 160 samples.
+frame_ms = 10
+# Snore band. Must stay below the 8 kHz Nyquist limit, with low < high.
+band_low_hz = 80.0
+band_high_hz = 1500.0
+# A frame is "active" when its level exceeds max(absolute_floor_dbfs,
+# noise_floor_dbfs + noise_margin_db).
+absolute_floor_dbfs = -50.0
+noise_margin_db = 8.0
+# A frame is "snore-like" when the energy in the band dominates and the band
+# level exceeds band_noise_floor_dbfs + band_margin_db.
+band_margin_db = 6.0
+band_ratio_min = 0.35
+# Noise-floor percentile estimator: window length, percentile (1-50) and the
+# number of frames before the floor is trusted (must be <= the window).
+noise_floor_window_seconds = 30
+noise_floor_percentile = 20
+noise_floor_min_seconds = 10
+# A gap longer than this clears the histograms and re-warms the floor.
+noise_floor_reset_gap_seconds = 60
+# A candidate freezes the histogram window; after this long it force-resumes so
+# a sustained noise source cannot pin the floor forever.
+noise_freeze_max_seconds = 30
+# Frames after a reset that do not count as hits, while the IIR chain settles.
+filter_warmup_ms = 100
+# Onset needs attack_min_hits hits inside the last attack_window_frames frames
+# (must satisfy 1 <= attack_min_hits <= attack_window_frames).
+attack_window_frames = 5
+attack_min_hits = 3
+# Consecutive non-hit frames that end a candidate (50 frames = 500 ms).
+hangover_frames = 50
+# Shortest event kept, measured after merging; shorter ones are discarded and
+# counted. Must be less than max_event_seconds * 1000.
+min_event_ms = 200
+# How long a finished candidate waits to merge with a following onset.
+merge_gap_ms = 800
+# A candidate this long is emitted and immediately restarted with continued=1.
+max_event_seconds = 15
+
+[stt]
+# Speech-to-text is off unless asked for: it is the only stage that hands audio
+# to another program. The Apple backend lives in apple-stt-sidecar and runs
+# `SpeechAnalyzer` on-device; it needs no permission grant (macOS 26+).
+enabled = false
+# How the recogniser is driven.
+#
+#   "stream"  — one long-lived sidecar fed over a Unix socket. Text appears while
+#               the person is still talking and no process is launched per
+#               segment. This is the default, and it needs `stream_command`.
+#   "segment" — the sidecar is run once per finished WAV. Simpler, restart-safe,
+#               but text only appears after the segment closes.
+#
+# Under "stream" the API's `stt.connected` is meaningful; under "segment" there
+# is no live channel, so `/status` reports `stt.state = "segment"` instead of
+# pretending the recogniser is disconnected.
+mode = "stream"
+# Launcher that starts the streaming sidecar with the socket path as its only
+# argument. `steno-stt-sidecar` is installed by
+# apple-stt-sidecar/install.sh; it goes through LaunchServices (`open -a`)
+# because that is the only way to start it and return immediately.
+stream_command = "steno-stt-sidecar"
+# Unix socket the sidecar connects back to. Empty derives it from the process id
+# (`$TMPDIR/steno-stt-<pid>.sock`), which is right for a single instance.
+socket_path = ""
+# Stored with each transcript so a mixed history stays readable. Rows recorded
+# before the SpeechAnalyzer migration say `apple-sfspeech`; this is the label for
+# new ones.
+engine = "apple-speechanalyzer"
+# Executable that takes the WAV path and prints one JSON object on stdout. Only
+# used when `mode = "segment"`; it is ignored by the streaming lane.
+command = "steno-stt-sidecar-file"
+args = []
+# Clips shorter than this are skipped: a 2-second clip rarely carries speech.
+min_segment_seconds = 3
+# The queue is the database, so a crash just resumes on the next pass.
+poll_interval_seconds = 20
+timeout_seconds = 120
+
+[control]
+# Service lifecycle control, used by the Portal's control centre to start, stop
+# and restart the two systemd units below.
+#
+# Off by default, and `enabled = true` is only accepted together with a loopback
+# `server.bind_address`: this is the one endpoint that changes machine state
+# instead of reporting it, the API has no authentication and no TLS, and a
+# start/stop endpoint reachable from the LAN would be an unauthenticated kill
+# switch for a device recording private audio.
+enabled = false
+# Only the systemctl CLI is used; nothing talks to D-Bus directly.
+systemctl_command = "systemctl"
+# Unit that runs this server (deployment/systemd/steno-monitor.service).
+server_unit = "steno-monitor"
+# Unit that runs the capture node (deployment/systemd/steno-node.service). On a split
+# deployment the node is on another host, so systemctl reports this unit as
+# unknown and the Portal says so rather than pretending it is controllable.
+node_unit = "steno-node"
+# A single systemctl invocation is killed after this long (1-120).
+timeout_seconds = 15
+
+[storage]
+# Both paths must be absolute. Put recording_dir on the USB storage and give the
+# service user write access to it; see README.md.
+recording_dir = "/mnt/steno-monitor/recordings"
+database_path = "/var/lib/steno-monitor/app.db"
+# Hard ceiling for recordings (20 GiB) and the target reached by deleting the
+# oldest complete segments (19 GiB); target must be less than max.
+recording_max_bytes = 21474836480
+recording_cleanup_target_bytes = 20401094656
+# Free-space floor kept for SQLite/OS work: 512 MiB.
+recording_reserve_bytes = 536870912
+# T0.1 decision: retention also runs periodically, not only at startup and when
+# a segment completes.
+retention_check_interval_seconds = 60

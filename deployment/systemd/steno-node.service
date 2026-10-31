@@ -1,0 +1,62 @@
+# systemd unit for steno-node, the capture-only half of the split deployment.
+#
+# Install to /etc/systemd/system/steno-node.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now steno-node
+#
+# This unit runs on the bedside device. It opens the microphone, sends PCM to the
+# server over UDP and does nothing else: no files, no database, no HTTP listener.
+# That is what makes it safe to put next to a bed and cheap to replace.
+
+[Unit]
+Description=Steno capture node (microphone to server over UDP)
+After=local-fs.target sound.target network-online.target
+Wants=network-online.target
+# The node is useless without a working uplink, but it must not crash-loop when
+# the access point takes a while to come up after a power cut.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# The account must be in the `audio` group, otherwise ALSA hides every real
+# device and the process only sees the `null` plugin — which looks exactly like
+# "running but recording nothing":
+#   sudo useradd --system --home /var/lib/steno-node --shell /usr/sbin/nologin steno-node
+#   sudo usermod -aG audio steno-node
+User=steno-node
+Group=steno-node
+SupplementaryGroups=audio
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# The audio devices must remain visible for ALSA; do not enable PrivateDevices.
+
+Environment=STENO_NODE_CONFIG=/etc/steno-monitor/node.toml
+ExecStart=/usr/local/bin/steno-node
+
+UMask=0027
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=steno-node
+
+Restart=on-failure
+RestartSec=5s
+
+# SIGTERM stops the stream, drains the capture ring for up to a second so the
+# server keeps the tail of the recording, then exits.
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+StateDirectory=steno-node
+
+[Install]
+WantedBy=multi-user.target

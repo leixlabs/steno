@@ -1,0 +1,55 @@
+[package]
+name = "steno-lib"
+description = "Shared domain logic: DSP, detection, capture ring, wire protocol, configuration, and the offline analysis tools."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+biquad.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+cpal.workspace = true
+# `metrics.rs` reads `adjtimex` on Linux to report kernel clock discipline.
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+# Only the offline tools need these. They stay optional so the capture node —
+# the crate that is cross-compiled for a Pi 3B — never pays for a CLI parser or
+# a WAV reader it does not link.
+clap = { workspace = true, optional = true }
+hound = { workspace = true, optional = true }
+
+# Only the server needs a database; the node must never link SQLite.
+rusqlite = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables the SQLite-backed parts of the error type. The server turns this on.
+db = ["dep:rusqlite"]
+# Enables the offline analysis modules and binaries (detect-wav, steno-eval).
+tools = ["dep:clap", "dep:hound"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "detect-wav"
+path = "src/bin/detect-wav.rs"
+required-features = ["tools"]
+
+[[bin]]
+name = "steno-eval"
+path = "src/bin/steno-eval.rs"
+required-features = ["tools"]
+
+[[test]]
+name = "detect_wav"
+required-features = ["tools"]
+
+[[test]]
+name = "steno_eval"
+required-features = ["tools"]
