@@ -1,94 +1,200 @@
-// Wire: the only two edges this program has.
+// Wire: the byte-level contract with the Rust side. No policy lives here.
 //
-//   in  : [u32 LE length][i64 LE utc_ms][s16le mono 16 kHz PCM]
-//   out : one JSON object per line
+// ```text
+// offset size field
+//      0    2 magic       0x5352 ("SR")
+//      2    1 direction   0x00 Swift -> Rust, 0x01 Rust -> Swift
+//      3    1 msg type
+//      4    4 payload len  u32, big-endian
+//      8    N payload
+// ```
 //
-// Both directions are byte-level concerns and nothing else: no policy, no
-// buffering decisions, no retries. The framing is owned by the Rust side
-// (`crates/server/src/stt_stream.rs`), so it is spelled out here once and never
-// interpreted.
+// The header is fixed at 8 bytes and the length is explicit, so a byte stream
+// that arrives split across `read()` calls (half a packet) or glued together
+// (three packets in one read) still decodes to exact frames: the reader asks for
+// exactly 8 then exactly `len` bytes and can never consume the next frame's
+// header as payload.
+//
+// The header has no room for the recorder's clock, so the *audio* payload
+// carries it:
+//
+// ```text
+// audio  payload = [i64 BE utc_ms of the first sample][s16le mono 16 kHz PCM]
+// snore  payload = JSON  SnorePayload
+// text   payload = JSON  TranscriptPayload      (final or partial)
+// state  payload = JSON  SessionPayload
+// R->S control   = JSON  ControlPayload
+// R->S config    = JSON  ConfigPayload
+// ```
+//
+// `utc_ms` is the reason this is a payload field rather than a side channel:
+// timestamps are the recorder's, and this process never invents one.
 
 import Foundation
 
-/// Where diagnostics go. LaunchServices swallows stderr, so a file copy is the
-/// only way to see why a headless run did nothing.
-let logPath: String =
-    ProcessInfo.processInfo.environment["STENO_STT_LOG"] ?? "/tmp/steno-stt-sidecar.log"
-
-private let logLock = NSLock()
-
-func log(_ message: String) {
-    let line = "steno-stt-sidecar[\(getpid())]: \(message)\n"
-    guard let data = line.data(using: .utf8) else { return }
-    logLock.lock()
-    defer { logLock.unlock() }
-    FileHandle.standardError.write(data)
-    if let handle = FileHandle(forWritingAtPath: logPath) {
-        handle.seekToEndOfFile()
-        handle.write(data)
-        try? handle.close()
-    } else {
-        try? data.write(to: URL(fileURLWithPath: logPath))
-    }
+/// Which way a frame is travelling. Checked on receipt: an uplink frame arriving
+/// on the downlink is a protocol error, not something to shrug at.
+enum Direction: UInt8 {
+    case swiftToRust = 0x00
+    case rustToSwift = 0x01
 }
 
-/// One block of audio as it arrived: samples plus the wall clock of the first
-/// one. The clock is the recorder's, not ours — this process never invents a
-/// timestamp.
-struct AudioFrame {
-    let samples: [Int16]
-    let utcMs: Int64
+enum MsgType: UInt8 {
+    case audio = 0x01
+    case snore = 0x02
+    case transcript = 0x03
+    case session = 0x04
+    case control = 0x81
+    case config = 0x82
 }
 
 enum WireError: Error, CustomStringConvertible {
     case closed
-    case malformed(String)
+    case badMagic(UInt16)
+    case badDirection(UInt8)
+    case unknownType(UInt8)
+    case payloadTooLarge(UInt32)
+    case truncated(needed: Int, got: Int)
+    case emptyAudio
 
     var description: String {
         switch self {
-        case .closed: return "socket closed"
-        case .malformed(let detail): return "malformed frame: \(detail)"
+        case .closed: return "peer closed the stream"
+        case .badMagic(let value): return String(format: "bad magic 0x%04X, expected 0x%04X", value, Wire.magic)
+        case .badDirection(let value): return String(format: "unexpected direction 0x%02X", value)
+        case .unknownType(let value): return String(format: "unknown message type 0x%02X", value)
+        case .payloadTooLarge(let value): return "payload of \(value) bytes exceeds \(Wire.maxPayload)"
+        case .truncated(let needed, let got): return "truncated payload: need \(needed) bytes, got \(got)"
+        case .emptyAudio: return "audio payload carries no samples"
         }
     }
 }
 
-/// Reads frames off a connected socket. Blocking by design: one dedicated
-/// thread owns the read side, so a slow analyser can never stall the socket.
-struct FrameReader {
-    private let fd: Int32
+enum Wire {
+    static let magic: UInt16 = 0x5352
+    static let headerBytes = 8
+    /// 20 ms of 16 kHz mono s16 is 640 bytes; a whole second is 32 000. The cap
+    /// is deliberately far above both so a legitimate burst is never refused,
+    /// and low enough that a corrupt length cannot ask for a gigabyte.
+    static let maxPayload: UInt32 = 1 << 20
 
-    init(fd: Int32) { self.fd = fd }
-
-    mutating func next() throws -> AudioFrame? {
-        guard let header = readExactly(12) else { return nil }
-        let length = header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
-        let utcMs = header.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: Int64.self) }
-        let bytes = Int(UInt32(littleEndian: length))
-        guard bytes > 0, bytes < (1 << 20), bytes % 2 == 0 else {
-            throw WireError.malformed("length \(bytes)")
-        }
-        guard let payload = readExactly(bytes) else { throw WireError.closed }
-        var samples = [Int16](repeating: 0, count: bytes / 2)
-        payload.withUnsafeBytes { raw in
-            for index in 0..<samples.count {
-                samples[index] = Int16(bitPattern: UInt16(
-                    littleEndian: raw.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)))
-            }
-        }
-        return AudioFrame(samples: samples, utcMs: Int64(littleEndian: utcMs))
+    static func header(direction: Direction, type: MsgType, length: Int) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: headerBytes)
+        bytes[0] = UInt8(magic >> 8)
+        bytes[1] = UInt8(magic & 0xff)
+        bytes[2] = direction.rawValue
+        bytes[3] = type.rawValue
+        let value = UInt32(length)
+        bytes[4] = UInt8((value >> 24) & 0xff)
+        bytes[5] = UInt8((value >> 16) & 0xff)
+        bytes[6] = UInt8((value >> 8) & 0xff)
+        bytes[7] = UInt8(value & 0xff)
+        return bytes
     }
 
-    /// Nil means the peer closed the connection mid-read: the session is over,
-    /// not broken.
+    static func parseHeader(_ bytes: [UInt8]) throws -> (Direction, MsgType, Int) {
+        guard bytes.count == headerBytes else {
+            throw WireError.truncated(needed: headerBytes, got: bytes.count)
+        }
+        let magic = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+        guard magic == Wire.magic else { throw WireError.badMagic(magic) }
+        guard let direction = Direction(rawValue: bytes[2]) else {
+            throw WireError.badDirection(bytes[2])
+        }
+        guard let type = MsgType(rawValue: bytes[3]) else {
+            throw WireError.unknownType(bytes[3])
+        }
+        let length = UInt32(bytes[4]) << 24 | UInt32(bytes[5]) << 16 | UInt32(bytes[6]) << 8 | UInt32(bytes[7])
+        guard length <= maxPayload else { throw WireError.payloadTooLarge(length) }
+        return (direction, type, Int(length))
+    }
+}
+
+/// One decoded frame, still as bytes: turning a payload into a message is the
+/// caller's job, because what a payload means depends on who sent it.
+struct Frame {
+    let direction: Direction
+    let type: MsgType
+    let payload: [UInt8]
+}
+
+/// A full-duplex byte channel over two file descriptors (a connected Unix
+/// socket, or stdin/stdout under `--stdio`).
+///
+/// Reads block: one dedicated thread owns the read direction, which is what
+/// makes a slow analyser unable to stall the wire. Writes take a lock because
+/// the results task and the audio thread can both have something to say.
+final class FrameChannel {
+    private let fdIn: Int32
+    private let fdOut: Int32
+    private let writeLock = NSLock()
+    private(set) var bytesIn = 0
+    private(set) var framesIn = 0
+
+    init(fdIn: Int32, fdOut: Int32) {
+        self.fdIn = fdIn
+        self.fdOut = fdOut
+    }
+
+    /// Nil means the peer closed between frames: the session is over, not broken.
+    func next() throws -> Frame? {
+        guard let header = readExactly(Wire.headerBytes) else { return nil }
+        let (direction, type, length) = try Wire.parseHeader(header)
+        var payload: [UInt8] = []
+        if length > 0 {
+            guard let body = readExactly(length) else { throw WireError.closed }
+            payload = body
+        }
+        bytesIn += Wire.headerBytes + length
+        framesIn += 1
+        return Frame(direction: direction, type: type, payload: payload)
+    }
+
+    /// Ends the read direction without touching writes.
+    ///
+    /// `control: stop` wants the session to drain and still be able to send its
+    /// last finals, so the reader is unblocked (`read` returns 0) while the
+    /// write half stays open.
+    func shutdownRead() {
+        _ = Darwin.shutdown(fdIn, SHUT_RD)
+    }
+
+    /// Returns false when the peer is gone; the caller then ends the session
+    /// rather than writing into a dead pipe for the rest of the night.
+    @discardableResult
+    func send(type: MsgType, payload: [UInt8]) -> Bool {
+        var bytes = Wire.header(direction: .swiftToRust, type: type, length: payload.count)
+        bytes.append(contentsOf: payload)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return write(bytes: bytes)
+    }
+
+    private func write(bytes data: [UInt8]) -> Bool {
+        var written = 0
+        while written < data.count {
+            let count = data.withUnsafeBytes { pointer -> Int in
+                guard let base = pointer.baseAddress else { return 0 }
+                return Darwin.write(fdOut, base.advanced(by: written), data.count - written)
+            }
+            if count <= 0 {
+                if errno == EINTR { continue }
+                return false
+            }
+            written += count
+        }
+        return true
+    }
+
     private func readExactly(_ count: Int) -> [UInt8]? {
         var buffer = [UInt8](repeating: 0, count: count)
         var filled = 0
         while filled < count {
             let read = buffer.withUnsafeMutableBytes { pointer -> Int in
                 guard let base = pointer.baseAddress else { return 0 }
-                return Darwin.read(fd, base.advanced(by: filled), count - filled)
+                return Darwin.read(fdIn, base.advanced(by: filled), count - filled)
             }
-            if read == 0 { return nil }
+            if read == 0 { return nil }  // clean EOF, even mid-frame
             if read < 0 {
                 if errno == EINTR { continue }
                 return nil
@@ -99,100 +205,148 @@ struct FrameReader {
     }
 }
 
-/// Writes JSON lines. Serialised because the results task and the audio thread
-/// can both have something to say.
-final class EventWriter {
-    private let fd: Int32
-    private let lock = NSLock()
-    private let encoder: JSONEncoder
+// MARK: - payload codecs
 
-    init(fd: Int32) {
-        self.fd = fd
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        self.encoder = encoder
+enum AudioPayload {
+    static let headerBytes = 8
+
+    /// `[i64 BE utc_ms][s16le …]`. Big-endian to match the frame header: one
+    /// endianness on the wire is one fewer thing to get wrong.
+    static func encode(samples: [Int16], utcMs: Int64) -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: headerBytes + samples.count * 2)
+        let value = UInt64(bitPattern: utcMs)
+        for index in 0..<8 {
+            bytes[index] = UInt8((value >> (56 - index * 8)) & 0xff)
+        }
+        var offset = headerBytes
+        for sample in samples {
+            let bits = UInt16(bitPattern: sample)
+            bytes[offset] = UInt8(bits & 0xff)
+            bytes[offset + 1] = UInt8(bits >> 8)
+            offset += 2
+        }
+        return bytes
     }
 
-    /// Returns false when the peer is gone; the caller then stops the session
-    /// rather than writing into a broken pipe for the rest of the night.
-    @discardableResult
-    func send(_ event: Event) -> Bool {
-        guard let data = try? encoder.encode(event) else {
-            log("cannot encode event \(event.type)")
-            return true
+    static func decode(_ payload: [UInt8]) throws -> (samples: [Int16], utcMs: Int64) {
+        guard payload.count > headerBytes else {
+            throw WireError.truncated(needed: headerBytes + 2, got: payload.count)
         }
-        var line = [UInt8](data)
-        line.append(0x0a)
-        lock.lock()
-        defer { lock.unlock() }
-        let ok = write(bytes: line)
-        if !ok { log("peer is gone (server stopped); closing after \(event.type)") }
-        return ok
-    }
-
-    private func write(bytes data: [UInt8]) -> Bool {
-        var written = 0
-        while written < data.count {
-            let count = data.withUnsafeBytes { pointer -> Int in
-                guard let base = pointer.baseAddress else { return 0 }
-                return Darwin.write(fd, base.advanced(by: written), data.count - written)
-            }
-            if count <= 0 {
-                if errno == EINTR { continue }
-                return false
-            }
-            written += count
+        var value: UInt64 = 0
+        for index in 0..<8 {
+            value = value << 8 | UInt64(payload[index])
         }
-        return true
+        let body = payload[headerBytes...]
+        guard body.count % 2 == 0 else {
+            throw WireError.truncated(needed: body.count + 1, got: body.count)
+        }
+        var samples = [Int16](repeating: 0, count: body.count / 2)
+        var offset = body.startIndex
+        for index in 0..<samples.count {
+            samples[index] = Int16(bitPattern: UInt16(body[offset]) | UInt16(body[offset + 1]) << 8)
+            offset += 2
+        }
+        guard !samples.isEmpty else { throw WireError.emptyAudio }
+        return (samples, Int64(bitPattern: value))
     }
 }
 
-/// One line on the wire. Field names are the contract with `HelperEvent` in
-/// `stt_stream.rs`; unknown fields there are ignored, missing ones become
-/// `None`, which is exactly what a partial or a state line needs.
-struct Event: Encodable {
-    let type: String
-    var text: String?
-    var start_ms: Int?
-    var end_ms: Int?
-    var segments: [Segment]?
-    var engine: String?
-    var language: String?
-    var message: String?
-    /// Only on `ready`, so the server can log which locale is really running.
-    var locale: String?
+// MARK: - messages
+//
+// Key names are the contract with `crates/server/src/sidecar_wire.rs`. Both
+// sides spell them in snake_case on the wire.
 
-    static func ready(engine: String, locale: String) -> Event {
-        Event(type: "ready", engine: engine, language: nil, locale: locale)
-    }
+struct SnorePayload: Encodable {
+    let startMs: Int64
+    let endMs: Int64
+    let label: String
+    let peak: Float
+    let mean: Float
+    let windows: Int
+    let threshold: Float
+    /// `"normal"` when the episode ended on its own, `"shutdown"` when the
+    /// session stopped mid-episode — the audio exists either way, so the row is
+    /// written either way, but the two must be distinguishable.
+    let endReason: String
+}
 
-    static func partial(_ text: String) -> Event {
-        Event(type: "partial", text: text)
-    }
+struct TranscriptPayload: Encodable {
+    /// `"final"` or `"partial"`.
+    let kind: String
+    let text: String
+    let startMs: Int64?
+    let endMs: Int64?
+    let engine: String?
+    let language: String?
+    let segments: [SegmentPayload]?
 
-    static func final(text: String, startMs: Int, endMs: Int, engine: String, language: String) -> Event {
-        Event(
-            type: "final",
-            text: text,
-            start_ms: startMs,
-            end_ms: endMs,
-            segments: [],
-            engine: engine,
-            language: language
+    static func final(text: String, startMs: Int64, endMs: Int64, engine: String, language: String) -> TranscriptPayload {
+        TranscriptPayload(
+            kind: "final", text: text, startMs: startMs, endMs: max(endMs, startMs),
+            engine: engine, language: language, segments: []
         )
     }
 
-    static func error(_ message: String) -> Event {
-        Event(type: "error", message: message)
+    static func partial(_ text: String) -> TranscriptPayload {
+        TranscriptPayload(
+            kind: "partial", text: text, startMs: nil, endMs: nil,
+            engine: nil, language: nil, segments: nil
+        )
     }
 }
 
-/// Per-word timing. `SpeechAnalyzer` hands back an attributed string whose runs
-/// carry `audioTimeRange`; when a caller asked for it we can fill this in, and
-/// when it did not the array stays empty rather than guessed.
-struct Segment: Encodable {
-    let start_ms: Int
-    let end_ms: Int
+struct SegmentPayload: Encodable {
+    let startMs: Int64
+    let endMs: Int64
     let text: String
-    let confidence: Float?
+}
+
+struct SessionPayload: Encodable {
+    /// `"ready"`, `"error"` or `"stopped"`.
+    let state: String
+    let engine: String?
+    let language: String?
+    let locale: String?
+    /// What the snore lane is actually doing: `"apple-soundanalysis-v1"`,
+    /// `"model:<name>"` or `null` when it is off. A string, not a bool, so the
+    /// transcript history can say which detector produced an annotation.
+    let snore: String?
+    let message: String?
+}
+
+struct ConfigPayload: Decodable {
+    let locale: String?
+    let preset: String?
+    let snore: Bool?
+    let snoreThreshold: Float?
+    let snoreWindow: Double?
+}
+
+struct ControlPayload: Decodable {
+    /// `"stop"`, `"flush"` or `"status"`.
+    let action: String
+}
+
+enum JSONPayload {
+    static let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return encoder
+    }()
+
+    static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
+    }()
+
+    static func encode<T: Encodable>(_ value: T) -> [UInt8]? {
+        guard let data = try? encoder.encode(value) else { return nil }
+        return [UInt8](data)
+    }
+
+    static func decode<T: Decodable>(_ type: T.Type, from payload: [UInt8]) throws -> T {
+        try decoder.decode(type, from: Data(payload))
+    }
 }

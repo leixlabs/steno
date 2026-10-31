@@ -211,6 +211,13 @@ struct Reported {
     capture_rate_hz: u32,
     channels: u16,
     sample_format: String,
+    /// What the microphone (or the node's microphone) actually runs at.
+    ///
+    /// Separate from `capture_rate_hz` on purpose: the recorded stream is
+    /// always the wire format, and an operator diagnosing a stretched
+    /// transcript needs the device's own rate next to it, not instead of it.
+    device_rate_hz: u32,
+    device_channels: u16,
     time_quality: Option<TimeQuality>,
     time_synced: bool,
     clock_drift_ppm: Option<f64>,
@@ -314,6 +321,15 @@ impl RuntimeStatus {
         }
     }
 
+    /// Reports the format the device negotiation actually settled on, as opposed
+    /// to the wire format the recording uses.
+    pub fn set_device_format(&self, rate_hz: u32, channels: u16) {
+        if let Ok(mut reported) = self.reported.lock() {
+            reported.device_rate_hz = rate_hz;
+            reported.device_channels = channels;
+        }
+    }
+
     /// Reports the timeline state (`time_quality`, `time_synced`, drift).
     pub fn set_time(&self, quality: Option<TimeQuality>, synced: bool, drift_ppm: Option<f64>) {
         if let Ok(mut reported) = self.reported.lock() {
@@ -371,8 +387,8 @@ impl HttpState {
         runtime: Arc<RuntimeStatus>,
     ) -> Self {
         runtime.seed_capture_format(
-            config.audio.preferred_rate_hz,
-            config.audio.channels,
+            steno_lib::config::WIRE_RATE_HZ,
+            steno_lib::config::WIRE_CHANNELS,
             config.audio.format.as_str(),
         );
         // `server.web_dir` is the single place the UI location is configured;
@@ -610,7 +626,15 @@ struct SttView {
     state: &'static str,
     connected: bool,
     engine: String,
+    /// The language the recogniser was told to listen for, from `[stt] locale`.
+    /// Reported next to the state because "ready" says nothing about whether it
+    /// is ready for the right language.
+    locale: String,
     finals_total: u64,
+    /// Snore episodes the sidecar's classifier reported and the server stored.
+    /// Separate from the detector's own `events_total`: two detectors annotate
+    /// the same audio, and a single count would hide which one found what.
+    snore_events_total: u64,
     dropped_blocks: u64,
     partial: Option<String>,
     error: Option<String>,
@@ -682,9 +706,14 @@ struct RecordingView {
 struct MicrophoneView {
     state: &'static str,
     device: String,
+    /// Format of what is being recorded: always the wire format.
     capture_rate_hz: u32,
     channels: u16,
     sample_format: String,
+    /// What the device itself runs at. `0` until it has been negotiated (or for
+    /// a network source, where the node reports its own device format).
+    device_rate_hz: u32,
+    device_channels: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -718,6 +747,11 @@ struct StorageView {
 
 #[derive(Debug, Serialize)]
 struct CaptureView {
+    /// Live level of the block that was dispatched last, in dBFS. `null` before
+    /// the first block: reporting 0 would read as "clipping", which is the
+    /// loudest possible claim and the least likely.
+    level_peak_dbfs: Option<f32>,
+    level_rms_dbfs: Option<f32>,
     xrun_count: u64,
     lost_frames_total: u64,
     capture_ring_overflow_frames: u64,
@@ -733,6 +767,13 @@ struct SourceView {
     kind: &'static str,
     /// Whether a capture node has announced itself and is still sending.
     node_connected: bool,
+    /// `ip:port` the newest datagram came from, or `null` before the first one.
+    ///
+    /// The protocol carries a device id, not an address, so this is the only
+    /// place the server records *which machine* is on the wire. It stays filled
+    /// after the node goes quiet on purpose: "who was talking to us, and how long
+    /// ago" is the question an operator asks when a node disappears.
+    peer: Option<String>,
     /// Wall clock of the newest datagram, or `null` before the first one. This
     /// is the heartbeat a client should show: `node_connected` says whether the
     /// node counts as present, this says how fresh the evidence is.
@@ -805,8 +846,16 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
     };
     let reported = state.runtime.reported();
     let degraded = metrics.degraded.load(Ordering::Relaxed);
+    let level = metrics.live_level();
+    // Four states, not two. `dead` is the one that matters most to an operator:
+    // audio is arriving, so every byte-level counter looks healthy, and the
+    // microphone is nonetheless hearing nothing. Reporting it as `ok` (the
+    // behaviour that made a silent capsule look like a working one) is worse than
+    // reporting nothing at all.
     let signal_state = if metrics.signal_silent.load(Ordering::Relaxed) {
         "silent"
+    } else if metrics.signal_dead.load(Ordering::Relaxed) {
+        "dead"
     } else if state.runtime.is_running() {
         "ok"
     } else {
@@ -833,6 +882,8 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                 capture_rate_hz: reported.capture_rate_hz,
                 channels: reported.channels,
                 sample_format: reported.sample_format,
+                device_rate_hz: reported.device_rate_hz,
+                device_channels: reported.device_channels,
             },
             detector: DetectorView {
                 state: metrics.detector_state().as_str(),
@@ -855,6 +906,8 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                 newest_ended_at_utc: pool.as_ref().and_then(|pool| pool.newest_ended_at_utc),
             },
             capture: CaptureView {
+                level_peak_dbfs: level.map(|(level, _)| level),
+                level_rms_dbfs: level.map(|(_, rms)| rms),
                 xrun_count: metrics.xrun_count.load(Ordering::Relaxed),
                 lost_frames_total: metrics.lost_frames_total.load(Ordering::Relaxed),
                 capture_ring_overflow_frames: metrics
@@ -869,6 +922,7 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
             source: SourceView {
                 kind: state.config.source.kind.as_str(),
                 node_connected: metrics.net_source_connected.load(Ordering::Relaxed),
+                peer: metrics.net_peer(),
                 last_packet_at_utc: metrics
                     .net_last_packet_unix_ms()
                     .and_then(DateTime::from_timestamp_millis),
@@ -914,7 +968,9 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                 state: stt_state(&state.config, metrics.stt_connected.load(Ordering::Relaxed), metrics.stt_error().as_deref()),
                 connected: metrics.stt_connected.load(Ordering::Relaxed),
                 engine: metrics.stt_engine(),
+                locale: state.config.stt.locale.clone(),
                 finals_total: metrics.stt_finals.load(Ordering::Relaxed),
+                snore_events_total: metrics.stt_snores.load(Ordering::Relaxed),
                 dropped_blocks: metrics.dropped_stt_blocks.load(Ordering::Relaxed),
                 partial: metrics.stt_partial(),
                 error: metrics.stt_error(),

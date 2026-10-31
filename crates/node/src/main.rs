@@ -267,17 +267,27 @@ fn load(path: &PathBuf) -> Result<Loaded, NodeError> {
             "node.hello_interval_ms must be within 100..=10000".into(),
         ));
     }
-    if !steno_lib::config::SUPPORTED_CAPTURE_RATES.contains(&file.audio.preferred_rate_hz) {
+    if !steno_lib::config::SUPPORTED_CAPTURE_RATES.contains(&file.audio.device_rate_hz) {
         return Err(NodeError::Config(format!(
-            "audio.preferred_rate_hz: must be one of {:?}, got {}",
+            "audio.device_rate_hz: must be one of {:?}, got {}; this is a hint for the device, the wire is fixed at {} Hz",
             steno_lib::config::SUPPORTED_CAPTURE_RATES,
-            file.audio.preferred_rate_hz
+            file.audio.device_rate_hz,
+            steno_lib::config::WIRE_RATE_HZ
         )));
     }
-    if !(1..=2).contains(&file.audio.channels) {
+    if !(1..=2).contains(&file.audio.device_channels) {
         return Err(NodeError::Config(format!(
-            "audio.channels: must be 1 or 2, got {}",
-            file.audio.channels
+            "audio.device_channels: must be 1 or 2, got {}",
+            file.audio.device_channels
+        )));
+    }
+    // Checked against the *configured* channel count here; the negotiated one is
+    // checked again before the first block is converted, because the device may
+    // open with fewer channels than asked for.
+    if file.audio.mono_channel_index >= file.audio.device_channels {
+        return Err(NodeError::Config(format!(
+            "audio.mono_channel_index: must be < audio.device_channels ({}), got {}",
+            file.audio.device_channels, file.audio.mono_channel_index
         )));
     }
     Ok(Loaded {
@@ -341,16 +351,25 @@ fn run() -> Result<(), NodeError> {
     let negotiated = selection.info.clone();
     // The device may only clock at 48 kHz stereo. Everything past this point —
     // the archive, the gate, the packets and therefore the server's recording,
-    // detector and recogniser — works in 16 kHz mono, so the conversion happens
-    // once, here, instead of being assumed away.
-    let converter = audio_capture::WireConverter::new(negotiated.rate_hz, negotiated.channels)
-        .map_err(|error| NodeError::Config(format!("capture format: {error}")))?;
+    // detector and recogniser — works in the wire format, so the conversion
+    // happens once, here, instead of being assumed away. The wire format is a
+    // constant shared with the server: it is not negotiated, not configured, and
+    // not allowed to differ, so there is nothing for the two machines to
+    // disagree about.
+    let converter = audio_capture::WireConverter::new(
+        negotiated.rate_hz,
+        negotiated.channels,
+        audio.mono_channel_index,
+    )
+    .map_err(|error| NodeError::Config(format!("capture format: {error}")))?;
     tracing::info!(
         device = %negotiated.device_name,
         device_rate_hz = negotiated.rate_hz,
         device_channels = negotiated.channels,
-        wire_rate_hz = audio_capture::WireConverter::RATE_HZ,
-        "capture device negotiated; the wire format is 16 kHz mono"
+        mono_channel_index = audio.mono_channel_index,
+        wire_rate_hz = steno_lib::config::WIRE_RATE_HZ,
+        wire_channels = steno_lib::config::WIRE_CHANNELS,
+        "capture device negotiated; the wire format is fixed"
     );
 
     // A condenser capsule at high gain is mostly rumble. Filtering it out here —
@@ -421,11 +440,12 @@ fn run() -> Result<(), NodeError> {
     let device_name = settings.device_name.clone();
     let device_id = settings.device_id;
     let hello_interval = Duration::from_millis(settings.hello_interval_ms);
-    // What travels on the wire, not what the device clocks at. HELLO has to
-    // describe the frames that follow it, or the server decodes a 48 kHz stereo
-    // stream as if it were 16 kHz mono.
-    let channels: u16 = 1;
-    let rate_hz = audio_capture::WireConverter::RATE_HZ;
+    // What travels on the wire, not what the device clocks at. HELLO still
+    // announces it — the server uses the announcement to refuse a node built
+    // against a different wire format — but the value is a constant on both
+    // sides rather than something either machine chooses.
+    let channels: u16 = steno_lib::config::WIRE_CHANNELS;
+    let rate_hz = steno_lib::config::WIRE_RATE_HZ;
     let device_channels = negotiated.channels;
     let device_rate_hz = negotiated.rate_hz;
     let session_id = new_session_id();
@@ -643,9 +663,10 @@ fn forward_capture(
         }
 
         // Device format in, wire format out. A block of 48 kHz stereo is
-        // downmixed and resampled here; everything below this line — the
-        // archive, the gate, the packet headers — is 16 kHz mono, which is what
-        // HELLO told the server to expect.
+        // reduced to one channel and resampled here; everything below this line
+        // — the archive, the gate, the packet headers — is the wire format, which
+        // is what HELLO announces and what every consumer on the other side
+        // assumes without being told again.
         let converted = converter.convert(&block);
         wire_scratch.clear();
         wire_scratch.extend_from_slice(converted);

@@ -28,8 +28,8 @@ fn the_example_configuration_parses_and_validates() {
     assert_eq!(config.server.timezone, "");
 
     assert_eq!(config.audio.alsa_device, "");
-    assert_eq!(config.audio.preferred_rate_hz, 16_000);
-    assert_eq!(config.audio.channels, 1);
+    assert_eq!(config.audio.device_rate_hz, 16_000);
+    assert_eq!(config.audio.device_channels, 1);
     assert_eq!(config.audio.format.as_str(), "S16_LE");
     assert_eq!(config.audio.mono_channel_index, 0);
     assert_eq!(config.audio.segment_duration_seconds, 3_600);
@@ -70,8 +70,8 @@ fn the_example_configuration_is_safe_for_the_documented_deployment() {
     let config = Config::from_toml_str(&text).unwrap();
     assert!(config.storage.recording_dir.is_absolute());
     assert!(config.storage.database_path.is_absolute());
-    assert!(SUPPORTED_CAPTURE_RATES.contains(&config.audio.preferred_rate_hz));
-    assert!(config.audio.mono_channel_index < config.audio.channels);
+    assert!(SUPPORTED_CAPTURE_RATES.contains(&config.audio.device_rate_hz));
+    assert!(config.audio.mono_channel_index < config.audio.device_channels);
     assert!(config.detector.attack_min_hits <= config.detector.attack_window_frames);
     assert!(
         u64::from(config.detector.max_event_seconds) * 1000

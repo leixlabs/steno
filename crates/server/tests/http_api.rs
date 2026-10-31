@@ -365,7 +365,11 @@ async fn status_reflects_metrics_and_supervisor_reports() {
     harness.runtime.set_recording(RecordingState::Stopped);
     harness.runtime.set_microphone(MicrophoneState::Disconnected);
     harness.runtime.set_device("USB PnP Sound Device");
-    harness.runtime.set_capture_format(48_000, 2, "S16_LE");
+    // The recording format and the device format are two different facts now:
+    // the status page has to report both, or a converted device would look like
+    // it was recorded at its own rate.
+    harness.runtime.set_capture_format(16_000, 1, "S16_LE");
+    harness.runtime.set_device_format(48_000, 2);
     harness
         .runtime
         .set_time(Some(TimeQuality::Corrected), true, Some(4.25));
@@ -389,8 +393,10 @@ async fn status_reflects_metrics_and_supervisor_reports() {
     assert_eq!(body["recording"]["state"], "stopped");
     assert_eq!(body["microphone"]["state"], "disconnected");
     assert_eq!(body["microphone"]["device"], "USB PnP Sound Device");
-    assert_eq!(body["microphone"]["capture_rate_hz"], 48_000);
-    assert_eq!(body["microphone"]["channels"], 2);
+    assert_eq!(body["microphone"]["capture_rate_hz"], 16_000);
+    assert_eq!(body["microphone"]["channels"], 1);
+    assert_eq!(body["microphone"]["device_rate_hz"], 48_000);
+    assert_eq!(body["microphone"]["device_channels"], 2);
     assert_eq!(body["detector"]["noise_floor_dbfs"], -63.5);
     assert_eq!(body["detector"]["band_noise_floor_dbfs"], -70.25);
     assert_eq!(body["detector"]["events_total"], 9);
@@ -409,6 +415,14 @@ async fn status_reflects_metrics_and_supervisor_reports() {
     harness.metrics.signal_silent.store(true, Ordering::Relaxed);
     let body = get(&harness, "/api/v1/status").await.json();
     assert_eq!(body["signal_state"], "silent");
+
+    // A muted capsule: audio arrives, so `signal_silent` is false, and the
+    // microphone is nonetheless hearing nothing. Reporting `ok` here is what
+    // let a dead input look healthy, so `dead` has to be its own state.
+    harness.metrics.signal_silent.store(false, Ordering::Relaxed);
+    harness.metrics.signal_dead.store(true, Ordering::Relaxed);
+    let body = get(&harness, "/api/v1/status").await.json();
+    assert_eq!(body["signal_state"], "dead");
 }
 
 #[tokio::test]

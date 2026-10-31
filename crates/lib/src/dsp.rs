@@ -281,6 +281,42 @@ impl FrameBuilder {
     }
 }
 
+/// Level of one block, for the live view: what an operator needs to answer "is
+/// the microphone still hearing anything".
+///
+/// Peak and RMS together because they fail differently: a stuck preamp shows a
+/// flat RMS and a jittery peak, a muted device shows the floor on both. Neither
+/// number is stored — this is a display value, recomputed per block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockLevel {
+    pub peak_dbfs: f32,
+    pub rms_dbfs: f32,
+}
+
+/// Measures one block of interleaved S16 samples in dBFS, floored at -120.
+pub fn block_level(samples: &[i16]) -> BlockLevel {
+    if samples.is_empty() {
+        return BlockLevel {
+            peak_dbfs: DBFS_FLOOR,
+            rms_dbfs: DBFS_FLOOR,
+        };
+    }
+    let mut peak: f32 = 0.0;
+    let mut energy: f32 = 0.0;
+    for sample in samples {
+        let value = f32::from(*sample) / 32_768.0;
+        let magnitude = value.abs();
+        if magnitude > peak {
+            peak = magnitude;
+        }
+        energy += value * value;
+    }
+    BlockLevel {
+        peak_dbfs: (20.0 * peak.max(RMS_FLOOR).log10()).max(DBFS_FLOOR),
+        rms_dbfs: dbfs_from_energy(energy, samples.len()),
+    }
+}
+
 /// `20 * log10(max(rms, 1e-6))`, i.e. a -120 dBFS floor (TECH_SPEC §5.2).
 fn dbfs_from_energy(energy: f32, samples: usize) -> f32 {
     let rms = (energy / samples as f32).sqrt();

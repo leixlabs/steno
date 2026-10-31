@@ -11,9 +11,12 @@ import type { ControlAction, ControlTarget, Status, Tone } from './api'
 export function CardHead({
   title,
   state,
+  meta,
 }: {
   title: string
   state: { text: string; tone: Tone }
+  /** Right-aligned monospace detail: a unit name, an address. Not a metric. */
+  meta?: { text: string; title: string }
 }) {
   return (
     <div className="card-head">
@@ -21,6 +24,11 @@ export function CardHead({
       <span className={`chip ${toneClass(state.tone)}`}>
         <i /> {state.text}
       </span>
+      {meta && (
+        <span className="card-unit" title={meta.title}>
+          {meta.text}
+        </span>
+      )}
     </div>
   )
 }

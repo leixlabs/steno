@@ -44,11 +44,12 @@
 
 use chrono::Utc;
 use steno_lib::audio_capture::{CaptureMeta, CaptureRing};
+use steno_lib::config::{WIRE_CHANNELS, WIRE_RATE_HZ};
 use steno_lib::metrics::Metrics;
 use steno_lib::protocol::{self, Header, Hello, Kind, ProtocolError};
 use steno_lib::timeline::monotonic_now_ns;
 use std::io;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -70,11 +71,6 @@ pub struct NetCaptureConfig {
     pub port: u16,
     /// Expected node id. `0` accepts the first node that says HELLO.
     pub device_id: u32,
-    /// Announced format the server will accept. Anything else is refused rather
-    /// than silently reinterpreted, matching the project's "no silent fallback"
-    /// rule (TECH_SPEC §11).
-    pub rate_hz: u32,
-    pub channels: u16,
     pub jitter_buffer_ms: u32,
     /// No packet for this long marks the source connected = false.
     pub idle_timeout_ms: u32,
@@ -86,8 +82,6 @@ impl Default for NetCaptureConfig {
             bind_address: "0.0.0.0".to_string(),
             port: 8091,
             device_id: 0,
-            rate_hz: 16_000,
-            channels: 1,
             jitter_buffer_ms: 150,
             idle_timeout_ms: 5_000,
         }
@@ -171,6 +165,9 @@ struct Receiver {
     last_packet_ns: u64,
     generation_counter: u32,
     idle_reported: bool,
+    /// Last peer address handed to the metrics. Kept here so the (mutex-backed)
+    /// status field is written when the source changes rather than per packet.
+    peer: Option<SocketAddr>,
 }
 
 impl Receiver {
@@ -194,6 +191,7 @@ impl Receiver {
             last_packet_ns: monotonic_now_ns(),
             generation_counter: 0,
             idle_reported: false,
+            peer: None,
         })
     }
 
@@ -202,8 +200,16 @@ impl Receiver {
         let mut samples: Vec<i16> = Vec::with_capacity(protocol::MAX_PCM_PAYLOAD_BYTES / 2);
         while !stop.load(Ordering::Relaxed) {
             match self.socket.recv_from(&mut buffer) {
-                Ok((len, _from)) => {
+                Ok((len, from)) => {
                     let now = monotonic_now_ns();
+                    // The node's address is the one fact the wire protocol does
+                    // not carry, so it is taken from the socket. Written only
+                    // when it changes: a node keeps one socket for a session,
+                    // and this field is behind a mutex.
+                    if self.peer != Some(from) {
+                        self.peer = Some(from);
+                        self.metrics.set_net_peer(from.to_string());
+                    }
                     self.metrics.net_packets_received.fetch_add(1, Ordering::Relaxed);
                     self.metrics.note_net_packet(Utc::now().timestamp_millis());
                     self.last_packet_ns = now;
@@ -334,20 +340,22 @@ impl Receiver {
                 return;
             }
         };
-        if hello.rate_hz != self.cfg.rate_hz || hello.channels != self.cfg.channels {
-            // Refuse rather than reinterpret: recording audio at a rate the
-            // server did not expect would corrupt every duration downstream.
+        if hello.rate_hz != WIRE_RATE_HZ || hello.channels != WIRE_CHANNELS {
+            // Refuse rather than reinterpret. The wire format is now a constant
+            // on both sides, so any other announcement means the node was built
+            // against a different definition of the wire — recording it would
+            // corrupt every duration downstream.
             self.metrics.net_protocol_errors.fetch_add(1, Ordering::Relaxed);
             self.metrics.set_last_error(format!(
-                "net capture format mismatch: node announced {} Hz {} ch, server expects {} Hz {} ch",
-                hello.rate_hz, hello.channels, self.cfg.rate_hz, self.cfg.channels
+                "net capture format mismatch: node announced {} Hz {} ch, the wire format is {WIRE_RATE_HZ} Hz {WIRE_CHANNELS} ch",
+                hello.rate_hz, hello.channels
             ));
             tracing::error!(
                 node_rate_hz = hello.rate_hz,
                 node_channels = hello.channels,
-                server_rate_hz = self.cfg.rate_hz,
-                server_channels = self.cfg.channels,
-                "capture node announced a format the server is not configured for"
+                wire_rate_hz = WIRE_RATE_HZ,
+                wire_channels = WIRE_CHANNELS,
+                "capture node announced a format that is not the wire format"
             );
             return;
         }
@@ -389,7 +397,7 @@ impl Receiver {
         }
 
         let payload = &data[protocol::HEADER_LEN..];
-        let frames = match protocol::validate_pcm_payload(payload, self.cfg.channels) {
+        let frames = match protocol::validate_pcm_payload(payload, WIRE_CHANNELS) {
             Ok(frames) => frames,
             Err(error) => {
                 self.metrics.net_protocol_errors.fetch_add(1, Ordering::Relaxed);
@@ -410,7 +418,7 @@ impl Receiver {
         // start again at 0. Its frame counter is monotonic within a session, so
         // a large backward jump is the tell.
         let reorder_frames =
-            (u64::from(self.cfg.rate_hz) * u64::from(self.cfg.jitter_buffer_ms) / 1000).max(1);
+            (u64::from(WIRE_RATE_HZ) * u64::from(self.cfg.jitter_buffer_ms) / 1000).max(1);
         let restarted = self
             .session
             .as_ref()
@@ -557,8 +565,8 @@ impl Receiver {
 
         let meta = CaptureMeta {
             frames: packet.frames,
-            channels: self.cfg.channels,
-            rate_hz: self.cfg.rate_hz,
+            channels: WIRE_CHANNELS,
+            rate_hz: WIRE_RATE_HZ,
             capture_seq,
             mono_start_ns,
             stream_generation: generation,
@@ -659,15 +667,6 @@ pub fn spawn(
     ring: Arc<CaptureRing>,
     metrics: Arc<Metrics>,
 ) -> Result<NetCaptureHandle, NetCaptureError> {
-    if cfg.rate_hz == 0 {
-        return Err(NetCaptureError::Config("rate_hz must not be 0".into()));
-    }
-    if !(1..=2).contains(&cfg.channels) {
-        return Err(NetCaptureError::Config(format!(
-            "channels must be 1 or 2, got {}",
-            cfg.channels
-        )));
-    }
     if cfg.jitter_buffer_ms == 0 {
         return Err(NetCaptureError::Config("jitter_buffer_ms must not be 0".into()));
     }

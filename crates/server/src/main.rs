@@ -24,7 +24,7 @@
 
 use steno_lib::audio_capture::{self, CaptureRing, NegotiatedFormat};
 use steno_lib::bounded_queue::{BoundedQueue, PopOutcome};
-use steno_lib::config::{Config, SampleFormat, SourceKind};
+use steno_lib::config::{Config, SampleFormat, SourceKind, WIRE_CHANNELS, WIRE_RATE_HZ};
 use steno_server::db_writer::{DbWriter, DbWriterHandle};
 use steno_lib::detector::{
     DetectionPipeline, Discontinuity, EndReason, EventDraft, SegmentContext, State,
@@ -53,16 +53,29 @@ const CONTROL_SLOTS: usize = 16;
 /// a `cpal::Stream` halts when dropped, and [`net_capture::NetCaptureHandle`]
 /// signals its receive thread and joins it. Keeping both behind one type lets the
 /// rest of the process stay agnostic about where audio came from.
+///
+/// The local variant carries the format-conversion thread as well: dropping the
+/// stream stops the microphone, and `LocalWireCapture::drop` stops the converter
+/// once it has drained what was already captured.
 #[allow(dead_code)]
 enum CaptureHandle {
-    Alsa(cpal::Stream),
+    Alsa {
+        stream: cpal::Stream,
+        local: audio_capture::LocalWireCapture,
+    },
     Net(net_capture::NetCaptureHandle),
 }
 
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Colour only when stderr is a terminal. Redirected to a file — which is
+    // what systemd, `tools/dev.sh` and every `> log` do — escape sequences are
+    // noise that breaks anything reading the log line by line.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .init();
 
     let config_path = Config::resolve_path();
     let config = match Config::load(&config_path) {
@@ -175,11 +188,19 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
     }
 
     // --- capture source ---------------------------------------------------
-    // Resolve the audio layout first: the ring, both queues and the dispatcher
-    // all need rate/channels, and the two sources get them from completely
-    // different places (device negotiation vs server config).
+    // Two formats have to be told apart here, and conflating them is what this
+    // wiring exists to prevent:
+    //
+    // * the **device** format — whatever the microphone could be opened at, or,
+    //   for a network source, whatever the node's own microphone clocks at;
+    // * the **wire** format — 16 kHz mono S16, the one constant every consumer
+    //   downstream is written against.
+    //
+    // Only the device format is negotiable. Everything the dispatcher, the
+    // recorder, the detector and the recogniser see is the wire format, so a
+    // 48 kHz stereo microphone and a 16 kHz mono node produce the same WAV.
     let mut alsa_selection: Option<audio_capture::CaptureSelection> = None;
-    let negotiated: NegotiatedFormat = match config.source.kind {
+    let device: NegotiatedFormat = match config.source.kind {
         SourceKind::Alsa => {
             let host = cpal::default_host();
             match audio_capture::select_device(&host, &config.audio) {
@@ -201,35 +222,41 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
             }
         }
         SourceKind::Net => {
-            // The server declares the layout it is willing to record and the
-            // node must announce exactly this. Reinterpreting a mismatched node
-            // would silently corrupt every duration downstream, so the mismatch
-            // is refused in `net_capture` instead of being adapted here.
+            // The node converts before sending, so what arrives is already the
+            // wire format; `net_capture` refuses anything that announces
+            // otherwise. The node's *device* rate is not visible from here — it
+            // reports it in its own INFO message, which is the honest place for
+            // a fact about another host.
             NegotiatedFormat {
                 device_name: format!("net:{}:{}", config.source.bind_address, config.source.port),
-                rate_hz: config.audio.preferred_rate_hz,
-                channels: config.audio.channels,
+                rate_hz: WIRE_RATE_HZ,
+                channels: WIRE_CHANNELS,
                 format: SampleFormat::S16Le,
             }
         }
     };
-    runtime.set_device(negotiated.device_name.clone());
-    runtime.set_capture_format(
-        negotiated.rate_hz,
-        negotiated.channels,
-        negotiated.format.as_str(),
-    );
+    let wire = NegotiatedFormat {
+        device_name: device.device_name.clone(),
+        rate_hz: WIRE_RATE_HZ,
+        channels: WIRE_CHANNELS,
+        format: SampleFormat::S16Le,
+    };
+    runtime.set_device(device.device_name.clone());
+    runtime.set_capture_format(wire.rate_hz, wire.channels, wire.format.as_str());
+    runtime.set_device_format(device.rate_hz, device.channels);
     tracing::info!(
-        device = %negotiated.device_name,
-        rate_hz = negotiated.rate_hz,
-        channels = negotiated.channels,
+        device = %device.device_name,
+        device_rate_hz = device.rate_hz,
+        device_channels = device.channels,
+        wire_rate_hz = wire.rate_hz,
+        wire_channels = wire.channels,
         source = config.source.kind.as_str(),
-        "capture format resolved"
+        "capture format resolved; the wire format is fixed"
     );
 
     let ring = Arc::new(CaptureRing::new(
-        negotiated.rate_hz,
-        negotiated.channels,
+        wire.rate_hz,
+        wire.channels,
         config.audio.capture_ring_ms,
         config.audio.period_ms,
         config.audio.buffer_ms,
@@ -275,7 +302,7 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
         stt_queue: stt_queue.clone(),
         db: db_handle.clone(),
         shutting_down: Arc::clone(&shutting_down),
-        negotiated: negotiated.clone(),
+        negotiated: wire.clone(),
     });
 
     // Transcription sits entirely off the audio path: it reads finished segments
@@ -295,14 +322,35 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
                     "alsa source selected but no device was resolved".into(),
                 )
             })?;
+            // The callback pushes the device's own frames into `device_ring`; a
+            // converter thread turns them into wire blocks in `ring`, which is
+            // what the dispatcher and therefore everything else reads. This is
+            // the single-box equivalent of what the node does before sending:
+            // one conversion, next to the microphone, and every consumer after
+            // it speaks one format.
+            let device_ring = Arc::new(CaptureRing::new(
+                device.rate_hz,
+                device.channels,
+                config.audio.capture_ring_ms,
+                config.audio.period_ms,
+                config.audio.buffer_ms,
+            ));
+            let mut local = audio_capture::LocalWireCapture::spawn(
+                Arc::clone(&device_ring),
+                Arc::clone(&ring),
+                &device,
+                config.audio.mono_channel_index,
+                Arc::clone(&metrics),
+            )
+            .map_err(|error| steno_lib::error::Error::Audio(format!("capture format: {error}")))?;
             match audio_capture::start_stream(
                 selection,
-                Arc::clone(&ring),
+                Arc::clone(&device_ring),
                 Arc::clone(&metrics),
                 Arc::clone(&shutting_down),
                 1,
             ) {
-                Ok(stream) => CaptureHandle::Alsa(stream),
+                Ok(stream) => CaptureHandle::Alsa { stream, local },
                 Err(error) => {
                     tracing::error!(%error, "failed to start capture stream");
                     metrics.set_last_error(error.to_string());
@@ -310,6 +358,7 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
                     // The dispatcher is already running and will simply never see
                     // audio; shut it down cleanly instead of exiting with threads
                     // mid-flight.
+                    local.stop();
                     shutting_down.store(true, Ordering::Relaxed);
                     dispatcher.request_shutdown();
                     recording_queue.close();
@@ -325,8 +374,6 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
                 bind_address: config.source.bind_address.clone(),
                 port: config.source.port,
                 device_id: config.source.device_id,
-                rate_hz: negotiated.rate_hz,
-                channels: negotiated.channels,
                 jitter_buffer_ms: config.source.jitter_buffer_ms,
                 idle_timeout_ms: config.source.idle_timeout_ms,
             };
@@ -504,6 +551,7 @@ fn start_transcription(
             socket_path,
             launcher: config.stt.stream_command.clone(),
             engine: config.stt.engine.clone(),
+            locale: config.stt.locale.clone(),
             database_path: config.storage.database_path.clone(),
             ready_timeout: Duration::from_secs(30),
             restart_delay: Duration::from_secs(5),
@@ -840,7 +888,14 @@ impl DetectorWorker {
                         self.config.detector.clone(),
                         format.rate_hz,
                         format.channels,
-                        self.config.audio.mono_channel_index,
+                        // Always channel 0: the dispatcher only ever receives the
+                        // wire format, which is mono. Which *device* channel
+                        // became that mono stream was decided at capture (by the
+                        // node, or by `WireConverter` on the single-box path), so
+                        // there is nothing left to select here — and selecting a
+                        // channel that does not exist would be an error rather
+                        // than a config choice.
+                        0,
                     )
                     .map_err(|e| Error::Internal(format!("detector setup: {e}")))?;
                     self.pipeline = Some(pipeline);

@@ -15,9 +15,14 @@
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0</string>
+    <string>3.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
+    <!-- Only `--mode mic` needs this. SpeechAnalyzer and the sound classifier
+         are on-device and use no permission at all, which is why the recorder
+         path (audio arriving over the socket) has never prompted. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>steno-stt-sidecar captures audio from the default input device when started with --mode mic.</string>
     <key>LSMinimumSystemVersion</key>
     <string>26.0</string>
     <key>LSBackgroundOnly</key>

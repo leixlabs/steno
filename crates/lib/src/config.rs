@@ -12,10 +12,33 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/steno-monitor/config.toml";
 /// Environment variable that overrides the configuration path.
 pub const CONFIG_PATH_ENV: &str = "STENO_MONITOR_CONFIG";
 
-/// Capture rates the detection branch knows how to convert (TECH_SPEC §5.1).
+/// Capture rates a device may be opened at.
+///
+/// These are device rates, not wire rates: every one of them is converted onto
+/// [`WIRE_RATE_HZ`] by [`crate::audio_capture::WireConverter`] before anything
+/// records, detects or transcribes. The list is closed because the resampler
+/// expresses each ratio exactly (`Resampler::new` refuses the rest).
 pub const SUPPORTED_CAPTURE_RATES: [u32; 5] = [16_000, 32_000, 44_100, 48_000, 96_000];
 /// The MVP detection rate. Any other configured value is a validation error.
 pub const DETECTION_RATE_HZ: u32 = 16_000;
+
+/// The one format everything downstream speaks: what travels on the wire, what
+/// the recorder writes to disk, what the detector analyses and what the
+/// recogniser is handed.
+///
+/// This is a constant, not a setting, because every one of those consumers was
+/// already written against it and only the *device* was allowed to differ. It
+/// used to be expressed as `[audio] preferred_rate_hz` + `channels` on both
+/// sides of the split deployment, which meant two files had to agree by hand;
+/// a mismatch did not resample, it refused the audio, and a node that kept
+/// sending HELLO while its PCM was refused looked online all night. Making the
+/// wire format a constant removes that failure mode: the only thing left to
+/// configure is the device, and the conversion to this format happens once,
+/// next to the microphone.
+pub const WIRE_RATE_HZ: u32 = DETECTION_RATE_HZ;
+/// Mono. Stereo capture is downmixed (one chosen channel) before anything else
+/// sees it, so no consumer has to think about interleaving.
+pub const WIRE_CHANNELS: u16 = 1;
 /// Classic RIFF/WAVE size ceiling; segments must stay below it (TECH_SPEC §4.2).
 pub const RIFF_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Bytes per stored sample for the only supported capture format.
@@ -134,6 +157,12 @@ pub struct SttConfig {
     /// Human-readable backend name stored with each transcript.
     #[serde(default = "default_stt_engine")]
     pub engine: String,
+    /// Language the recogniser listens for, e.g. `zh-CN`. Sent to the sidecar in
+    /// the `config` frame that precedes the first audio block: the language is
+    /// the orchestrator's decision, and a sidecar guessing it from a built-in
+    /// default would silently transcribe the night in the wrong language.
+    #[serde(default = "default_stt_locale")]
+    pub locale: String,
     /// Executable to run. It receives the WAV path as its last argument and
     /// must print one JSON object on stdout (see `stt::Transcript`).
     #[serde(default = "default_stt_command")]
@@ -259,10 +288,17 @@ pub struct AudioConfig {
     /// more than one candidate present, startup fails instead of guessing.
     #[serde(default)]
     pub alsa_device: String,
-    #[serde(default = "default_preferred_rate_hz")]
-    pub preferred_rate_hz: u32,
-    #[serde(default = "default_channels")]
-    pub channels: u16,
+    /// Rate to *ask the device* for. Not the rate anything is recorded or
+    /// analysed at: that is [`WIRE_RATE_HZ`], fixed. The device's own default
+    /// configuration is tried first regardless of this value, because it is the
+    /// only rate ALSA guarantees; this is the fallback hint.
+    #[serde(default = "default_device_rate_hz")]
+    pub device_rate_hz: u32,
+    /// Channels to *ask the device* for. The wire is always [`WIRE_CHANNELS`];
+    /// a device that only offers stereo is captured as stereo and one channel of
+    /// it is taken (see `mono_channel_index`).
+    #[serde(default = "default_device_channels")]
+    pub device_channels: u16,
     #[serde(default = "default_format")]
     pub format: SampleFormat,
     #[serde(default = "default_period_ms")]
@@ -271,6 +307,15 @@ pub struct AudioConfig {
     pub buffer_ms: u32,
     #[serde(default = "default_segment_duration_seconds")]
     pub segment_duration_seconds: u64,
+    /// Which of the device's channels becomes the mono wire stream.
+    ///
+    /// This is the one place "stereo in, mono out" is a decision rather than an
+    /// average: a bedside microphone often has one capsule pointed at the room
+    /// and one at a wall, and averaging them mixes in a reflection instead of
+    /// removing noise. Must be `< device_channels`; it is checked against the
+    /// channels the device actually opened at before the first block is
+    /// converted, and a device that delivered fewer channels is an error rather
+    /// than a silent clamp.
     #[serde(default)]
     pub mono_channel_index: u16,
     /// Rumble filter for the capture path, in Hz; 0 disables it.
@@ -481,6 +526,7 @@ impl Default for SttConfig {
             engine: default_stt_engine(),
             command: default_stt_command(),
             args: Vec::new(),
+            locale: default_stt_locale(),
             min_segment_seconds: default_stt_min_segment_seconds(),
             poll_interval_seconds: default_stt_poll_interval_seconds(),
             timeout_seconds: default_stt_timeout_seconds(),
@@ -504,6 +550,11 @@ impl SttConfig {
         if self.engine.trim().is_empty() {
             errors.push("stt.engine: must be non-empty when stt.enabled is true".to_string());
         }
+        if self.mode == SttMode::Stream && self.locale.trim().is_empty() {
+            errors.push(
+                "stt.locale: must name the recogniser language when stt.mode = \"stream\"".to_string(),
+            );
+        }
         if self.poll_interval_seconds == 0 {
             errors.push("stt.poll_interval_seconds: must be at least 1".to_string());
         }
@@ -517,8 +568,8 @@ impl Default for AudioConfig {
     fn default() -> Self {
         AudioConfig {
             alsa_device: String::new(),
-            preferred_rate_hz: default_preferred_rate_hz(),
-            channels: default_channels(),
+            device_rate_hz: default_device_rate_hz(),
+            device_channels: default_device_channels(),
             format: default_format(),
             period_ms: default_period_ms(),
             buffer_ms: default_buffer_ms(),
@@ -597,6 +648,10 @@ fn default_stt_stream_command() -> String {
     "steno-stt-sidecar".to_string()
 }
 
+fn default_stt_locale() -> String {
+    "zh-CN".to_string()
+}
+
 fn default_stt_engine() -> String {
     "apple-speechanalyzer".to_string()
 }
@@ -612,10 +667,10 @@ fn default_stt_poll_interval_seconds() -> u64 {
 fn default_stt_timeout_seconds() -> u64 {
     120
 }
-fn default_preferred_rate_hz() -> u32 {
+fn default_device_rate_hz() -> u32 {
     16_000
 }
-fn default_channels() -> u16 {
+fn default_device_channels() -> u16 {
     1
 }
 fn default_format() -> SampleFormat {
@@ -837,16 +892,16 @@ impl ServerConfig {
 
 impl AudioConfig {
     fn validate(&self, errors: &mut Vec<String>) {
-        if !(1..=2).contains(&self.channels) {
+        if !(1..=2).contains(&self.device_channels) {
             errors.push(format!(
-                "audio.channels: MVP supports 1 or 2 channels, got {}",
-                self.channels
+                "audio.device_channels: MVP supports 1 or 2 channels, got {}",
+                self.device_channels
             ));
         }
-        if self.mono_channel_index >= self.channels {
+        if self.mono_channel_index >= self.device_channels {
             errors.push(format!(
-                "audio.mono_channel_index: must be < audio.channels ({}), got {}",
-                self.channels, self.mono_channel_index
+                "audio.mono_channel_index: must be < audio.device_channels ({}), got {}",
+                self.device_channels, self.mono_channel_index
             ));
         }
         if self.rumble_highpass_hz > 400 {
@@ -855,10 +910,10 @@ impl AudioConfig {
                 self.rumble_highpass_hz
             ));
         }
-        if !SUPPORTED_CAPTURE_RATES.contains(&self.preferred_rate_hz) {
+        if !SUPPORTED_CAPTURE_RATES.contains(&self.device_rate_hz) {
             errors.push(format!(
-                "audio.preferred_rate_hz: must be one of {:?} (TECH_SPEC §5.1), got {}",
-                SUPPORTED_CAPTURE_RATES, self.preferred_rate_hz
+                "audio.device_rate_hz: must be one of {:?} (TECH_SPEC §5.1), got {}; this is a hint for the device, the wire is fixed at {WIRE_RATE_HZ} Hz",
+                SUPPORTED_CAPTURE_RATES, self.device_rate_hz
             ));
         }
         if self.period_ms == 0 {
@@ -891,10 +946,10 @@ impl AudioConfig {
         let segment_bytes = self.max_segment_bytes();
         if segment_bytes >= RIFF_MAX_BYTES {
             errors.push(format!(
-                "audio.segment_duration_seconds: {} s at {} Hz x {} ch x 2 B is {} bytes, which does not fit classic RIFF (< {} bytes)",
+                "audio.segment_duration_seconds: {} s at the wire format ({} Hz x {} ch x 2 B) is {} bytes, which does not fit classic RIFF (< {} bytes)",
                 self.segment_duration_seconds,
-                self.preferred_rate_hz,
-                self.channels,
+                WIRE_RATE_HZ,
+                WIRE_CHANNELS,
                 segment_bytes,
                 RIFF_MAX_BYTES
             ));
@@ -908,26 +963,30 @@ impl AudioConfig {
     }
 
     /// Byte size of one full segment of raw PCM, before the WAV header.
+    ///
+    /// Computed from the wire format, not from the device hint: the WAV on disk
+    /// is always [`WIRE_RATE_HZ`] × [`WIRE_CHANNELS`], because the conversion
+    /// happens before anything is recorded.
     pub fn max_segment_bytes(&self) -> u64 {
-        self.preferred_rate_hz as u64
-            * self.channels as u64
+        u64::from(WIRE_RATE_HZ)
+            * u64::from(WIRE_CHANNELS)
             * self.format.bytes_per_sample()
             * self.segment_duration_seconds
     }
 
     /// Frame count that triggers a `duration` rotation (TECH_SPEC §4.3).
     pub fn segment_frames(&self) -> u64 {
-        self.preferred_rate_hz as u64 * self.segment_duration_seconds
+        u64::from(WIRE_RATE_HZ) * self.segment_duration_seconds
     }
 
     /// Frames held by the SPSC capture ring.
     pub fn capture_ring_frames(&self) -> usize {
-        (self.preferred_rate_hz as u64 * self.capture_ring_ms as u64 / 1000) as usize
+        (u64::from(WIRE_RATE_HZ) * u64::from(self.capture_ring_ms) / 1000) as usize
     }
 
     /// Bytes per frame of interleaved PCM as stored on disk.
     pub fn block_align(&self) -> u64 {
-        self.channels as u64 * self.format.bytes_per_sample()
+        u64::from(WIRE_CHANNELS) * self.format.bytes_per_sample()
     }
 }
 

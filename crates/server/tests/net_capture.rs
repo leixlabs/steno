@@ -101,8 +101,6 @@ fn start_server(port: u16, jitter_ms: u32) -> (Arc<CaptureRing>, Arc<Metrics>, n
             bind_address: "127.0.0.1".to_string(),
             port,
             device_id: 0,
-            rate_hz: RATE_HZ,
-            channels: CHANNELS,
             jitter_buffer_ms: jitter_ms,
             idle_timeout_ms: 2_000,
         },
@@ -250,6 +248,30 @@ fn a_node_self_report_is_stored_verbatim() {
     assert!(metrics.net_node_report_unix_ms.load(Ordering::Relaxed) > 0);
 }
 
+/// The wire protocol carries a device id, not an address, so the socket is the
+/// only place "which machine is sending" can come from. It is what the status
+/// page names when a node goes quiet — "who was talking to us" has no other
+/// answer.
+#[test]
+fn the_peer_address_of_the_node_is_recorded() {
+    let port = free_port();
+    let (_ring, metrics, _handle) = start_server(port, 150);
+    let node = Node::new(format!("127.0.0.1:{port}"));
+    let expected = node.socket.local_addr().expect("node local addr").to_string();
+
+    assert!(metrics.net_peer().is_none(), "nothing has arrived yet");
+
+    node.send_hello(RATE_HZ, CHANNELS);
+
+    assert!(
+        eventually(|| metrics.net_peer().is_some(), Duration::from_secs(2)),
+        "the datagram's source address should be recorded"
+    );
+    // `ip:port` exactly as the socket reported it: the node's port is ephemeral
+    // and changes when it restarts, and that change is itself a useful signal.
+    assert_eq!(metrics.net_peer().as_deref(), Some(expected.as_str()));
+}
+
 /// A node that gates quiet audio announces the range it did not send. The server
 /// must count it as *gated*, never as packet loss — otherwise a node behaving
 /// exactly as configured would page the operator about a broken uplink.
@@ -394,7 +416,10 @@ fn a_hello_with_a_different_format_is_refused() {
     let (ring, metrics, _handle) = start_server(port, 150);
     let mut node = Node::new(format!("127.0.0.1:{port}"));
 
-    // The node claims 48 kHz while the server was configured for 16 kHz.
+    // The node claims 48 kHz. There is nothing to "configure the server to
+    // expect" any more — the wire format is a constant — so this is a node built
+    // against a different definition of the wire, and its audio must not be
+    // recorded.
     node.send_hello(48_000, CHANNELS);
     for _ in 0..4 {
         node.send_pcm();
@@ -402,7 +427,12 @@ fn a_hello_with_a_different_format_is_refused() {
 
     assert!(
         pop_block(&ring, Duration::from_millis(500)).is_none(),
-        "audio must not be recorded at a rate the server did not expect"
+        "audio must not be recorded when the node does not speak the wire format"
+    );
+    let error = metrics.last_error().unwrap_or_default();
+    assert!(
+        error.contains("the wire format is"),
+        "the refusal must name the wire format rather than a server setting: {error}"
     );
     assert!(
         metrics
@@ -422,8 +452,6 @@ fn packets_from_an_unexpected_device_are_ignored() {
             bind_address: "127.0.0.1".to_string(),
             port,
             device_id: 42,
-            rate_hz: RATE_HZ,
-            channels: CHANNELS,
             jitter_buffer_ms: 150,
             idle_timeout_ms: 2_000,
         },

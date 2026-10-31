@@ -41,6 +41,7 @@ type ServerEvent =
       language: string | null
     }
   | { type: 'state'; state: string }
+  | { type: 'snore'; start_ms: number; end_ms: number; label: string; peak: number; mean: number; windows: number; threshold: number }
   | { type: 'error'; message: string }
   | { type: 'lagged'; missed: number }
 
@@ -54,6 +55,8 @@ export interface LiveTranscript {
   finals: Utterance[]
   /** Total phrases the server had stored when the socket opened. */
   historyAtConnect: number | null
+  /** Snore episodes stored while this page was open, oldest first. */
+  snores: Array<{ startMs: number; endMs: number; label: string; peak: number }>
   /** Set when the server said this browser missed events. */
   lagged: number
   /** Last failure, for the panel to show instead of an empty transcript. */
@@ -66,6 +69,7 @@ const INITIAL: LiveTranscript = {
   partial: null,
   finals: [],
   historyAtConnect: null,
+  snores: [],
   lagged: 0,
   error: null,
   engine: null,
@@ -205,7 +209,27 @@ function apply(prev: LiveTranscript, event: ServerEvent): LiveTranscript {
       return event.state === 'ready' ? { ...prev, status: 'live' } : prev
     case 'error':
       return { ...prev, error: event.message, partial: null }
+    case 'snore':
+      // Kept, not yet drawn: the recordings page has the annotations, and this
+      // list is what a live badge would read. Trimming keeps a long night from
+      // growing the array forever.
+      return {
+        ...prev,
+        snores: [
+          ...prev.snores.slice(-19),
+          {
+            startMs: event.start_ms,
+            endMs: event.end_ms,
+            label: event.label,
+            peak: event.peak,
+          },
+        ],
+      }
     case 'lagged':
       return { ...prev, lagged: prev.lagged + event.missed }
+    default:
+      // A server that learns a new event type must never blank the page: an
+      // exhausted switch returns undefined, which React renders as a crash.
+      return prev
   }
 }

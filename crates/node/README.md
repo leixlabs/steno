@@ -44,26 +44,37 @@ hello_interval_ms = 1000        # 100..=10000
 
 [audio]
 alsa_device = "Razer Seiren, USB Audio"   # 空 = 用唯一的 USB 采集设备；多个则启动失败
-preferred_rate_hz = 16000
-channels = 1
+device_rate_hz = 16000          # 给设备的提示，不是录音格式
+device_channels = 1             # 向设备申请的声道数
+mono_channel_index = 0          # 哪个设备声道变成单声道流（必须 < device_channels）
 period_ms = 20
 buffer_ms = 400
 capture_ring_ms = 500
 ```
 
-两条硬约束：
+**线上格式是常量，不是配置**：16 kHz、单声道、S16_LE，定义在
+`steno_lib::config::WIRE_RATE_HZ` / `WIRE_CHANNELS`。节点在发送前完成
+"设备格式 → 线上格式"的唯一一次转换（`WireConverter`），所以服务端、检测器、
+识别器和 sidecar 收到的永远是同一种东西。`[audio]` 里的一切都只描述麦克风。
 
-- `preferred_rate_hz` / `channels` 必须与服务端 `[audio]` 完全一致。不一致的音频会被
-  **拒绝**，不会重采样成"看起来能用"的格式——两端必须对录音格式有同一个认知。
+由此：
+
+- 没有"两端 `[audio]` 必须写一致"这条约束了——服务端根本没有对应的键可写。节点宣告
+  非线上格式的 HELLO 仍然会被**拒绝**（那是"这台机器的二进制比服务端旧"的信号），
+  但不会重采样成"看起来能用"的格式。
+- `mono_channel_index` 是**选一路**，不是求平均：床头麦克风常常一只胶囊对着房间、
+  一只对着墙，平均等于把反射混进来。设备实际开出的声道数少于该下标时启动报错，
+  不会悄悄退回 0 号。
 - `period_ms = 20` 时一包是 640 B PCM + 32 B 头，安全落在 1500 B MTU 内；调大就有
   WiFi 分片风险。
 
 ## 运行时行为
 
-1. 协商设备（与单机版同一套 `audio_capture`）。回落顺序仅限：配置采样率 → 48 kHz →
-   44.1 kHz；声道 → 单声道。再不行就报错退出。
-2. 发 HELLO 宣告格式，之后按 `hello_interval_ms` 重发。服务端重启会忘掉已宣告的格式，
-   在收到新的 HELLO 之前拒收 PCM，所以这个间隔必须短。
+1. 协商设备（与单机版同一套 `audio_capture`）。设备自己的默认配置优先——那是 ALSA
+   唯一保证的；再依次尝试配置的采样率 → 48 kHz → 44.1 kHz，声道 → 单声道。
+   再不行就报错退出。**开出来的格式只影响转换器，不影响录音。**
+2. 发 HELLO 宣告线上格式，之后按 `hello_interval_ms` 重发。服务端重启会忘掉已宣告的
+   格式，在收到新的 HELLO 之前拒收 PCM，所以这个间隔必须短。
 3. 每个采集周期发一个 PCM 数据报，带 session id、包序号和首样本的绝对帧号。
 4. `capture_ring_ms` 是**延迟缓冲**，不是录音缓冲：网络卡住时放不下的音频直接丢弃，
    服务端记为 gap。
@@ -74,7 +85,7 @@ capture_ring_ms = 500
 ## 部署
 
 ```sh
-tools/deploy-node.sh --host 192.168.31.58 --server-host 192.168.31.10
+tools/deploy-node.sh --host 192.168.31.58 --server-host 192.168.31.152
 tools/deploy-node.sh --dry-run                             # 默认主机 pi.local
 ```
 
@@ -87,7 +98,7 @@ tools/deploy-node.sh --dry-run                             # 默认主机 pi.loc
 ## 本机自测（不需要硬件）
 
 ```sh
-tools/run-server.sh                 # 服务端以 source.kind = "net" 启动，等 UDP 8091
+tools/run-server-mac.sh                 # 服务端以 source.kind = "net" 启动，等 UDP 8091
 tools/replay-wav.py night.wav 127.0.0.1:8091
 ```
 

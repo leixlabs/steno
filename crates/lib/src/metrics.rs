@@ -4,7 +4,7 @@
 //! the dispatcher, the recorder, the detector and the DB writer. They are read by
 //! the HTTP `/status` handler. Nothing here allocates on the audio path.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Number of DSP frame timings kept for the p99 estimate.
@@ -167,6 +167,10 @@ pub struct Metrics {
     /// server and the node sharing a schema.
     net_node_report: Mutex<Option<String>>,
     pub net_node_report_unix_ms: AtomicI64,
+    /// `ip:port` the newest datagram came from. Behind a mutex because it is
+    /// text; the receiver only writes it when the address changes, so this is
+    /// one write per node session, not one per packet.
+    net_peer: Mutex<Option<String>>,
     /// Frames the node announced it deliberately did not send, so the Portal can
     /// separate "the node gated this" from "the uplink lost this".
     pub net_gated_frames: AtomicU64,
@@ -174,6 +178,12 @@ pub struct Metrics {
 
     // --- queues (TECH_SPEC §4.3) ---
     pub dropped_detection_blocks: AtomicU64,
+    /// Live level of the newest block, in milli-dBFS. `known` gates it: the
+    /// atomic's default `0` would otherwise read as 0 dBFS, i.e. a perfectly
+    /// clipped signal.
+    pub live_peak_mdb: AtomicI32,
+    pub live_rms_mdb: AtomicI32,
+    pub live_level_known: AtomicBool,
     /// Audio blocks the streaming recogniser never got. Transcription is
     /// best-effort, so this is a counter rather than an error.
     pub dropped_stt_blocks: AtomicU64,
@@ -200,6 +210,16 @@ pub struct Metrics {
     pub noise_floor_known: AtomicBool,
     pub band_noise_floor_known: AtomicBool,
     pub signal_silent: AtomicBool,
+    /// Audio arriving that is not digital silence but carries no usable signal:
+    /// a muted capsule, a microphone unseated from it, or an input gain at zero.
+    ///
+    /// Separate from [`Self::signal_silent`] because the two failures are
+    /// different and need different fixes. `signal_silent` means every sample is
+    /// exactly `0` — no stream at all, the `null` plugin, or a decoder producing
+    /// nothing. This one means samples arrive and carry only dither: a muted
+    /// capsule reads around -78 dBFS with peaks of a few LSB, which is not
+    /// "silence" by any byte-level test and used to be reported as `ok`.
+    pub signal_dead: AtomicBool,
 
     // --- storage ---
     pub storage_pressure: AtomicBool,
@@ -221,6 +241,10 @@ pub struct Metrics {
     pub stt_connected: AtomicBool,
     /// Utterances stored since start.
     pub stt_finals: AtomicU64,
+    /// Snore episodes the sidecar's classifier reported and this server stored.
+    /// Counted apart from `events_total`, which is the rule-based detector's:
+    /// the two annotate the same audio and must stay distinguishable.
+    pub stt_snores: AtomicU64,
     stt_engine: Mutex<String>,
     /// How the recogniser is launched: the command and the arguments the server
     /// actually passes. Set once when the worker starts.
@@ -298,6 +322,26 @@ impl Metrics {
 
     pub fn stt_error(&self) -> Option<String> {
         self.stt_error.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Records the level of the block just dispatched. Display only.
+    pub fn set_live_level(&self, peak_dbfs: f32, rms_dbfs: f32) {
+        self.live_peak_mdb
+            .store((peak_dbfs * 1000.0).round() as i32, Ordering::Relaxed);
+        self.live_rms_mdb
+            .store((rms_dbfs * 1000.0).round() as i32, Ordering::Relaxed);
+        self.live_level_known.store(true, Ordering::Relaxed);
+    }
+
+    /// `None` until a block has been measured — never a fabricated 0 dBFS.
+    pub fn live_level(&self) -> Option<(f32, f32)> {
+        if !self.live_level_known.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some((
+            self.live_peak_mdb.load(Ordering::Relaxed) as f32 / 1000.0,
+            self.live_rms_mdb.load(Ordering::Relaxed) as f32 / 1000.0,
+        ))
     }
 
     pub fn set_time_synced(&self, synced: bool) {
@@ -386,6 +430,23 @@ impl Metrics {
 
     pub fn node_report(&self) -> Option<String> {
         self.net_node_report.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Records the address the newest datagram came from, as reported by the
+    /// socket: `ip:port`.
+    ///
+    /// This is the only place the server learns where the node is — the protocol
+    /// carries a device id, not an address — so it is what an operator needs to
+    /// answer "which machine is on the wire", and the only way to tell a node
+    /// that moved from one that never attached.
+    pub fn set_net_peer(&self, peer: impl Into<String>) {
+        if let Ok(mut slot) = self.net_peer.lock() {
+            *slot = Some(peer.into());
+        }
+    }
+
+    pub fn net_peer(&self) -> Option<String> {
+        self.net_peer.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Records the wall clock of the newest packet from the capture node.

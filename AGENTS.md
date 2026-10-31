@@ -84,14 +84,15 @@ crates/lib            platform-neutral core (package `steno-lib`); no storage, H
   dsp, resampler      DC block, band-pass, framing, noise-floor estimator, polyphase resampler
   detector            candidate state machine, `DetectionPipeline`, `DETECTOR_VERSION`
   timeline            monotonic clock origin, clock map, gap records, time quality
-  audio_capture       CaptureRing (the one producer contract) + CPAL device selection
+  audio_capture       CaptureRing (the one producer contract), CPAL device selection, WireConverter + LocalWireCapture (device format → wire format)
   protocol            node↔server UDP wire format, shared by both binaries
   bounded_queue       SPSC ring + audio/control slot split
   metrics, error      counters shared with the HTTP layer; `Error::Db` behind `feature = "db"`
   detect_wav, eval    offline analysis, behind `feature = "tools"`
 crates/server         recording, detection, storage, transcription, HTTP + Portal
   dispatcher          the only place that decides when a segment rotates
-  recorder, storage   WAV writing/recovery, SQLite schema v3
+  recorder, storage   WAV writing/recovery, typed SQL
+  migrate             schema applier: reads migrations/*.sql, writes sqlx's bookkeeping
   retention, recovery capacity reclamation, startup reconciliation
   db_writer           the single writer thread; one rusqlite connection
   net_capture         UDP receive half of the split deployment
@@ -101,13 +102,18 @@ crates/server         recording, detection, storage, transcription, HTTP + Porta
   main.rs             runtime assembly and shutdown order
 crates/node           capture-only binary (package `steno-node`): microphone → UDP. No disk, no DB, no listener
 web                   Vite + React 19 + TS control centre (build output `web/dist`, not committed)
-apple-stt-sidecar  macOS SpeechAnalyzer sidecar: PCM in, JSON out (.app bundle + wrappers)
-tools/dev.sh          dev environment: Vite HMR + rebuild-and-restart for the server
+apple-stt-sidecar  audio hub .app: microphone/socket/file → SpeechAnalyzer + SoundAnalysis,
+                   binary framing both ways (see apple-stt-sidecar/README.md)
+tools/dev.sh          dev supervisor: web/server/sidecar/node, per-service reload, console panel
 tools/refresh-all.sh  rebuild + redeploy every runtime, then restart and verify
-tools/run-server.sh   run the server locally with a throwaway runtime dir
+tools/run-server-mac.sh   run the server locally with a throwaway runtime dir
 tools/deploy-node.sh  cross-build + install the capture node on a Pi in one shot
 tools/replay-wav.py   replays a WAV into the UDP protocol at real time
+tools/dev-panel.py    renders the dev console panel (pipeline state + workflow events)
+tools/stt-watch.py    live view of what the server is recognising (WS + /status), no browser
 tools/stt-stream-probe.py  drives the streaming sidecar's socket without the server
+migrations/           the schema itself: one <VERSION>_<DESCRIPTION>.sql per change,
+                      applied in order, never edited after release
 docs/                 spec/ (original), decisions/ (dated), operations/, verification/
 deployment/           everything a machine needs installed: systemd units + the two
                       annotated example configs (config.example.toml, node.example.toml)
@@ -128,7 +134,7 @@ is always compiled:
 sudo apt-get install -y build-essential pkg-config libasound2-dev   # Debian/Pi
 cargo build --workspace                 # debug
 cargo build --release --workspace
-cargo test --workspace --all-features   # 194 passing, 1 ignored doctest
+cargo test --workspace --all-features   # 247 passing, 1 ignored doctest
 cargo clippy --workspace --all-targets --all-features
 ```
 
@@ -140,7 +146,7 @@ Feature flags are not optional in practice:
   `tests/steno_eval.rs`. Use `--workspace --all-features` for a full run.
 - `feature = "db"` only enables `Error::Db`; the server turns it on.
 
-Current state (last verified run): `195 tests, 194 passed, 0 failed, 1 ignored`
+Current state (last verified run): `248 tests, 247 passed, 0 failed, 1 ignored`
 (the ignored one is the illustrative doc-test at the top of `http_server.rs`).
 **Clippy is not clean**: it currently reports warnings in all three crates
 (`derivable_impls` for `SourceKind`, a stale `&` in `http_server`, `while_let_loop`
@@ -171,19 +177,48 @@ explicitly, or add the ignores first.
 
 Two scripts cover the loop; both are the documented path, so keep them working.
 
-**While developing** (frontend and backend, one command, one Ctrl-C):
+**While developing** (every process, one console, one Ctrl-C):
 
 ```sh
-tools/dev.sh                 # Vite :5173 proxying /api + server :8080, both hot
-tools/dev.sh --stt on        # ...with live transcription
-tools/dev.sh --port 8081     # a second instance beside the first
+tools/dev.sh                     # web + server + sidecar, all watched
+tools/dev.sh --with-node         # ...plus a local capture node (real UDP path)
+tools/dev.sh --only server,sidecar
+tools/dev.sh status              # one-shot panel from any shell
+tools/dev.sh logs sidecar -f     # the sidecar's own log, live
+tools/dev.sh reload sidecar      # rebuild + relaunch one service
+tools/dev.sh stop [role]         # stop everything, or one role, without needing the supervisor
+tools/dev.sh stop web | start web | logs server | schema | quit
 ```
 
-`web/src/**` reloads through Vite HMR. `crates/**/*.rs` triggers `cargo build`,
-then SIGTERM the old process and start the new one — but only after the build
-succeeds, so a syntax error leaves the running server alone instead of taking the
-page you were looking at off the air. It uses the same `var/` runtime directory as
-a normal run, which means it takes the port over from a detached instance; on exit
+The supervisor owns `web` (Vite), `server`, `sidecar` and, optionally, `node`. The
+sidecar is still launched *by the server* — dev.sh only points `[stt]
+stream_command` at a generated wrapper that runs the bundle built in this repo,
+detached, so no `install.sh` is needed and no LaunchServices launch hides the
+process. `reload sidecar` rebuilds the bundle and kills the process; the stt
+worker reconnects and starts the new build within its 5 s restart delay.
+
+Reload-on-change: `crates/**/*.rs` → build, then SIGTERM the old process and start
+the new one — but only after the build succeeds, so a syntax error leaves the
+running server alone instead of taking the page you were looking at off the air.
+`apple-stt-sidecar/Sources/**` rebuilds the bundle and restarts the sidecar;
+`crates/node/**` does the same for the node when that role is on. `web/src/**`
+needs nothing: Vite HMR.
+
+`tools/dev.sh stop` is the way out of a dev run, and unlike `quit` it does not need
+the supervisor: it finds the pids from the state files, the listening port and the
+sidecar's socket name, stops them in the documented order, restores `[stt]
+stream_command` (dev points it at a generated wrapper inside `var/dev/`, which stop
+deletes — leaving it there makes the next `refresh-all.sh` start a server that
+cannot launch a recogniser), and removes `var/dev/`. Only processes carrying this
+checkout's `target/` path are touched.
+
+The console panel (`tools/dev-panel.py`) is the point of the whole thing: it polls
+`/api/v1/status` once a second and tails **both** the server log and the sidecar's,
+merging them by timestamp (UTC converted to local, sidecar lines tagged), so
+capture → record → detect → stt (with the phrase being formed) and the last few
+workflow events — including the sidecar's `text [...]` and `snore:` lines — are
+visible without opening a browser. It uses the same `var/` runtime directory as a
+normal run, which means it takes the port over from a detached instance; on exit
 `tools/refresh-all.sh --no-node` puts that instance back.
 
 **Everything at once** (after changing code, this is the only command needed):
@@ -201,14 +236,20 @@ or the server did not answer `/api/v1/status` within 30 s. `--stt on|off` and
 `--control on|off` patch that one `enabled` key in place rather than
 regenerating the config, which would also reset the port and the segment length.
 
-**Server, locally** (throwaway runtime dir, nothing under `/etc` or `/var`):
+**Server on macOS** (foreground, repo-local runtime dir, nothing under `/etc` or
+`/var`; the Pi uses `deployment/systemd/steno-monitor.service` instead, and this
+script refuses to run on Linux rather than pretending it can):
 
 ```sh
-tools/run-server.sh                 # [source] kind = "net", HTTP on 127.0.0.1:8080
-tools/run-server.sh --lan           # reachable from a phone on the LAN
-tools/run-server.sh --alsa          # open this machine's microphone instead
-tools/run-server.sh --release --reset-config
+tools/run-server-mac.sh                 # [source] kind = "net", HTTP on 127.0.0.1:8080
+tools/run-server-mac.sh --lan           # reachable from a phone on the LAN
+tools/run-server-mac.sh --mic           # open this machine's capture device (CoreAudio)
+tools/run-server-mac.sh --release --reset-config
 ```
+
+`--mic` writes `[source] kind = "alsa"`: that value is the historical name for
+"open the local device", which is CoreAudio here. `--alsa` still works as an
+alias and says so.
 
 It generates `var/server.toml` (repo-local, git-ignored — **not** `$TMPDIR`,
 which macOS purges, and this directory holds real recordings) on first run,
@@ -248,9 +289,9 @@ box-to-file map is at the end of the section.
  BEDSIDE (Pi)                        SERVER HOST — steno-monitor (one process)
  ────────────                        ───────────────────────────────────────
 
- 1  CAPTURE
-      mic → steno-node ── UDP 8091 (32 B hdr + ≤1280 B PCM, no retx) ─┐
-      mic → ALSA                                                      ┴─► CaptureRing
+ 1  CAPTURE                      (both inputs leave this band as the same format)
+      mic → steno-node ── WireConverter ── UDP 8091 (≤1280 B PCM, no retx) ─┐
+      mic → CaptureRing(device) ── LocalWireCapture ────────────────────────┴─► CaptureRing(16 kHz mono)
 
  2  SEGMENT AND FAN OUT
       CaptureRing ──► dispatcher ──┬──► recorder ──► .partial ──► *.wav
@@ -259,14 +300,16 @@ box-to-file map is at the end of the section.
 
  3  RECOGNISE                  (the main line leaves the process here)
       stt queue ──► stt_stream ──Unix socket──► steno-stt-sidecar.app
-                                                          │ SpeechAnalyzer
-                                                          │ on-device models
-                                                          ▼
-                                        text (partial / final) ──► utterances
+                    config/control down           │ one audio hub, two lanes
+                    audio up, events back         ├─ SpeechAnalyzer ──► text
+                                                  └─ SoundAnalysis  ──► snore episodes
+                                        │
+                                        ├─► utterances      (phrases, with wall-clock bounds)
+                                        └─► snore_events    (source='apple-soundanalysis-v1')
 
  4  WHAT IS KEPT               (a side effect of the main line)
       disk   *.wav under storage.recording_dir
-      db     app.db (WAL, v3): segments, gaps, events, transcripts
+      db     app.db (WAL, v4): segments, gaps, events, transcripts
                                         │
                                         ├─► HTTP :8080 ─► Portal ─► browser
                                         ├─► stt worker (mode="segment") ──► transcripts
@@ -283,20 +326,37 @@ same pipeline with the node removed: the server opens the microphone itself and
 the entry point becomes the CPAL callback. (On macOS that path is CoreAudio; the
 key name is historical.)
 
+Both entry points convert to the wire format before the dispatcher, and that is
+the one thing to keep true when touching this band. The node converts in its
+forwarder thread; the single-box path feeds `CaptureRing(device)` and lets
+`LocalWireCapture` publish `CaptureRing(16 kHz mono)`, because the CPAL callback
+must never resample (it would allocate and filter on an audio thread). A device
+that only clocks at 48 kHz stereo therefore records a 16 kHz mono WAV, and the
+recogniser is never handed samples at a rate it was not told about.
+
 The dispatcher is fed by one queue and fans out to three. None of them may block
 it: a full recording queue drops the block and registers a `queue_overflow` gap
 (and withholds it from detection so the detector sees the same hole), a full
 detection queue drops its copy and restarts the detector, and transcription is
 lossy on purpose.
 
-`stt_stream` is the socket **server** — it binds, the sidecar connects, and the
-text comes back over the same socket. The sidecar is an external `.app`, launched
-with `open -n -a` through `stt.stream_command` and re-launched 5 s after a
-session ends. It holds no policy: `SpeechAnalyzer` finalises its own results as
-audio flows, so there is no rotation, no endpoint timer and no re-decode of
-audio Apple refused to finalise — that whole layer was deleted with
-`SFSpeechRecognizer`. Recognition is on-device and needs no permission grant.
-Setting `mode = "segment"` swaps the socket for a one-shot `stt.command`.
+`stt_stream` is the socket **server** — it binds, the sidecar connects, and
+both directions ride the same connection: audio up, `config` (the language) and
+`control` (`stop`, `flush`, `status`) down. The sidecar is an external `.app`,
+launched with `open -n -a` through `stt.stream_command` and re-launched 5 s after
+a session ends.
+
+The sidecar holds no policy. It runs one audio hub — microphone, socket or file,
+all converted once to 16 kHz mono — and fans each block out to two lanes:
+`SpeechAnalyzer` for text and `SoundAnalysis` for snore episodes. `SpeechAnalyzer`
+finalises its own results as audio flows, so there is no rotation, no endpoint
+timer and no re-decode of audio Apple refused to finalise — that whole layer was
+deleted with `SFSpeechRecognizer`. The classifier lane is a second, independent
+annotator: its episodes land in `snore_events` with `source='apple-soundanalysis-v1'`
+so they can never be confused with the server's own `rule-v1` rows. Both lanes
+run on-device and need no permission grant; only `--mode mic` needs the
+microphone prompt. Setting `mode = "segment"` swaps the socket for a one-shot
+`stt.command`.
 
 The one-writer rule is about the audio path, not the file: `DbWriter` owns the
 connection used by recorder and detector, while HTTP, both STT workers and the
@@ -309,14 +369,17 @@ startup retention pass each open their own — `rusqlite::Connection` is not
 |---|---|
 | node: microphone → UDP | `crates/node/src/main.rs` |
 | `net_capture` (UDP in, jitter buffer, re-anchor) | `crates/server/src/net_capture.rs` |
-| `CaptureRing` + CPAL device selection | `crates/lib/src/audio_capture.rs` |
+| `CaptureRing` + CPAL device selection + `WireConverter` / `LocalWireCapture` | `crates/lib/src/audio_capture.rs` |
 | dispatcher | `crates/server/src/dispatcher.rs` |
 | recorder (`.partial` → `.wav`) | `crates/server/src/recorder.rs` |
 | detector | `crates/lib/src/detector.rs`, with `dsp.rs` and `resampler.rs` |
 | `DbWriter` | `crates/server/src/db_writer.rs` |
-| SQLite schema and queries | `crates/server/src/storage.rs` |
+| SQLite schema (DDL) | `migrations/*.sql` |
+| schema applier / version gate | `crates/server/src/migrate.rs` |
+| queries against that schema | `crates/server/src/storage.rs` |
 | `stt_stream` / `stt` (in-process workers) | `crates/server/src/stt_stream.rs` / `crates/server/src/stt.rs` |
-| `steno-stt-sidecar.app` (external process; `SpeechAnalyzer`, no TCC grant) | `apple-stt-sidecar/Sources/*.swift`, built by `build.sh`, installed by `install.sh` |
+| sidecar framing, both directions | `crates/server/src/sidecar_wire.rs` |
+| `steno-stt-sidecar.app` (external process; `SpeechAnalyzer` + `SoundAnalysis`, no TCC grant) | `apple-stt-sidecar/Sources/*.swift`, built by `build.sh`, installed by `install.sh` |
 | wrappers on `PATH` (`steno-stt-sidecar`, `steno-stt-sidecar-file`) | `apple-stt-sidecar/wrappers/*.sh` |
 | speech models (system assets, not ours) | `AssetInventory`-managed on-device models, reached through `SpeechAnalyzer` |
 | HTTP API + static Portal | `crates/server/src/http_server.rs` |
@@ -368,9 +431,33 @@ Ownership rules that must not drift:
 
 ## Storage and data model
 
-SQLite schema is version 3, migrated idempotently through `PRAGMA user_version`
-(`Database::migrate`). A database newer than the binary is refused, not
-downgraded. Tables:
+**The schema is not in the Rust code.** Every `CREATE TABLE` lives in
+`migrations/<VERSION>_<DESCRIPTION>.sql`; the files are embedded at build time and
+applied by `crates/server/src/migrate.rs`. Do not add DDL to a `.rs` file, and do
+not add a table by editing `storage.rs` — add a migration.
+
+Each file runs in one transaction together with its bookkeeping row, in the table
+and format `sqlx migrate` uses (`_sqlx_migrations`: version, description, success,
+SHA-384 checksum, execution time). The applier is not `sqlx::migrate`, because
+`sqlx`'s SQLite driver and `rusqlite` 0.40 require incompatible `libsqlite3-sys`
+versions and both declare `links = "sqlite3"` — cargo will not build them
+together. The consequence worth knowing: `sqlx`'s CLI still reads a live database
+truthfully, which is the whole point of writing that format.
+
+- **Add a migration:** `sqlx migrate add --source migrations <description>` — the
+  CLI continues the numbering from the highest existing file (`0005_…`) and drops a
+  placeholder comment. Replace it with the SQL; do not renumber released files.
+- **Never edit a released migration.** The checksum is checked on every startup; a
+  mismatch stops the process with the version named. There are no down migrations
+  — recovery is a backup.
+- **Baseline:** a database written before this scheme has `user_version` but no
+  bookkeeping table. The first startup records everything up to `user_version` as
+  applied instead of replaying DDL over existing tables.
+- **Refusals, not repairs:** an unknown recorded version, `success = false`, or a
+  `user_version` past the newest file all fail startup. A database newer than the
+  binary is refused, not downgraded.
+
+Tables:
 
 | Table | Holds |
 |---|---|
@@ -378,7 +465,7 @@ downgraded. Tables:
 | `audio_gaps` | every registered hole: offset, lost frames, kind, `estimate_source` |
 | `snore_events` | candidate events with feature columns, `review_status`, `continued`, `detector_version` |
 | `segment_transcripts` | one transcript per segment (primary key `segment_id`); `status` `ok`/`failed` |
-| `utterances` | streaming-recogniser phrases with absolute times (schema v3) |
+| `utterances` | streaming-recogniser phrases with absolute times (migration `0003`) |
 
 Segment status vocabulary: `recording`, `complete`, `interrupted`, `missing`,
 `deleted`. `interrupted` comes from a repaired `.partial`; `missing` means the row
@@ -423,18 +510,34 @@ than documenting them as present.
 - `alsa` (default): this process opens the microphone. Device selection matches
   `audio.alsa_device` against the CPAL device **description string**
   (`Device::to_string()`), not a PCM name; empty means "there must be exactly
-  one candidate", otherwise startup fails with `MultipleDevices`. Negotiation
-  tries the configured rate, then 48 kHz, then 44.1 kHz, S16 only — a device
-  that only offers F32 (e.g. a Mac's built-in mic) fails by design.
-- `net`: the server never opens a microphone. It declares the layout in `[audio]`
-  and refuses a node that announces anything else, rather than reinterpreting it.
+  one candidate", otherwise startup fails with `MultipleDevices`. The device may
+  be opened at any of the five supported rates and 1–2 channels; the device's own
+  default configuration is tried first, then the configured hint, then 48 kHz,
+  then 44.1 kHz, S16 only — a device that only offers F32 (e.g. a Mac's built-in
+  mic) fails by design.
+- Everything after the device speaks **one** format: `WIRE_RATE_HZ` (16 kHz) mono
+  S16_LE, defined once in `steno_lib::config` and used by the wire, the WAV
+  recorder, the detector, the STT queue and the sidecar. It is a constant, not a
+  setting: the node converts before sending and the single-box path converts in
+  `LocalWireCapture` right after the callback, so `[audio] device_rate_hz` /
+  `device_channels` describe the microphone and never the recording. This used to
+  be configured on both machines, which meant two files had to agree by hand and
+  a mismatch refused the audio while the node still looked online.
+- `mono_channel_index` is a real choice, not an average: that device channel
+  becomes the mono stream, and an index the device did not open with is a
+  startup error rather than a clamp.
+- `net`: the server never opens a microphone. `net_capture` accepts only a HELLO
+  announcing the wire format and refuses anything else, rather than
+  reinterpreting it.
 
 UDP wire format (`steno-lib::protocol`, little-endian, 32-byte header): magic
 `0x534E`, version 1, kind (`1` HELLO / `2` PCM / `3` HELLO_ACK), `device_id`,
 `session_id`, `packet_seq`, `first_frame`, `t_mono_us`. HELLO carries a 40-byte
-payload (rate, channels, `S16_LE`, reserved, 32-byte device name). PCM payloads
-are capped at 1280 bytes so 32 + 1280 stays inside a 1500-byte MTU — larger
-blocks would be IP-fragmented and a lost fragment costs the whole packet.
+payload (rate, channels, `S16_LE`, reserved, 32-byte device name) — still
+announced, though now it can only ever say 16 kHz mono, so the announcement is a
+version check rather than a negotiation. PCM payloads are capped at 1280 bytes so
+32 + 1280 stays inside a 1500-byte MTU — larger blocks would be IP-fragmented and
+a lost fragment costs the whole packet.
 
 Three properties to preserve:
 
@@ -445,7 +548,9 @@ Three properties to preserve:
 - **`net_capture` does not write gap records.** A real loss moves `first_frame`
   and the node timer together, and the dispatcher registers the gap with the
   correct duration.
-- **Format mismatch is an error in `/status`, not an adaptation.**
+- **A node that does not announce the wire format is refused**, and the error in
+  `/status` names the wire format rather than a server setting, because there is
+  no setting any more.
 
 Out-of-order datagrams are held by `packet_seq` for `source.jitter_buffer_ms`
 (default 150 ms), then the hole is declared lost. A session id change or a large
@@ -470,10 +575,12 @@ once at startup and any change needs a restart.
 
 Sections: `[server]` (bind, port, http_threads 1–8, IANA `timezone`, `web_dir`),
 `[source]` (kind/bind/port/device_id/jitter_buffer_ms/idle_timeout_ms),
-`[audio]` (device, rate, channels 1–2, period/buffer, segment length, ring and
-queue depths ≥ 2 periods, gap tolerance, flush interval, shutdown timeout),
-`[detector]` (see below), `[stt]`, `[storage]` (both paths absolute, max >
-cleanup target, reserve, retention interval).
+`[audio]` (device name, device rate hint, device channels 1–2, `mono_channel_index`,
+period/buffer, segment length, ring and queue depths ≥ 2 periods, gap tolerance,
+flush interval, shutdown timeout), `[detector]` (see below), `[stt]`, `[storage]`
+(both paths absolute, max > cleanup target, reserve, retention interval).
+The wire format is deliberately *not* in this list: it is
+`steno_lib::config::WIRE_RATE_HZ` / `WIRE_CHANNELS`.
 
 `deployment/config.example.toml` is the authoritative key list with defaults, and
 `crates/lib/tests/config_example.rs` parses and validates that exact file,
@@ -526,16 +633,29 @@ Off by default (`stt.enabled = false`): it is the only stage that hands audio to
 another program. Where that program sits, and how it is launched, is in
 [Runtime architecture](#runtime-architecture). Two modes:
 
-- `mode = "stream"` (default): one long-lived sidecar over a Unix socket. Server →
-  sidecar: `[u32 len][i64 utc_ms][s16le mono 16 kHz PCM]`; sidecar → server:
-  one JSON object per line (`ready`/`partial`/`final`/`error`). Each frame carries
-  the recorder's wall clock, so a sidecar restart cannot shift text. The socket
-  exists because the sidecar is started with `open -n -a` (the only launcher that
-  returns immediately and leaves the process running) and `open` hands the child
-  no stdio. `SpeechAnalyzer` needs no permission grant; rebuilding the bundle
-  needs no re-authorisation.
+- `mode = "stream"` (default): one long-lived sidecar over a Unix socket, full
+  duplex, framed as `[u16 BE "SR"][u8 direction][u8 type][u32 BE length][payload]`.
+  Up: `0x01` audio (`[i64 BE utc_ms][s16le mono 16 kHz PCM]`), `0x02` snore
+  episode, `0x03` transcript, `0x04` session state. Down: `0x81` control
+  (`stop`/`flush`/`status`), `0x82` config (locale, snore threshold). The
+  direction byte is validated, so a desynchronised stream fails loudly instead of
+  being read as payload. Each audio frame carries the recorder's wall clock, so a
+  sidecar restart cannot shift text. The socket exists because the sidecar is
+  started with `open -n -a` (the only launcher that returns immediately and
+  leaves the process running) and `open` hands the child no stdio; the sidecar
+  also speaks the same protocol over stdin/stdout (`--mode stdio`) for embedding
+  and for the probe. `SpeechAnalyzer` needs no permission grant; rebuilding the
+  bundle needs no re-authorisation.
 - `mode = "segment"`: runs `stt.command` per finished WAV and parses one JSON
   object from stdout. Simpler, restart-safe, one process launch per segment.
+
+Watching it without the Portal: `tools/stt-watch.py` subscribes to
+`/api/v1/transcript` (the same WebSocket the page uses) and polls `/status` for
+the live level (`capture.level_peak_dbfs`, measured per block in the dispatcher),
+so text, snore episodes and "is the microphone hearing anything" are visible in a
+terminal. The sidecar itself can also write recognised phrases into its log
+(`--log-text`, off by default — a transcript does not belong in a world-readable
+/tmp file; `tools/dev.sh` passes it on a dev machine).
 
 The queue is the database (`segments_awaiting_transcript`): no in-memory backlog,
 crash-resumes, a slow recogniser cannot backpressure recording, and a failed

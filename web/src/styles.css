@@ -164,37 +164,6 @@ body {
   border-bottom-color: var(--accent);
 }
 
-/* --- console page -------------------------------------------------------- */
-
-/* The console ends with a pointer to the other page, because the two documents
-   are now separate: a reader who came here for the audio should not have to
-   guess that it moved. */
-.console-hint {
-  margin-top: 16px;
-  padding: 13px 18px;
-  color: var(--muted);
-  font-size: 12.5px;
-}
-
-.console-hint p {
-  margin: 0;
-}
-
-.console-hint strong {
-  color: var(--text);
-  font-weight: 600;
-}
-
-.console-hint a {
-  margin-left: 6px;
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.console-hint a:hover {
-  text-decoration: underline;
-}
-
 /* --- operational cards --------------------------------------------------- */
 
 .topbar-meta {
@@ -302,8 +271,10 @@ body {
 
 /* --- storage pool -------------------------------------------------------- */
 
+/* The pool closes the page, so it sets its own top gap instead of the bottom
+   one the other sections use. */
 .pool {
-  margin-bottom: 4px;
+  margin: 16px 0 0;
 }
 
 .meter {
@@ -440,6 +411,37 @@ body {
   padding: 16px 0;
 }
 
+.day-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* Three buttons that narrow the strip. They are small and quiet on purpose: the
+   strip is the content, this only decides what it lists. */
+.day-filter {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.day-filter button {
+  padding: 5px 9px;
+  font-size: 11.5px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.day-empty {
+  align-self: center;
+  padding: 0 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 input[type='date'] {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -476,6 +478,13 @@ button.ghost {
   background: transparent;
 }
 
+/* A button that sits inside a dense row: the panel head, a chip strip. */
+button.tiny {
+  padding: 3px 8px;
+  font-size: 10.5px;
+  border-radius: 7px;
+}
+
 button.on {
   background: rgba(245, 165, 36, 0.16);
   border-color: rgba(245, 165, 36, 0.5);
@@ -485,32 +494,58 @@ button.on {
 .day-scroll {
   display: flex;
   gap: 6px;
+  flex: 1;
+  min-width: 0;
   overflow-x: auto;
-  padding-left: 6px;
+  padding-left: 4px;
   scrollbar-width: thin;
 }
 
+/* One chip per night: date, segment count, and a bar for how much of the day
+   was actually recorded. The count alone cannot tell a 20-minute night from an
+   eight-hour one, and the strip is compared by shape at a glance. */
 .day-chip {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 3px;
   min-width: 58px;
-  padding: 6px 8px;
+  padding: 6px 8px 5px;
   background: transparent;
-  border-color: transparent;
+  border: 1px solid transparent;
+  border-radius: 9px;
 }
 
-.day-chip span {
-  font-size: 11px;
+.day-date {
+  font-size: 10.5px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
 }
 
-.day-chip b {
+.day-count {
   font-size: 13px;
   font-weight: 600;
+  line-height: 1.2;
   font-variant-numeric: tabular-nums;
+}
+
+.day-bar {
+  display: block;
+  width: 100%;
+  height: 3px;
+  margin-top: 1px;
+  border-radius: 999px;
+  background: #22303e;
+  overflow: hidden;
+}
+
+.day-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: #35506b;
 }
 
 .day-chip.active {
@@ -518,8 +553,30 @@ button.on {
   border-color: #2b3d50;
 }
 
-.day-chip.active span {
+.day-chip.active .day-date {
   color: var(--text);
+}
+
+.day-chip.active .day-bar i {
+  background: var(--accent);
+}
+
+.day-chip.today .day-date {
+  color: var(--accent);
+}
+
+/* A candidate on that night — the only thing on this strip that is not a
+   duration. A dot, because it is a flag, not a quantity. */
+.day-chip.has-events::after {
+  content: '';
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.85;
 }
 
 /* --- layout ------------------------------------------------------------- */
@@ -562,7 +619,8 @@ button.on {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px 12px;
+  flex-wrap: wrap;
   margin-bottom: 14px;
 }
 
@@ -577,6 +635,35 @@ button.on {
   font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* The summary of a selected window. It sits in the head because it describes the
+   selection, and a selection is not worth a card of its own: it comes and goes
+   with one drag. */
+.head-stats {
+  display: flex;
+  align-items: center;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.head-stats b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.head-span {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(245, 165, 36, 0.12);
+  border: 1px solid rgba(245, 165, 36, 0.32);
+  color: #ffd08a;
+  font-family: var(--mono);
+  font-size: 10.5px;
 }
 
 .empty {
@@ -669,8 +756,14 @@ button.on {
 
 /* Dragging must not select text inside the track. */
 .timeline-scroll.dragging,
-.timeline-scroll.dragging * {
+.timeline-scroll.dragging *,
+.timeline-scroll.selecting,
+.timeline-scroll.selecting * {
   user-select: none;
+}
+
+.timeline-scroll.selecting {
+  cursor: crosshair;
 }
 
 .timeline-track {
@@ -680,8 +773,11 @@ button.on {
   background: #0c1218;
   border: 1px solid var(--line);
   /* No clipping: at high zoom the segment widths are already exact, and hiding
-     the overflow here would cut the last block at the viewport edge. */
+     the overflow here would cut the last block at the viewport edge.
+     No `overflow: hidden` also keeps a selected window's edge handles usable at
+     the very ends of the night. */
   box-sizing: border-box;
+  cursor: crosshair;
 }
 
 .timeline-hint {
@@ -740,6 +836,59 @@ button.on {
   background: var(--ok);
 }
 
+/* --- window selection ---------------------------------------------------- */
+
+/* The wash takes no pointer events, so the segment blocks under it stay
+   clickable — selecting a window and selecting a segment are different acts and
+   must not fight over the same drag. Only the two edges grab. */
+.range {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 2;
+  pointer-events: none;
+  border-radius: 4px;
+  background: rgba(245, 165, 36, 0.15);
+  border-top: 1px solid rgba(245, 165, 36, 0.45);
+  border-bottom: 1px solid rgba(245, 165, 36, 0.45);
+}
+
+.range-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  pointer-events: auto;
+  cursor: ew-resize;
+}
+
+.range-handle::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 10px -2px rgba(245, 165, 36, 0.9);
+}
+
+.range-handle.from {
+  left: -4px;
+}
+
+.range-handle.from::after {
+  left: 4px;
+}
+
+.range-handle.to {
+  right: -4px;
+}
+
+.range-handle.to::after {
+  right: 4px;
+}
+
 /* --- events ------------------------------------------------------------- */
 
 .event-list {
@@ -796,14 +945,15 @@ button.on {
   font-variant-numeric: tabular-nums;
 }
 
-.event-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.event-actions button {
-  padding: 4px 9px;
-  font-size: 11px;
+/* A label carried over from a previously reviewed night. There is no control
+   next to it any more: this page reports candidates, it does not grade them. */
+.event-tag {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 10.5px;
+  color: var(--muted);
 }
 
 /* --- detail ------------------------------------------------------------- */
@@ -814,6 +964,16 @@ button.on {
   margin-bottom: 14px;
   filter: invert(0.92) hue-rotate(180deg) saturate(0.7);
   border-radius: 8px;
+}
+
+/* Stands where the player would be when retention has taken the audio. */
+.player-missing {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #0c1218;
+  font-size: 11.5px;
 }
 
 .facts {
@@ -842,6 +1002,22 @@ button.on {
   font-variant-numeric: tabular-nums;
 }
 
+/* A value that is technically a reading but means "this is broken": a muted
+   capsule reported as a number looks healthy until it is coloured. */
+.facts dd.bad {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* The one actionable sentence under a card whose state needs explaining. Not a
+   banner: the card is still working, one input of it is not. */
+.signal-hint {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--danger);
+}
+
 .muted {
   color: var(--muted);
 }
@@ -860,26 +1036,153 @@ button.on {
   .app {
     padding: 20px 14px 48px;
   }
+  /* The strip gets its own line once the arrows, the date and the filters no
+     longer fit beside it. */
+  .daybar {
+    flex-wrap: wrap;
+  }
+  .day-scroll {
+    order: 3;
+    flex-basis: 100%;
+  }
+  .day-filter {
+    margin-left: auto;
+  }
 }
 
 /* --- streaming transcript ------------------------------------------------ */
 
-/* A transcript is read as prose, so it is one flowing passage rather than a list
-   of timestamped rows. Each phrase stays an inline element with its own title,
-   which is where the timestamps live. */
+/* One phrase per line, with its clock on a rail to the left. A transcript is
+   scanned by time as often as it is read as prose, and the row is the thing you
+   can click: it seeks the player to that instant and selects the segment that
+   holds it. The rail is drawn per row rather than on the list — the list is a
+   scroll container, so a line on it would either clip the dots or scroll away. */
 .transcript {
-  font-size: 13.5px;
-  line-height: 1.85;
-  color: var(--text);
-  max-height: 320px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 380px;
   overflow-y: auto;
   scrollbar-width: thin;
 }
 
-.transcript-phrase + .transcript-phrase::before {
-  /* A thin space between phrases: the recogniser's phrases are consecutive
-     parts of one sentence, so a comma or a full stop would be an invention. */
-  content: ' ';
+.transcript li {
+  margin: 0;
+  padding: 0;
+}
+
+.transcript-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  width: 100%;
+  padding: 6px 10px 6px 18px;
+  border: 0;
+  border-radius: 0 8px 8px 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* The rail: one 1px segment per row, and the rows are adjacent, so it reads as
+   one unbroken line down the list. */
+.transcript-row::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--line);
+}
+
+/* The dot, straddling the rail at the height of the clock. */
+.transcript-row::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 12px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #0f1720;
+  border: 1px solid #2b3d50;
+}
+
+.transcript-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.transcript-row:hover::after {
+  border-color: #48627c;
+}
+
+/* The phrase under the playhead. It follows the audio, so the transcript reads
+   as a subtitle track while the night plays back. */
+.transcript-row.active {
+  background: rgba(245, 165, 36, 0.09);
+}
+
+.transcript-row.active::after {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(245, 165, 36, 0.16);
+}
+
+/* Outside the window selected on the timeline. Dimmed, not hidden: the window
+   is a lens, and a row that disappears cannot be found again by scrolling. */
+.transcript-row.outside {
+  opacity: 0.45;
+}
+
+/* The audio behind this phrase was reclaimed by retention. Only the clock is
+   dimmed: the words are still worth reading, the jump target is not. */
+.transcript-row.no-audio .transcript-time b {
+  color: #46566a;
+}
+
+.transcript-row.no-audio::after {
+  background: transparent;
+  border-style: dashed;
+}
+
+.transcript-time {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.transcript-time b {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.transcript-time i {
+  font-size: 10px;
+  font-style: normal;
+  color: #5c6c7d;
+}
+
+.transcript-row.active .transcript-time b {
+  color: var(--accent);
+}
+
+.transcript-text {
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.transcript-note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #ffb4a6;
 }
 
 .transcript-live {
@@ -946,48 +1249,4 @@ button.on {
   margin: 10px 0 0;
   font-size: 11px;
   color: var(--muted);
-}
-
-.utterance-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 320px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-}
-
-.utterance {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--line);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.utterance:last-child {
-  border-bottom: none;
-}
-
-.utterance-time {
-  flex: none;
-  width: 62px;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 11px;
-}
-
-.utterance-text {
-  color: var(--text);
-}
-
-/* The phrase being recognised: dimmer, italic, and it disappears on its own. */
-.utterance.live .utterance-text {
-  color: var(--muted);
-  font-style: italic;
 }

@@ -1,4 +1,8 @@
-//! SQLite schema, migrations and typed queries (TECH_SPEC §7, task T4.1).
+//! Typed queries against the SQLite file (TECH_SPEC §7, task T4.1).
+//!
+//! The schema is not declared here. Every table lives in a versioned file under
+//! `migrations/`, applied by [`crate::migrate`]; this module only reads and
+//! writes rows in the shape those files define.
 //!
 //! Connections are opened per owning worker/thread. WAL and foreign keys are
 //! enabled for each connection; audio callbacks never touch this module.
@@ -12,8 +16,6 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-const SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct SegmentStarted {
@@ -126,8 +128,19 @@ pub struct EventRow {
     pub started_at_utc: DateTime<Utc>,
     pub ended_at_utc: DateTime<Utc>,
     pub duration_ms: u32,
+    /// Which detector wrote this row: `rule-v1` for the server's own DSP, or
+    /// `apple-soundanalysis-v1` for the sidecar's classifier. Without it the two
+    /// annotations of the same second are indistinguishable after the fact.
+    pub source: String,
     pub rule_score: Option<f32>,
     pub detector_version: String,
+    /// Classifier label and confidence. `None` on rule-based rows: the DSP has
+    /// no label, and inventing one would make a filter look meaningful.
+    pub classifier_label: Option<String>,
+    pub classifier_confidence: Option<f32>,
+    /// The confidence the episode had to reach to be opened. Stored because a
+    /// row is only meaningful next to the bar it cleared.
+    pub classifier_threshold: Option<f32>,
     pub peak_dbfs: Option<f32>,
     pub mean_level_dbfs: Option<f32>,
     pub mean_band_ratio: Option<f32>,
@@ -162,6 +175,28 @@ pub struct TranscriptRow {
     pub created_at_utc: DateTime<Utc>,
 }
 
+/// An annotation produced outside the server's own detector — today, the
+/// sidecar's `SoundAnalysis` snore lane.
+///
+/// The range is wall-clock and the offsets are derived, which is the whole point:
+/// the analyser knows what it heard and when, not which file and which frame.
+#[derive(Debug, Clone)]
+pub struct ClassifiedEvent {
+    pub started_at_utc: DateTime<Utc>,
+    pub ended_at_utc: DateTime<Utc>,
+    /// Classifier label, e.g. `snoring`.
+    pub label: String,
+    /// Peak confidence across the windows that made up the episode.
+    pub confidence: f32,
+    /// The confidence needed to open the episode.
+    pub threshold: f32,
+    /// Written into both `source` and `detector_version`: for a classifier row
+    /// they name the same thing, and a reader looking for either must find it.
+    pub source: String,
+    /// `normal` or `shutdown`.
+    pub end_reason: String,
+}
+
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
@@ -194,124 +229,14 @@ impl Database {
         Ok(())
     }
 
-    /// Idempotent migration managed by `PRAGMA user_version`.
+    /// Brings the file up to the schema this binary ships.
+    ///
+    /// The DDL is not here: every statement lives in `migrations/*.sql` and is
+    /// applied by [`crate::migrate`], which also records what it ran in the
+    /// `_sqlx_migrations` table `sqlx migrate info` reads. A database newer than
+    /// the binary is refused, not downgraded.
     pub fn migrate(&self) -> Result<()> {
-        let mut version: i32 = self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(Error::Storage(format!(
-                "database schema version {version} is newer than supported {SCHEMA_VERSION}"
-            )));
-        }
-        if version == 0 {
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute_batch(
-                "CREATE TABLE recording_segments (
-                    id TEXT PRIMARY KEY,
-                    relative_path TEXT NOT NULL UNIQUE,
-                    started_at_utc TEXT NOT NULL,
-                    ended_at_utc TEXT,
-                    capture_rate_hz INTEGER NOT NULL CHECK(capture_rate_hz > 0),
-                    channels INTEGER NOT NULL CHECK(channels BETWEEN 1 AND 2),
-                    sample_format TEXT NOT NULL CHECK(sample_format = 'S16_LE'),
-                    channel_mapping TEXT NOT NULL,
-                    frame_count INTEGER NOT NULL DEFAULT 0 CHECK(frame_count >= 0),
-                    size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(size_bytes >= 0),
-                    xrun_count INTEGER NOT NULL DEFAULT 0 CHECK(xrun_count >= 0),
-                    gap_count INTEGER NOT NULL DEFAULT 0 CHECK(gap_count >= 0),
-                    lost_frames_total INTEGER NOT NULL DEFAULT 0 CHECK(lost_frames_total >= 0),
-                    time_quality TEXT NOT NULL CHECK(time_quality IN ('synced','unsynced','corrected')),
-                    boot_id TEXT NOT NULL,
-                    clock_drift_ppm REAL,
-                    end_reason TEXT CHECK(end_reason IS NULL OR end_reason IN ('duration','gap','time_step','format_change','size_limit','shutdown','error')),
-                    status TEXT NOT NULL CHECK(status IN ('recording','complete','interrupted','deleted','missing')),
-                    created_at_utc TEXT NOT NULL
-                );
-                CREATE TABLE audio_gaps (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    segment_id TEXT NOT NULL REFERENCES recording_segments(id) ON DELETE CASCADE,
-                    offset_frames INTEGER NOT NULL CHECK(offset_frames >= 0),
-                    lost_frames INTEGER NOT NULL CHECK(lost_frames >= 0),
-                    kind TEXT NOT NULL CHECK(kind IN ('xrun','stream_error','capture_ring_overflow','queue_overflow','stream_rebuild')),
-                    estimate_source TEXT NOT NULL CHECK(estimate_source IN ('timestamp','counter','unknown')),
-                    at_utc TEXT NOT NULL
-                );
-                CREATE TABLE snore_events (
-                    id TEXT PRIMARY KEY,
-                    segment_id TEXT NOT NULL REFERENCES recording_segments(id) ON DELETE CASCADE,
-                    start_offset_frames INTEGER NOT NULL CHECK(start_offset_frames >= 0),
-                    end_offset_frames INTEGER NOT NULL CHECK(end_offset_frames >= start_offset_frames),
-                    started_at_utc TEXT NOT NULL,
-                    ended_at_utc TEXT NOT NULL,
-                    duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
-                    rule_score REAL CHECK(rule_score IS NULL OR (rule_score >= 0 AND rule_score <= 1)),
-                    detector_version TEXT NOT NULL,
-                    peak_dbfs REAL,
-                    mean_level_dbfs REAL,
-                    mean_band_ratio REAL,
-                    noise_floor_dbfs REAL,
-                    end_reason TEXT NOT NULL DEFAULT 'normal' CHECK(end_reason IN ('normal','max_duration','segment_end','gap','detector_gap','shutdown')),
-                    review_status TEXT NOT NULL DEFAULT 'unreviewed' CHECK(review_status IN ('snore','not_snore','unreviewed')),
-                    continued INTEGER NOT NULL DEFAULT 0 CHECK(continued IN (0,1)),
-                    created_at_utc TEXT NOT NULL
-                );
-                CREATE INDEX idx_events_started_at ON snore_events(started_at_utc);
-                CREATE INDEX idx_events_segment_offset ON snore_events(segment_id,start_offset_frames);
-                CREATE INDEX idx_segments_started_at ON recording_segments(started_at_utc);
-                CREATE INDEX idx_gaps_segment_offset ON audio_gaps(segment_id,offset_frames);
-                PRAGMA user_version = 1;",
-            )?;
-            tx.commit()?;
-            version = 1;
-        }
-        if version < 2 {
-            // Transcription is an optional, additive stage: it never blocks
-            // recording and it can be re-run, so it gets its own table rather
-            // than columns on `recording_segments`.
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute_batch(
-                "CREATE TABLE segment_transcripts (
-                    segment_id TEXT PRIMARY KEY REFERENCES recording_segments(id) ON DELETE CASCADE,
-                    engine TEXT NOT NULL,
-                    language TEXT,
-                    text TEXT NOT NULL DEFAULT '',
-                    segments_json TEXT NOT NULL DEFAULT '[]',
-                    status TEXT NOT NULL CHECK(status IN ('ok','failed','skipped')),
-                    error TEXT,
-                    audio_seconds REAL,
-                    created_at_utc TEXT NOT NULL
-                );
-                CREATE INDEX idx_transcripts_created ON segment_transcripts(created_at_utc);
-                CREATE INDEX idx_transcripts_status ON segment_transcripts(status);
-                PRAGMA user_version = 2;",
-            )?;
-            tx.commit()?;
-            version = 2;
-        }
-        if version < 3 {
-            // Streaming transcription produces phrases, not per-segment text:
-            // one utterance can span a segment boundary, and a segment can hold
-            // several. They are keyed by wall clock so the UI can lay them on
-            // the same timeline as the events.
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute_batch(
-                "CREATE TABLE utterances (
-                    id TEXT PRIMARY KEY,
-                    started_at_utc TEXT NOT NULL,
-                    ended_at_utc TEXT NOT NULL,
-                    engine TEXT NOT NULL,
-                    language TEXT,
-                    text TEXT NOT NULL DEFAULT '',
-                    segments_json TEXT NOT NULL DEFAULT '[]',
-                    created_at_utc TEXT NOT NULL
-                );
-                CREATE INDEX idx_utterances_started_at ON utterances(started_at_utc);
-                PRAGMA user_version = 3;",
-            )?;
-            tx.commit()?;
-            version = 3;
-        }
-        let _ = version;
-        Ok(())
+        crate::migrate::apply(&self.conn)
     }
 
     pub fn connection(&self) -> &Connection {
@@ -381,10 +306,10 @@ impl Database {
         self.conn.execute(
             "INSERT INTO snore_events (
                 id,segment_id,start_offset_frames,end_offset_frames,started_at_utc,
-                ended_at_utc,duration_ms,rule_score,detector_version,peak_dbfs,
+                ended_at_utc,duration_ms,source,rule_score,detector_version,peak_dbfs,
                 mean_level_dbfs,mean_band_ratio,noise_floor_dbfs,end_reason,
                 review_status,continued,created_at_utc
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'unreviewed',?15,?16)",
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,'rule-v1',?8,?9,?10,?11,?12,?13,?14,'unreviewed',?15,?16)",
             params![
                 event.id,
                 event.segment_id,
@@ -405,6 +330,79 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// An annotation whose only coordinates are wall-clock ones — today, the
+    /// sidecar's classifier.
+    ///
+    /// It deliberately carries no offsets: the range is what the analyser
+    /// reported, and the frame offsets are derived here from the segment that
+    /// owns that range and the rate it was recorded at. That is the only honest
+    /// way to turn a clock into a frame index, and it is why the conversion lives
+    /// next to the schema rather than in the caller.
+    ///
+    /// An episode that spans a segment boundary becomes one row per segment, with
+    /// `continued` set on the continuation rows: the audio is split across files,
+    /// so a single row could not point at it.
+    ///
+    /// Returns the number of rows written. Zero means no recorded segment covers
+    /// the range — the caller must report that, not pretend it was stored.
+    pub fn insert_classified_event(&self, event: &ClassifiedEvent) -> Result<usize> {
+        if event.ended_at_utc <= event.started_at_utc {
+            return Ok(0);
+        }
+        let segments = self.segments_between(event.started_at_utc, event.ended_at_utc)?;
+        let base_id = external_event_id();
+        let mut written = 0usize;
+        for segment in segments {
+            let rate = f64::from(segment.capture_rate_hz.max(1));
+            let segment_start = segment.started_at_utc;
+            let overlap_start = event.started_at_utc.max(segment_start);
+            let overlap_end = match segment.ended_at_utc {
+                Some(end) => event.ended_at_utc.min(end),
+                // Still recording: the audio up to `ended_at` exists on disk, so
+                // the episode's own end is the bound.
+                None => event.ended_at_utc,
+            };
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let start_offset = offset_frames(overlap_start, segment_start, rate);
+            let end_offset = offset_frames(overlap_end, segment_start, rate).max(start_offset + 1);
+            let duration_ms = (overlap_end - overlap_start).num_milliseconds().max(1);
+            let id = if written == 0 {
+                base_id.clone()
+            } else {
+                format!("{base_id}-{written}")
+            };
+            self.conn.execute(
+                "INSERT INTO snore_events (
+                    id,segment_id,start_offset_frames,end_offset_frames,started_at_utc,
+                    ended_at_utc,duration_ms,source,detector_version,classifier_label,
+                    classifier_confidence,classifier_threshold,end_reason,review_status,
+                    continued,created_at_utc
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'unreviewed',?14,?15)",
+                params![
+                    id,
+                    segment.id,
+                    start_offset,
+                    end_offset,
+                    overlap_start.to_rfc3339(),
+                    overlap_end.to_rfc3339(),
+                    duration_ms,
+                    event.source,
+                    event.source,
+                    event.label,
+                    f64::from(event.confidence),
+                    f64::from(event.threshold),
+                    event.end_reason,
+                    i64::from(written > 0),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            written += 1;
+        }
+        Ok(written)
     }
 
     pub fn set_review_status(&self, event_id: &str, status: ReviewStatus) -> Result<bool> {
@@ -839,8 +837,12 @@ fn map_event(row: &Row<'_>) -> rusqlite::Result<EventRow> {
         started_at_utc: parse_utc(&row.get::<_, String>("started_at_utc")?),
         ended_at_utc: parse_utc(&row.get::<_, String>("ended_at_utc")?),
         duration_ms: row.get("duration_ms")?,
+        source: row.get("source")?,
         rule_score: row.get("rule_score")?,
         detector_version: row.get("detector_version")?,
+        classifier_label: row.get("classifier_label")?,
+        classifier_confidence: row.get("classifier_confidence")?,
+        classifier_threshold: row.get("classifier_threshold")?,
         peak_dbfs: row.get("peak_dbfs")?,
         mean_level_dbfs: row.get("mean_level_dbfs")?,
         mean_band_ratio: row.get("mean_band_ratio")?,
@@ -900,6 +902,23 @@ pub fn local_day_range(date: NaiveDate, timezone: Option<chrono_tz::Tz>) -> (Dat
     }
 }
 
+
+/// Frames from the segment's start to `at`, at the rate the segment was captured
+/// at. Rounded rather than truncated: a sub-frame rounding error repeated across
+/// a night is a visible offset in the Portal.
+fn offset_frames(at: DateTime<Utc>, segment_start: DateTime<Utc>, rate: f64) -> i64 {
+    let micros = (at - segment_start).num_microseconds().unwrap_or(0).max(0);
+    ((micros as f64 / 1_000_000.0) * rate).round() as i64
+}
+
+/// Ids only need to be unique within one database.
+fn external_event_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("evt{:013x}{:04x}", Utc::now().timestamp_millis(), n & 0xffff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,11 +943,144 @@ mod tests {
     }
 
     #[test]
+    fn a_classified_episode_becomes_one_row_per_segment_it_touches() {
+        let db = Database::in_memory().unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        // Two consecutive one-second segments at 16 kHz.
+        for (id, offset) in [("seg-a", 0i64), ("seg-b", 1)] {
+            let began = start + chrono::Duration::seconds(offset);
+            db.insert_segment_started(&segment(id, began, &format!("2025/01/01/{id}.wav")))
+                .unwrap();
+            db.complete_segment(&SegmentCompleted {
+                id: id.into(),
+                ended_at_utc: began + chrono::Duration::seconds(1),
+                frame_count: 16_000,
+                size_bytes: 32_044,
+                end_reason: "duration".into(),
+                clock_drift_ppm: None,
+                xrun_count: 0,
+                gap_count: 0,
+                lost_frames_total: 0,
+                status: SegmentStatus::Complete,
+            })
+            .unwrap();
+        }
+
+        // An episode from the middle of the first into the middle of the second:
+        // it cannot be one row, because the audio is two files.
+        let written = db
+            .insert_classified_event(&ClassifiedEvent {
+                started_at_utc: start + chrono::Duration::milliseconds(500),
+                ended_at_utc: start + chrono::Duration::milliseconds(1_500),
+                label: "snoring".into(),
+                confidence: 0.81,
+                threshold: 0.5,
+                source: "apple-soundanalysis-v1".into(),
+                end_reason: "normal".into(),
+            })
+            .unwrap();
+        assert_eq!(written, 2);
+
+        let rows = db.events_between(start, start + chrono::Duration::seconds(2)).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Offsets are derived from the clock at the segment's own capture rate.
+        assert_eq!(rows[0].segment_id, "seg-a");
+        assert_eq!(rows[0].start_offset_frames, 8_000);
+        assert_eq!(rows[0].end_offset_frames, 16_000);
+        assert!(!rows[0].continued);
+        assert_eq!(rows[1].segment_id, "seg-b");
+        assert_eq!(rows[1].start_offset_frames, 0);
+        assert_eq!(rows[1].end_offset_frames, 8_000);
+        assert!(rows[1].continued);
+        assert_eq!(rows[0].source, "apple-soundanalysis-v1");
+        assert_eq!(rows[0].classifier_label.as_deref(), Some("snoring"));
+        assert_eq!(rows[0].classifier_confidence, Some(0.81));
+        // The rule-based fields stay empty: a classifier has no rule score and no
+        // dBFS measurement, and inventing one would make a filter lie.
+        assert_eq!(rows[0].rule_score, None);
+        assert_eq!(rows[0].peak_dbfs, None);
+    }
+
+    #[test]
+    fn v4_carries_rule_events_over_instead_of_dropping_them() {
+        // A v3 database as it exists in the field: `snore_events` with no
+        // `source`. The migration must keep the rows — before v4 the rule
+        // detector was the table's only writer, so every one of them is
+        // `rule-v1` by construction.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            // Built from the shipped migration files rather than a hand-copied
+            // schema, so this fixture cannot drift from what v3 really was. No
+            // `_sqlx_migrations` row is written and `user_version` is set by
+            // hand: that is exactly the shape a pre-migrations binary left
+            // behind, and it is what the baseline path has to recognise.
+            for migration in crate::migrate::migration_files()
+                .unwrap()
+                .iter()
+                .filter(|m| m.version <= 3)
+            {
+                conn.execute_batch(migration.sql).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+            conn.execute(
+                "INSERT INTO recording_segments (id,relative_path,started_at_utc,capture_rate_hz,
+                    channels,sample_format,channel_mapping,time_quality,boot_id,status,created_at_utc)
+                 VALUES ('seg','x.wav',?1,16000,1,'S16_LE','mono','synced','b','complete',?1)",
+                [start.to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snore_events (id,segment_id,start_offset_frames,end_offset_frames,
+                    started_at_utc,ended_at_utc,duration_ms,rule_score,detector_version,
+                    peak_dbfs,created_at_utc)
+                 VALUES ('old','seg',0,16000,?1,?2,1000,0.9,'rule-v1',-12.0,?1)",
+                [start.to_rfc3339(), (start + chrono::Duration::seconds(1)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let version: i32 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
+        let rows = db.events_between(start, start + chrono::Duration::hours(1)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "old");
+        assert_eq!(rows[0].source, "rule-v1");
+        assert_eq!(rows[0].rule_score, Some(0.9));
+        assert_eq!(rows[0].peak_dbfs, Some(-12.0));
+        // The classifier columns are empty on a rule row, and stay empty.
+        assert_eq!(rows[0].classifier_label, None);
+        assert_eq!(rows[0].classifier_confidence, None);
+    }
+
+    #[test]
+    fn an_episode_over_unrecorded_time_writes_nothing() {
+        let db = Database::in_memory().unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let written = db
+            .insert_classified_event(&ClassifiedEvent {
+                started_at_utc: start,
+                ended_at_utc: start + chrono::Duration::seconds(3),
+                label: "snoring".into(),
+                confidence: 0.9,
+                threshold: 0.5,
+                source: "apple-soundanalysis-v1".into(),
+                end_reason: "normal".into(),
+            })
+            .unwrap();
+        // Zero, not an error: the caller has to report "no audio behind this".
+        assert_eq!(written, 0);
+    }
+
+    #[test]
     fn migrations_are_idempotent_and_enable_foreign_keys() {
         let db = Database::in_memory().unwrap();
         db.migrate().unwrap();
         let version: i32 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         // Each version is additive and both must be present after an in-place
         // upgrade of an older database.
         let transcripts: i64 = db

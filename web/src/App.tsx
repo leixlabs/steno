@@ -2,9 +2,12 @@
 //
 // Routing is a hash rather than a path on purpose. The server serves this SPA
 // from a directory and falls back to index.html for unknown paths, so a path
-// route would work too — but `#/recordings` also survives being opened from a
+// route would work too — but `#/console` also survives being opened from a
 // file:// preview and needs no server cooperation at all. Two pages do not
 // justify a router dependency.
+//
+// Recordings is the landing page: the night is what this device is for, and the
+// console is the answer to a question you only ask when something looks wrong.
 
 import { useEffect, useState } from 'react'
 import { api, type Status } from './api'
@@ -15,12 +18,12 @@ import { serviceLabel, serviceTone, toneClass } from './ui'
 type Page = 'console' | 'recordings'
 
 const PAGES: { id: Page; label: string; hint: string }[] = [
-  { id: 'console', label: '控制台', hint: '服务端 · 采集端 · 存储' },
   { id: 'recordings', label: '录音', hint: '时间轴 · 片段 · 语句' },
+  { id: 'console', label: '控制台', hint: '服务端 · 采集端 · 存储' },
 ]
 
 function pageFromHash(): Page {
-  return window.location.hash.replace(/^#\/?/, '') === 'recordings' ? 'recordings' : 'console'
+  return window.location.hash.replace(/^#\/?/, '') === 'console' ? 'console' : 'recordings'
 }
 
 export default function App() {

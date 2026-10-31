@@ -22,9 +22,13 @@ export interface Status {
   microphone: {
     state: string
     device: string
+    /** Format of the recording: always 16 kHz mono. */
     capture_rate_hz: number
     channels: number
     sample_format: string
+    /** What the device itself runs at; 0 until negotiated. */
+    device_rate_hz: number
+    device_channels: number
   }
   detector: {
     state: string
@@ -48,6 +52,10 @@ export interface Status {
     newest_ended_at_utc: string | null
   }
   capture: {
+    /** Peak of the newest block, in dBFS; null before the first block. */
+    level_peak_dbfs: number | null
+    /** RMS of the newest block, in dBFS; null before the first block. */
+    level_rms_dbfs: number | null
     xrun_count: number
     lost_frames_total: number
     capture_ring_overflow_frames: number
@@ -58,6 +66,8 @@ export interface Status {
   source: {
     kind: string
     node_connected: boolean
+    /** `ip:port` the newest datagram came from; null before the first one. */
+    peer: string | null
     /** Wall clock of the newest datagram; null before the first one. */
     last_packet_at_utc: string | null
     packets_received: number
@@ -101,6 +111,13 @@ export interface Status {
     /** The recogniser command line the worker uses; null when it is off. */
     launch: { command: string; args: string[] } | null
   }
+  /**
+   * `ok` | `silent` | `dead` | `unknown`.
+   *
+   * `silent` is digital silence (every sample zero). `dead` is the one that
+   * matters: samples arrive and carry only dither, so a muted capsule or an
+   * unseated microphone used to be indistinguishable from a working one.
+   */
   signal_state: string
 }
 
@@ -236,6 +253,12 @@ export const api = {
     return data.utterances
   },
 
+  /**
+   * Sets a candidate's review label. The server still exposes this and the
+   * column still holds labels from earlier nights, but the Portal no longer
+   * offers the controls: the page reports candidates, it does not grade them.
+   * Kept typed so the endpoint stays documented on this side too.
+   */
   async review(
     eventId: string,
     status: 'snore' | 'not_snore' | 'unreviewed',

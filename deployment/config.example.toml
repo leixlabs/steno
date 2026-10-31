@@ -37,10 +37,12 @@ web_dir = "web/dist"
 #   "alsa" — this process opens the microphone itself (single-box deployment,
 #            the default; nothing below this line is used).
 #   "net"  — a capture node (steno-node on a Pi, or an ESP32) streams PCM here
-#            over UDP and this process only records, detects and serves. The
-#            expected audio layout still comes from [audio]: the node must
-#            announce exactly `preferred_rate_hz` and `channels`, otherwise its
-#            audio is refused rather than reinterpreted.
+#            over UDP and this process only records, detects and serves.
+#
+# Either way the server receives or produces one format — 16 kHz mono S16_LE —
+# and there is nothing to configure about it: the node converts before sending,
+# and the local path converts after the device. A node that announces a
+# different format in its HELLO is refused rather than reinterpreted.
 kind = "alsa"
 # Only for kind = "net". `0.0.0.0` is required for a node on another host;
 # loopback silently accepts nothing, so the feature would look broken.
@@ -62,19 +64,28 @@ idle_timeout_ms = 5000
 # present, startup fails instead of guessing. A concrete example:
 # alsa_device = "hw:1,0"
 alsa_device = ""
-# Requested capture rate. Must be one of 16000, 32000, 44100, 48000, 96000
-# (TECH_SPEC §5.1). If the device cannot deliver it, negotiation falls back to
-# 48 kHz then 44.1 kHz, and the actual rate is recorded per segment.
-preferred_rate_hz = 16000
-# 1 or 2 channels. The recorder always stores every channel; the detector
-# analyses only `mono_channel_index`.
-channels = 1
+# Everything in this section describes the *device*, not the recording. What is
+# recorded, sent and recognised is always 16 kHz mono S16_LE, because every
+# consumer downstream (recorder, detector, recogniser, sidecar) is written
+# against that one format. It is not a setting: it used to be configured as
+# `preferred_rate_hz` + `channels` on both machines, which meant two files had
+# to agree by hand and a mismatch silently refused the audio.
+#
+# Requested device rate. Must be one of 16000, 32000, 44100, 48000, 96000
+# (TECH_SPEC §5.1). The device's own default configuration is tried first — it
+# is the only rate ALSA guarantees — so this is a fallback hint.
+device_rate_hz = 16000
+# Device channels to ask for, 1 or 2. A stereo device is captured as stereo and
+# converted down; the recording is mono either way.
+device_channels = 1
 # Rumble filter on the capture path, in Hz; 0 disables it. A condenser
 # microphone at high gain produces a floor that is almost entirely sub-250 Hz
 # airflow and preamp noise — measured at -33 dBFS on the bedside device, only a
 # few dB below speech, which leaves the recogniser nothing to work with. A
 # second-order high pass at 120 Hz drops that floor by 8 dB. Kept low enough that
 # a male fundamental survives: this is a rumble filter, not a telephone band.
+# On a split deployment this belongs on the *node*: the copy of record and the
+# uplink must hear the same thing.
 rumble_highpass_hz = 120
 # Only S16_LE is supported for capture and recording.
 format = "S16_LE"
@@ -82,9 +93,11 @@ format = "S16_LE"
 period_ms = 10
 buffer_ms = 200
 # Segment rotation is by stored frame count, not on the hour: one hour at 16 kHz
-# mono. Must keep a segment below 4 GiB (rate x channels x 2 B x seconds).
+# mono. Must keep a segment below 4 GiB.
 segment_duration_seconds = 3600
-# Channel the detector listens to; must be < channels.
+# Which of the device's channels becomes the mono stream. Must be
+# < device_channels. Not an average: a bedside microphone often has one capsule
+# pointed at the room and one at a wall, and averaging mixes the reflection in.
 mono_channel_index = 0
 # SPSC capture ring size. Must be at least 2 periods, so is every queue below.
 capture_ring_ms = 500
@@ -102,7 +115,9 @@ header_flush_interval_seconds = 30
 shutdown_timeout_seconds = 10
 
 [detector]
-# Fixed at 16000 for the MVP; any other value is a validation error.
+# Fixed at 16000 for the MVP; any other value is a validation error. It equals
+# the wire format, so the detector's resampler is always a pass-through: the
+# conversion happened at capture.
 detection_rate_hz = 16000
 # Frame length and hop. 10 ms at 16 kHz is 160 samples.
 frame_ms = 10
@@ -172,6 +187,11 @@ socket_path = ""
 # before the SpeechAnalyzer migration say `apple-sfspeech`; this is the label for
 # new ones.
 engine = "apple-speechanalyzer"
+# Language the recogniser listens for. Sent to the sidecar in the `config` frame
+# that precedes the first audio block: the orchestrator decides the language, and
+# a sidecar guessing it from a built-in default would transcribe a night in the
+# wrong one. Must be a locale the sidecar reports in `--check`.
+locale = "zh-CN"
 # Executable that takes the WAV path and prints one JSON object on stdout. Only
 # used when `mode = "segment"`; it is ignored by the streaming lane.
 command = "steno-stt-sidecar-file"

@@ -54,6 +54,21 @@ pub enum TranscriptEvent {
     },
     /// The recogniser is (re)connecting, or has stopped.
     State { state: String },
+    /// A snore episode the sidecar's classifier reported and the server stored.
+    ///
+    /// Separate from `Final` because it is a different kind of fact: a phrase is
+    /// text a person said, an episode is an annotation about the audio. Pushed
+    /// live because "the classifier fired at all" is the first question a quiet
+    /// night raises, and waiting for a page refresh hides it for minutes.
+    Snore {
+        start_ms: i64,
+        end_ms: i64,
+        label: String,
+        peak: f32,
+        mean: f32,
+        windows: u32,
+        threshold: f32,
+    },
     /// The recogniser reported a failure. The page shows it instead of guessing.
     Error { message: String },
     /// Sent once when a client connects, so it knows the stream is live and what

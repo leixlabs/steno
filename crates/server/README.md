@@ -35,12 +35,13 @@ flush 待写事件 → 排空 DB writer。超过 `shutdown_timeout_seconds` 就*
 | `recorder.rs` | WAV 写入：`.partial` → 补头 → fsync → 原子 rename；录音分支不过滤、不重采样 |
 | `recovery.rs` | 启动扫描：截断到整帧、补真实长度、发布 `interrupted`；头都验不过的 `.partial` 原样留着并告警；文件与行对账（孤儿 / `missing`） |
 | `retention.rs` | 按字节预算回收：只删 `complete` 段、最旧优先，路径规范化后必须仍在录音根下，事件与人工复核标签保留 |
-| `storage.rs` | SQLite schema v3、迁移、类型化查询；每个连接单独开 WAL + 外键 |
+| `storage.rs` | SQLite schema v4、迁移、类型化查询；每个连接单独开 WAL + 外键 |
 | `db_writer.rs` | 单写者线程；先写 `SegmentStarted` 再放行任何引用它的块 |
 | `net_capture.rs` | UDP 接收端：抖动缓冲、丢包/乱序记账，用节点单调时间建立时间锚点（不用到达时间） |
 | `http_server.rs` | Axum 路由、静态 Portal、Range 请求、SPA 回退 |
 | `stt.rs` | 每段转写：依赖 `Transcriber` trait，Apple 后端是外部命令 |
-| `stt_stream.rs` | 长驻识别器 + Unix socket，边说话边出字 |
+| `stt_stream.rs` | 长驻识别器 + Unix socket（tokio 全双工）：上行 PCM、下行 config/control，边说话边出字；分类器的鼾声片段也在这里落库 |
+| `sidecar_wire.rs` | sidecar ↔ server 分帧协议的两个方向（8 字节头 + 负载编解码），不碰 I/O 之外的东西 |
 | `control.rs` | 受 `[control]` 门控的 systemctl 生命周期控制：只跑 `systemctl <verb> <unit>`，单元名来自配置、请求只能选闭集里的 target/action；默认关闭，且 `server.bind_address` 必须是 loopback 才允许开启。经 `GET/POST /api/v1/control` 暴露 |
 
 ## 运行
@@ -58,10 +59,10 @@ cargo run   -p steno-server
 本地开发不用碰 `/etc` 和 `/var`：
 
 ```sh
-tools/run-server.sh              # net 源，回环 HTTP，60 秒一段
-tools/run-server.sh --alsa       # 直接开本机麦克风
-tools/run-server.sh --lan        # 绑 0.0.0.0，手机可访问
-tools/run-server.sh --reset-config
+tools/run-server-mac.sh              # net 源，回环 HTTP，60 秒一段
+tools/run-server-mac.sh --mic       # 直接开本机麦克风
+tools/run-server-mac.sh --lan        # 绑 0.0.0.0，手机可访问
+tools/run-server-mac.sh --reset-config
 ```
 
 配置分节：`[server]` `[source]` `[audio]` `[detector]` `[stt]` `[storage]`（`[control]`
@@ -92,8 +93,12 @@ tools/run-server.sh --reset-config
 
 ## 存储与保留
 
-Schema v3 五张表：`recording_segments`、`audio_gaps`、`snore_events`、
+Schema v4 五张表：`recording_segments`、`audio_gaps`、`snore_events`、
 `segment_transcripts`、`utterances`。
+
+`snore_events.source` 区分标注来源：`rule-v1`（服务端自己的 DSP）与
+`apple-soundanalysis-v1`（sidecar 的分类器）。两者会标注同一段音频，没有这一列就再也分不开。
+分类器行的 `rule_score` / `peak_dbfs` 等一律为 `NULL` —— 它没有这些测量值，编一个出来会让筛选看起来有意义。
 
 **实时推送**：`transcript_hub` 是一条 `tokio::sync::broadcast` 通道（容量 256）。STT worker 在
 三个点发布——识别器就绪、partial、final——HTTP 层通过 `GET /api/v1/transcript` 订阅并转发。

@@ -13,7 +13,7 @@
 Portal 上那句提示来自 `/api/v1/status` 的 `stt.connected`，它由流式 worker
 收到 helper 的 `ready` 事件后才置位。排查后是四件事叠在一起：
 
-1. 本机运行时配置 `[stt] enabled = false`（`tools/run-server.sh` 生成的默认
+1. 本机运行时配置 `[stt] enabled = false`（`tools/run-server-mac.sh` 生成的默认
    值），`start_transcription` 第一行就返回 `None`，`connected` 永远是 false。
    这一步是**正确**的：功能确实没开。
 2. 但 `stt` 段只有 `connected/engine/finals/partial/error`，**没有 `enabled`、
@@ -29,7 +29,7 @@ Portal 上那句提示来自 `/api/v1/status` 的 `stt.connected`，它由流式
 修法：`/status.stt` 增加 `enabled`、`mode`、`state`，`state` 取
 `off / starting / ready / segment / error` 之一，由 `stt_state()` 派生——顺序是
 “没开 → 有错 → 逐段 → 连上 → 等待”，最可行动的判断优先。示例配置补齐三个键，
-`run-server.sh` 增加 `--stt` 并在 launcher 不在 PATH 时告警。
+`run-server-mac.sh` 增加 `--stt` 并在 launcher 不在 PATH 时告警。
 
 **残余的人工步骤**：macOS 的语音识别授权只能由人点一次。`tools/apple-stt/install.sh`
 装好后双击 bundle 或跑 `snore-stt-apple --authorize`，否则 helper 会以
@@ -44,7 +44,7 @@ Portal 上那句提示来自 `/api/v1/status` 的 `stt.connected`，它由流式
 
 - `[control] enabled = false` 是默认值，不写就打不开按钮。
 - `enabled = true` 只有在 `server.bind_address` 是 loopback 时才通过校验，否则
-  启动失败并点名 `control.enabled`。`tools/run-server.sh --control --lan` 直接拒绝。
+  启动失败并点名 `control.enabled`。`tools/run-server-mac.sh --control --lan` 直接拒绝。
 - 请求体只能给 `target`（`server`/`node`）+ `action`（`start`/`stop`/`restart`），
   两者都是封闭枚举；单元名只来自配置文件，不能从线上传。
 - 没有 systemd 的机器（容器、开发机）返回 `available = false` 加原因，
@@ -127,6 +127,22 @@ systemd 单元状态只在启停按钮旁边出现，且只在可查时出现（
 同时补了一个字段：`/status.source.last_packet_at_utc`。`node_connected` 只回答“在不在
 线”，回答不了“多久没动了”——节点 20 秒前断和 1 小时前断是两个问题。采集端卡片现在显示
 “最后收包 4 秒前”，`null` 表示这个进程还没收到过任何包（不是“1970 年收到过”）。
+
+补充（2026-10-31，见下节“来源地址”）：同一张卡片的卡片头还显示 `/status.source.peer`，
+即最后一个数据报的 `ip:port`。
+
+### 来源地址（2026-10-31 修正）
+
+上面那句“启停不可用 —— …”已经去掉了：在没有 systemd 的机器上它是每张卡片底下的一句常驻
+噪音，而它描述的是机器的属性，不是新闻。`control.available = false` 时现在什么都不渲染，
+按钮就是不存在。`control.enabled = false`（配置里关掉）仍然会说明，因为那是可以在配置里
+改的。
+
+协议里只有 `device_id`，没有地址，所以“是哪台机器在发”唯一的来源是收包的 socket。
+`net_capture` 在 `recv_from` 的地址变化时写一次 `Metrics::net_peer`（不是每包写，它在
+mutex 后面），`/status.source.peer` 原样交给 Portal，采集端卡片头以等宽字体显示
+`192.168.31.58:58022`。节点重启后源端口会变，这个变化本身也是有用的信号。节点静默后该
+字段仍然保留——运维问的正是“刚才是谁在跟我说话”。
 
 ## 7. 三边的启动参数
 

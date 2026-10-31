@@ -26,16 +26,24 @@ hello_interval_ms = 1000
 # ALSA card name. Empty means "use the only USB capture device"; with more than
 # one present, startup fails instead of guessing. A concrete example:
 alsa_device = "Razer Seiren, USB Audio"
+# Everything in this section describes the *device*. What leaves this machine is
+# always 16 kHz mono S16_LE — the one format the server records, detects and
+# transcribes — so the conversion happens here, once, before the archive and
+# before the wire. There is no matching key on the server to keep in sync.
+#
 # A hint, not a demand. The node opens the device at its own default
-# configuration — the only rate ALSA guarantees — and converts to the wire format
-# (16 kHz mono) before anything is archived or sent. Asking for 16 kHz on a
-# microphone that only clocks at 48 kHz used to be accepted anyway: ALSA rounded
-# the rate silently and the node labelled 48 kHz stereo samples as 16 kHz mono,
-# which time-stretches every syllable by six and turns speech into rumble.
-# A rate below the device's minimum is only used when the device default cannot
-# be opened at all.
-preferred_rate_hz = 16000
-channels = 1
+# configuration — the only rate ALSA guarantees — and converts to the wire
+# format before anything is archived or sent. Asking for 16 kHz on a microphone
+# that only clocks at 48 kHz used to be accepted anyway: ALSA rounded the rate
+# silently and the node labelled 48 kHz stereo samples as 16 kHz mono, which
+# time-stretches every syllable by six and turns speech into rumble.
+device_rate_hz = 16000
+device_channels = 1
+# Which of the device's channels becomes the mono stream. Must be
+# < device_channels, and is checked again against what the device actually
+# opened at. Not an average: averaging a room-facing capsule with a
+# wall-facing one mixes a reflection in instead of removing noise.
+mono_channel_index = 0
 # Rumble filter on the capture path, in Hz; 0 disables it. A condenser
 # microphone at high gain produces a floor that is almost entirely sub-250 Hz
 # airflow and preamp noise — measured at -33 dBFS on the bedside device, only a

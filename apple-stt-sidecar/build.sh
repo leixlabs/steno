@@ -23,13 +23,20 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Speech is macOS 26+; the target is spelled out so a build on an older SDK
 # fails here with a clear message instead of at runtime inside a recognition.
+#
+# Every file under Sources/ is compiled, so splitting a module means adding a
+# file and nothing else. Swift has no ordering requirement at file scope.
+SOURCES=$(find Sources -name '*.swift' | sort)
+
 swiftc -O -swift-version 5 \
     -target "$(uname -m)-apple-macos26.0" \
-    Sources/Wire.swift Sources/Studio.swift Sources/main.swift \
+    $SOURCES \
     -o "$EXECUTABLE" \
     -framework Speech \
+    -framework SoundAnalysis \
     -framework AVFoundation \
     -framework CoreMedia \
+    -framework CoreML \
     -framework Foundation
 
 # Ad-hoc signature: keeps the bundle valid after every rebuild.

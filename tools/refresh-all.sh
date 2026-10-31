@@ -252,8 +252,8 @@ if [ "$RESET_CONFIG" = 1 ] || [ ! -f "$CONFIG" ]; then
   [ "$RESET_CONFIG" = 1 ] && write_args+=(--reset-config)
   [ "$STT_MODE" = on ] && write_args+=(--stt)
   [ "$CONTROL_MODE" = on ] && write_args+=(--control)
-  say "regenerating $CONFIG from tools/run-server.sh"
-  run "$REPO_ROOT/tools/run-server.sh" "${write_args[@]}"
+  say "regenerating $CONFIG from tools/run-server-mac.sh"
+  run "$REPO_ROOT/tools/run-server-mac.sh" "${write_args[@]}"
 else
   say "keeping the existing $CONFIG"
   for pair in "stt:$STT_MODE" "control:$CONTROL_MODE"; do

@@ -30,8 +30,8 @@ http_threads = 1
 timezone = "UTC"
 
 [audio]
-preferred_rate_hz = 16000
-channels = 1
+device_rate_hz = 16000
+device_channels = 1
 format = "S16_LE"
 period_ms = 10
 buffer_ms = 200
@@ -297,4 +297,159 @@ fn metrics_free(events: &[steno_lib::detector::EventDraft]) -> usize {
         assert!(event.end_offset_frames >= event.start_offset_frames);
     }
     events.len()
+}
+
+/// The single-box path: a device that only clocks at 48 kHz stereo must still
+/// produce a 16 kHz mono recording, because that is the only format anything
+/// downstream speaks.
+///
+/// This is the part that was previously untrue: `[audio] preferred_rate_hz` and
+/// `channels` *described* the recording, so a stereo 48 kHz microphone wrote a
+/// stereo 48 kHz WAV and the recogniser was handed samples at a rate it had not
+/// been told about. Now the device format stops at `WireConverter`, and the
+/// segment row plus the WAV on disk must both say 16 kHz mono regardless.
+#[test]
+fn a_48k_stereo_device_still_records_16k_mono() {
+    use steno_lib::audio_capture::LocalWireCapture;
+    use steno_lib::config::{WIRE_CHANNELS, WIRE_RATE_HZ};
+
+    let dir = tempdir().unwrap();
+    let config = Arc::new(test_config(dir.path()));
+    std::fs::create_dir_all(&config.storage.recording_dir).unwrap();
+
+    let http_db = Database::open(&config.storage.database_path).unwrap();
+    let writer_db = Database::open(&config.storage.database_path).unwrap();
+    writer_db.migrate().unwrap();
+    let writer = DbWriter::spawn(writer_db, |error| eprintln!("db error: {error}"));
+
+    let metrics = Arc::new(Metrics::new());
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
+    // The device: 48 kHz, two channels.
+    let device_rate = 48_000u32;
+    let device_channels = 2u16;
+    let device_ring = Arc::new(CaptureRing::new(device_rate, device_channels, 500, 10, 200));
+    let wire_ring = Arc::new(CaptureRing::new(
+        WIRE_RATE_HZ,
+        WIRE_CHANNELS,
+        500,
+        10,
+        200,
+    ));
+    let device = NegotiatedFormat {
+        device_name: "stereo-48k".into(),
+        rate_hz: device_rate,
+        channels: device_channels,
+        format: SampleFormat::S16Le,
+    };
+    let mut local = LocalWireCapture::spawn(
+        Arc::clone(&device_ring),
+        Arc::clone(&wire_ring),
+        &device,
+        1,
+        Arc::clone(&metrics),
+    )
+    .expect("the converter must accept a supported device rate");
+
+    let recording_queue = Arc::new(BoundedQueue::new(64, 16));
+    let detection_queue = Arc::new(BoundedQueue::new(64, 16));
+    // What the dispatcher is told it is reading: the wire format, never the
+    // device format. That is the whole point of converting first.
+    let wire = NegotiatedFormat {
+        device_name: "stereo-48k".into(),
+        rate_hz: WIRE_RATE_HZ,
+        channels: WIRE_CHANNELS,
+        format: SampleFormat::S16Le,
+    };
+
+    let dispatcher = dispatcher::spawn(DispatcherInputs {
+        config: Arc::clone(&config),
+        metrics: Arc::clone(&metrics),
+        capture: Arc::clone(&wire_ring),
+        recording_queue: Arc::clone(&recording_queue),
+        detection_queue: Arc::clone(&detection_queue),
+        stt_queue: None,
+        db: writer.handle(),
+        shutting_down: Arc::clone(&shutting_down),
+        negotiated: wire,
+    });
+
+    // 200 ms of device audio, channel 1 carrying a 320 Hz tone and channel 0
+    // deliberately silent. Picking the wrong channel produces silence, which is
+    // exactly the failure an average would hide.
+    let block_frames = (device_rate / 5) as usize;
+    let samples: Vec<i16> = (0..block_frames)
+        .flat_map(|n| {
+            let phase =
+                2.0 * std::f32::consts::PI * 320.0 * (n as f32 / device_rate as f32);
+            [0i16, (phase.sin() * 3276.0) as i16]
+        })
+        .collect();
+    assert!(device_ring.callback_push(
+        &samples,
+        CaptureMeta {
+            frames: block_frames as u32,
+            channels: device_channels,
+            rate_hz: device_rate,
+            capture_seq: 0,
+            mono_start_ns: 0,
+            stream_generation: 1,
+        },
+    ));
+
+    std::thread::sleep(Duration::from_millis(300));
+    shutting_down.store(true, Ordering::Relaxed);
+    dispatcher.request_shutdown();
+    recording_queue.close();
+    detection_queue.close();
+    local.stop();
+    let mut handle = dispatcher;
+    assert!(handle.join(Duration::from_secs(5)), "dispatcher must stop");
+    assert!(writer.shutdown(Duration::from_secs(5)), "db writer must drain");
+
+    // The dispatcher was told the wire format, so the DB row carries it.
+    let segments = http_db
+        .segments_between(
+            chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            chrono::DateTime::from_timestamp(i64::from(u32::MAX), 0).unwrap(),
+        )
+        .expect("segment query must succeed");
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].capture_rate_hz, WIRE_RATE_HZ,
+        "a segment must never be labelled with the device rate"
+    );
+    assert_eq!(segments[0].channels, WIRE_CHANNELS);
+
+    // What the recorder and detector were handed: wire format, and a tone. The
+    // peak is the check that channel 1 was taken rather than channel 0 (which is
+    // silent here) — an average would have halved it, and a mislabelled rate
+    // would have stretched it.
+    let mut frames: Vec<i16> = Vec::new();
+    let mut fanout_format = None;
+    loop {
+        match recording_queue.pop_timeout(Duration::from_millis(10)) {
+            PopOutcome::Item(DispatcherMessage::Audio { format, pcm, .. }) => {
+                fanout_format = Some((format.rate_hz, format.channels));
+                frames.extend_from_slice(&pcm);
+            }
+            PopOutcome::Item(_) => {}
+            PopOutcome::Empty | PopOutcome::Closed => break,
+        }
+    }
+    assert_eq!(
+        fanout_format,
+        Some((WIRE_RATE_HZ, WIRE_CHANNELS)),
+        "the fan-out must carry the wire format, not the device format"
+    );
+    let peak = frames.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+    assert!(
+        peak > 1_000,
+        "the selected channel carries the tone; peak {peak} looks like the silent one"
+    );
+    assert!(
+        frames.len().abs_diff(3_200) <= 8,
+        "200 ms of 48 kHz audio is 3200 wire frames, got {}",
+        frames.len()
+    );
 }

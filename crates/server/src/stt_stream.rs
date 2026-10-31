@@ -1,53 +1,78 @@
-//! Streaming speech-to-text: one long-lived recogniser fed by the capture pipe.
+//! Streaming speech-to-text and snore classification, orchestrated from here.
 //!
-//! ## Why this exists next to `stt.rs`
+//! ## What this worker is responsible for
 //!
-//! The per-segment path (`stt.rs`) writes a WAV, then runs a sidecar on it. That
-//! is simple and restart-safe, but it has two costs that matter in a bedroom:
+//! Capture belongs to the node, analysis belongs to the sidecar, and this is the
+//! thing in between that decides: when the sidecar runs, what language it listens
+//! for, which audio it gets, where the results are stored, and when it is told to
+//! finish. None of those are facts the sidecar could know on its own.
 //!
-//! * every segment spawns a process — on macOS that reads as an application
-//!   launch, so the Dock flickers once every ten seconds;
-//! * text only appears after a segment closes and a whole file has been
-//!   decoded, which is seconds to tens of seconds late.
+//! ```text
+//! stt queue ──► writer task ──► [ 8-byte header | payload ] ──► sidecar
+//!                                    ▲                        │
+//!                                    └── control / config ◄────┘
+//! reader task ──► store task (rusqlite) ──► utterance + snore_events
+//!             └─► metrics / TranscriptHub ──► Portal
+//! ```
 //!
-//! So audio is now also pushed into a recogniser that stays alive, which
-//! produces text while the person is still talking.
-//!
-//! ## Why a Unix socket
+//! ## Why a Unix socket and not stdin
 //!
 //! The sidecar is started through LaunchServices (`open -n -a`), because that is
 //! the one launcher that returns immediately: the server needs a process that
-//! outlives the launch call, and `Command::status()` would block for the whole
-//! night. `open` hands the child no stdio, so the socket is what carries both
-//! directions — audio in, JSON out.
+//! outlives the launch call, and `Command::status()` on the bundle itself would
+//! block for the whole night. `open` hands the child no stdio, so the socket is
+//! what carries both directions — audio up, commands down. (`--mode stdio` exists
+//! for embedding and for the probe script; the protocol is the same either way,
+//! which is why [`read_frame`](crate::sidecar_wire::read_frame) is written against
+//! `AsyncRead` rather than against a socket.)
 //!
-//! ```text
-//! server -> sidecar : [u32 LE length][i64 LE utc_ms][s16le mono 16 kHz PCM]
-//! sidecar -> server : one JSON object per line
-//! ```
+//! ## Why async here, threads elsewhere
 //!
-//! Timestamps cross the wire as wall-clock milliseconds, so nothing has to be
-//! remapped on this side and a sidecar restart cannot shift the transcript.
+//! The audio path above this worker is real-time-ish and built on bounded queues
+//! and dedicated threads; there is exactly one socket to talk to, and it needs to
+//! be read and written concurrently without one direction stalling the other.
+//! That is what `select!` over a reader task, a writer task and a shutdown
+//! watcher buys — and the two blocking bits that remain (the audio queue's
+//! timed pop and SQLite) live in their own blocking tasks, so neither can stall
+//! the wire.
+//!
+//! ## Failure is visible
+//!
+//! A session that ends for any reason is restarted after `restart_delay`, and the
+//! reason is kept in `Metrics::set_stt_error` until the next `ready`. The one
+//! thing never done here is pretending: a phrase that the database refused is not
+//! published, an episode with no recorded segment behind it is logged as
+//! unstored, and an unknown frame is a warning, not a shrug.
 
-use std::io::{BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use tokio::net::unix::OwnedReadHalf;
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 
 use steno_lib::bounded_queue::{BoundedQueue, PopOutcome};
 use steno_lib::metrics::Metrics;
 
-use crate::storage::{Database, UtteranceRow};
+use crate::sidecar_wire::{
+    self as wire, Config, Control, Direction, MsgType, SessionEvent, SnoreEvent,
+    TranscriptEvent as SidecarTranscript,
+};
+use crate::storage::{ClassifiedEvent, Database, UtteranceRow};
 use crate::transcript_hub::{TranscriptEvent, TranscriptHub};
 
-/// One block of audio handed to the recogniser, stamped with the wall clock of
-/// its first sample so the sidecar never has to guess where it is in time.
+/// `snore_events.source` for a row produced by the sidecar's classifier. The
+/// server's own detector writes `rule-v1`; the two can annotate the same second
+/// of audio and must never be conflated.
+pub const CLASSIFIER_SOURCE: &str = "apple-soundanalysis-v1";
+
+/// A block of audio handed to the recogniser, stamped with the wall clock of its
+/// first sample so the sidecar never has to guess where it is in time.
 #[derive(Debug, Clone)]
 pub struct SttChunk {
     pub samples: Vec<i16>,
@@ -60,39 +85,39 @@ pub struct StreamOptions {
     pub socket_path: PathBuf,
     /// Wrapper that starts the sidecar through LaunchServices.
     pub launcher: String,
+    /// Label written into every stored row that the sidecar did not label itself.
     pub engine: String,
+    /// Language the recogniser should listen for. Sent in the `config` frame that
+    /// precedes the first audio block, because the language is the orchestrator's
+    /// decision — the sidecar must not have to guess it from a locale default.
+    pub locale: String,
     pub database_path: PathBuf,
     /// How long to wait for the sidecar to connect after a launch.
     pub ready_timeout: Duration,
     pub restart_delay: Duration,
 }
 
-#[derive(Debug, Deserialize)]
-struct SidecarEvent {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    start_ms: Option<i64>,
-    #[serde(default)]
-    end_ms: Option<i64>,
-    #[serde(default)]
-    segments: Option<serde_json::Value>,
-    #[serde(default)]
-    engine: Option<String>,
-    #[serde(default)]
-    language: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+/// A write that does not complete in this long is a stalled peer, not a slow one:
+/// the sidecar either drains the socket or is not there any more.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the sidecar gets to flush its last finals after `control: stop`.
+const STOP_GRACE: Duration = Duration::from_secs(5);
+/// Outbound frames in flight. Small on purpose: audio is a live stream, and a
+/// deep buffer would only convert a stall into latency.
+const OUTBOUND_DEPTH: usize = 8;
+
+#[derive(Debug)]
+enum Outbound {
+    Audio(SttChunk),
+    Control(Control),
+    Config(Config),
 }
 
-enum Event {
-    Ready,
-    Final(Box<SidecarEvent>),
-    Partial(String),
-    Error(String),
-    Closed,
+/// Work handed to the single thread that owns the database connection.
+#[derive(Debug)]
+enum Stored {
+    Utterance(Box<UtteranceRow>),
+    Snore(Box<SnoreEvent>),
 }
 
 pub fn spawn(
@@ -114,20 +139,22 @@ fn run(
     shutdown: Arc<AtomicBool>,
     hub: Arc<TranscriptHub>,
 ) {
-    let mut database: Option<Database> = None;
-    while !shutdown.load(Ordering::Relaxed) {
-        if database.is_none() {
-            match Database::open(&options.database_path) {
-                Ok(db) => database = Some(db),
-                Err(error) => tracing::warn!(%error, "stt stream cannot open the database yet"),
-            }
+    // One runtime, one thread, for the whole worker: there is exactly one socket
+    // and no fan-out, so a multi-threaded runtime would only add scheduling
+    // noise to a latency-sensitive loop.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "cannot start the stt stream runtime");
+            return;
         }
-        let Some(db) = database.as_mut() else {
-            sleep_unless_stopping(&shutdown, options.restart_delay);
-            continue;
-        };
+    };
 
-        match serve(db, &chunks, &options, &metrics, &shutdown, &hub) {
+    while !shutdown.load(Ordering::Relaxed) {
+        match runtime.block_on(serve(&chunks, &options, &metrics, &shutdown, &hub)) {
             Ok(()) => tracing::info!("stt stream session ended"),
             Err(StreamError::Stopped) => break,
             Err(error) => {
@@ -154,15 +181,14 @@ fn sleep_unless_stopping(shutdown: &AtomicBool, duration: Duration) {
     }
 }
 
-/// Binds the socket, launches the sidecar, then pumps audio until either side
-/// goes away. Returning always means "restart me".
-fn serve(
-    db: &mut Database,
+/// Binds the socket, launches the sidecar, then pumps both directions until
+/// either side goes away. Returning always means "restart me".
+async fn serve(
     chunks: &Arc<BoundedQueue<SttChunk>>,
     options: &StreamOptions,
     metrics: &Arc<Metrics>,
     shutdown: &Arc<AtomicBool>,
-    hub: &TranscriptHub,
+    hub: &Arc<TranscriptHub>,
 ) -> Result<(), StreamError> {
     // A sidecar from a previous run may still own the path.
     let _ = std::fs::remove_file(&options.socket_path);
@@ -170,243 +196,404 @@ fn serve(
         let _ = std::fs::create_dir_all(parent);
     }
     let listener = UnixListener::bind(&options.socket_path)?;
-    listener.set_nonblocking(true)?;
 
-    std::process::Command::new(&options.launcher)
-        .arg(&options.socket_path)
-        .status()
-        .map_err(|error| StreamError::Launch {
-            program: options.launcher.clone(),
-            source: error,
-        })?;
-
-    let mut stream = accept_with_timeout(&listener, options.ready_timeout, shutdown)?;
-    stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    launch_sidecar(options).await?;
+    let stream = accept_with_timeout(&listener, options.ready_timeout, shutdown).await?;
     tracing::info!(socket = %options.socket_path.display(), "stt stream sidecar connected");
 
-    let (event_tx, event_rx) = channel();
-    let reader = spawn_reader(stream.try_clone()?, event_tx);
+    let (read_half, write_half) = stream.into_split();
 
-    let result = pump(db, &mut stream, chunks, &event_rx, metrics, shutdown, hub);
+    // One rusqlite connection, one thread. WAL means the HTTP side reads freely
+    // while this writes; nothing else may touch this connection.
+    let database = Database::open(&options.database_path)?;
+    let (store_tx, store_rx) = std::sync::mpsc::channel::<Stored>();
+    let store_metrics = Arc::clone(metrics);
+    let store_hub = Arc::clone(hub);
+    let store = tokio::task::spawn_blocking(move || {
+        store_loop(database, store_rx, store_metrics, store_hub)
+    });
 
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-    let _ = reader.join();
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_DEPTH);
+    // The session's language travels before any audio: a recogniser that starts
+    // on the wrong language wastes a model load and produces a `ready` that is
+    // already wrong.
+    outbound_tx
+        .send(Outbound::Config(Config::for_stream(&options.locale)))
+        .await
+        .map_err(|_| StreamError::Stalled)?;
+    let writer = tokio::spawn(writer_loop(write_half, outbound_rx));
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pump_queue = Arc::clone(chunks);
+    let pump_tx = outbound_tx.clone();
+    let pump_cancel = Arc::clone(&cancel);
+    let pump = tokio::task::spawn_blocking(move || audio_pump(pump_queue, pump_tx, pump_cancel));
+
+    let reader = read_loop(
+        read_half,
+        store_tx,
+        Arc::clone(metrics),
+        Arc::clone(hub),
+        options.engine.clone(),
+    );
+    tokio::pin!(reader);
+
+    let result = tokio::select! {
+        biased;
+        outcome = &mut reader => outcome,
+        _ = wait_for_shutdown(shutdown) => {
+            // Ask for a clean finish: the sidecar commits whatever is still
+            // volatile and closes, which is the difference between losing the
+            // last phrase of the night and keeping it.
+            tracing::info!("stt stream stopping; asking the sidecar to finalise");
+            let _ = outbound_tx.send(Outbound::Control(Control::stop())).await;
+            match tokio::time::timeout(STOP_GRACE, &mut reader).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    tracing::warn!("sidecar did not finish within {STOP_GRACE:?}");
+                    Ok(())
+                }
+            }
+        }
+    };
+
+    // Stop producing audio, then let the writer drain what is queued before the
+    // half-close: a dropped queue means the sidecar's timeline has a hole it was
+    // never told about.
+    cancel.store(true, Ordering::Relaxed);
+    let _ = tokio::time::timeout(Duration::from_secs(2), pump).await;
+    drop(outbound_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), store).await;
+
     let _ = std::fs::remove_file(&options.socket_path);
     result
 }
 
-fn accept_with_timeout(
+async fn launch_sidecar(options: &StreamOptions) -> Result<(), StreamError> {
+    let program = options.launcher.clone();
+    let socket = options.socket_path.clone();
+    // `open` returns as soon as the bundle is handed to LaunchServices, which is
+    // what keeps this from blocking until the night is over.
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&program).arg(&socket).status()
+    })
+    .await
+    .map_err(|error| StreamError::Io(std::io::Error::other(error)))?;
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(StreamError::Launch {
+            program: options.launcher.clone(),
+            source: std::io::Error::other(format!("launcher exited with {status}")),
+        }),
+        Err(source) => Err(StreamError::Launch {
+            program: options.launcher.clone(),
+            source,
+        }),
+    }
+}
+
+async fn accept_with_timeout(
     listener: &UnixListener,
     timeout: Duration,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<UnixStream, StreamError> {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    loop {
         if shutdown.load(Ordering::Relaxed) {
             return Err(StreamError::Stopped);
         }
-        match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
+        match tokio::time::timeout(Duration::from_millis(100), listener.accept()).await {
+            Ok(Ok((stream, _))) => return Ok(stream),
+            Ok(Err(error)) => return Err(StreamError::Io(error)),
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    return Err(StreamError::NotConnected);
+                }
             }
-            Err(error) => return Err(StreamError::Io(error)),
         }
     }
-    Err(StreamError::NotConnected)
 }
 
-fn spawn_reader(stream: UnixStream, events: Sender<Event>) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("stt-stream-reader".to_string())
-        .spawn(move || {
-            // Lines are assembled by hand rather than with `read_line`: the
-            // socket has a read timeout so shutdown stays responsive, and
-            // `read_line` discards a partially received line when it hits one.
-            let mut reader = BufReader::new(stream);
-            let mut pending: Vec<u8> = Vec::with_capacity(4096);
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        pending.extend_from_slice(&chunk[..count]);
-                        while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
-                            let line: Vec<u8> = pending.drain(..=index).collect();
-                            let text = String::from_utf8_lossy(&line);
-                            let trimmed = text.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            let event = match serde_json::from_str::<SidecarEvent>(trimmed) {
-                                Ok(event) => event,
-                                Err(error) => {
-                                    tracing::debug!(
-                                        %error,
-                                        line = trimmed,
-                                        "ignoring unparsable sidecar line"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let mapped = match event.kind.as_str() {
-                                "ready" => Event::Ready,
-                                "final" => Event::Final(Box::new(event)),
-                                "partial" => Event::Partial(event.text.unwrap_or_default()),
-                                "error" => Event::Error(event.message.unwrap_or_else(|| {
-                                    "recogniser reported an error".to_string()
-                                })),
-                                other => {
-                                    tracing::debug!(kind = other, "ignoring unknown sidecar event");
-                                    continue;
-                                }
-                            };
-                            if events.send(mapped).is_err() {
-                                return;
-                            }
-                        }
-                        if pending.len() > 1 << 20 {
-                            tracing::warn!("sidecar sent a line we cannot frame; dropping it");
-                            pending.clear();
-                        }
-                    }
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            || error.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = events.send(Event::Closed);
-        })
-        .expect("spawn stt reader")
+async fn wait_for_shutdown(shutdown: &Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
-fn pump(
-    db: &mut Database,
-    stream: &mut UnixStream,
-    chunks: &Arc<BoundedQueue<SttChunk>>,
-    events: &Receiver<Event>,
-    metrics: &Arc<Metrics>,
-    shutdown: &Arc<AtomicBool>,
-    hub: &TranscriptHub,
-) -> Result<(), StreamError> {
-    let mut frame = Vec::with_capacity(64 * 1024);
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+// MARK: - audio out
 
-        // Drain every pending sidecar event first: the text is worth more than
-        // the next 20 ms of audio.
-        loop {
-            match events.try_recv() {
-                Ok(Event::Ready) => {
-                    metrics.stt_connected.store(true, Ordering::Relaxed);
-                    metrics.set_stt_error(None);
-                    // A browser that connected before the sidecar is worth telling
-                    // that the recogniser just came up.
-                    hub.publish(TranscriptEvent::State {
-                        state: "ready".to_string(),
-                    });
-                    tracing::info!("stt stream ready");
-                }
-                Ok(Event::Final(event)) => {
-                    // Debug, not info: one line per recognised phrase. This is
-                    // the only place that can tell "the sidecar never finalised a
-                    // phrase" from "it did and we refused to store it", which is
-                    // exactly the distinction that took a while to see the first
-                    // time.
-                    tracing::debug!(
-                        text = event.text.as_deref().unwrap_or(""),
-                        start_ms = ?event.start_ms,
-                        end_ms = ?event.end_ms,
-                        "sidecar sent a final"
-                    );
-                    match utterance_row(&event, &metrics.stt_engine()) {
-                        Some(row) => {
-                            if let Err(error) = db.save_utterance(&row) {
-                                tracing::warn!(%error, "cannot store utterance");
-                            } else {
-                                metrics.stt_finals.fetch_add(1, Ordering::Relaxed);
-                                metrics.set_stt_partial(None);
-                                // Published *after* the row exists: a client must
-                                // never show a phrase the database rejected.
-                                hub.publish(TranscriptEvent::final_from_row(&row));
-                                tracing::debug!(text = %row.text, "utterance stored");
-                            }
-                        }
-                        None => tracing::debug!(
-                            "final dropped: empty text or missing timestamps (never guessed)"
-                        ),
-                    }
-                }
-                Ok(Event::Partial(text)) => {
-                    metrics.set_stt_partial(Some(text.clone()));
-                    hub.publish(TranscriptEvent::Partial { text });
-                }
-                Ok(Event::Error(message)) => {
-                    // A task the sidecar ended itself reports "Recognition
-                    // request was canceled". That is the endpoint rotation
-                    // working, and showing it as an error state made a
-                    // recogniser that was actively producing text look dead —
-                    // the kind of lie the rest of this module goes to some
-                    // trouble to avoid.
-                    if message.to_lowercase().contains("cancel") {
-                        tracing::debug!(%message, "recognition task rotated");
-                        continue;
-                    }
-                    tracing::warn!(%message, "recogniser error");
-                    metrics.set_stt_error(Some(message.clone()));
-                    hub.publish(TranscriptEvent::Error { message });
-                }
-                Ok(Event::Closed) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Ok(());
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            }
-        }
-
+/// Drains the STT queue into the outbound channel.
+///
+/// Blocking on purpose: the queue's `pop_timeout` is a timed condvar wait, and
+/// putting it on the runtime would park an async worker for 100 ms at a time.
+///
+/// Deliberately **not** an `async fn`, even though nothing here awaits. It runs
+/// inside `spawn_blocking`, which takes a synchronous closure: an `async fn` would
+/// compile there as "returns a future nobody polls", and every block would be
+/// dropped in silence. That is not a hypothetical — it is what this function was
+/// first written as, and the queue counter was the only symptom.
+fn audio_pump(
+    chunks: Arc<BoundedQueue<SttChunk>>,
+    outbound: mpsc::Sender<Outbound>,
+    cancel: Arc<AtomicBool>,
+) {
+    while !cancel.load(Ordering::Relaxed) {
         match chunks.pop_timeout(Duration::from_millis(100)) {
-            PopOutcome::Item(chunk) => write_frame(stream, &mut frame, &chunk)?,
+            PopOutcome::Item(chunk) => {
+                if outbound.blocking_send(Outbound::Audio(chunk)).is_err() {
+                    return;
+                }
+            }
             PopOutcome::Empty => {}
-            PopOutcome::Closed => return Ok(()),
+            PopOutcome::Closed => return,
         }
     }
 }
 
-fn write_frame(
-    stream: &mut UnixStream,
-    buffer: &mut Vec<u8>,
-    chunk: &SttChunk,
+async fn writer_loop(
+    mut writer: OwnedWriteHalf,
+    mut outbound: mpsc::Receiver<Outbound>,
 ) -> Result<(), StreamError> {
-    let bytes = chunk.samples.len() * 2;
-    if bytes == 0 || bytes >= 1 << 20 {
-        return Ok(());
+    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(item) = outbound.recv().await {
+        match item {
+            Outbound::Audio(chunk) => {
+                if chunk.samples.is_empty() {
+                    continue;
+                }
+                wire::encode_audio(chunk.utc_ms, &chunk.samples, &mut buffer);
+                write_with_timeout(&mut writer, MsgType::Audio, &buffer).await?;
+            }
+            Outbound::Control(control) => {
+                let payload = serde_json::to_vec(&control)?;
+                write_with_timeout(&mut writer, MsgType::Control, &payload).await?;
+            }
+            Outbound::Config(config) => {
+                let payload = serde_json::to_vec(&config)?;
+                write_with_timeout(&mut writer, MsgType::Config, &payload).await?;
+            }
+        }
     }
-    buffer.clear();
-    buffer.extend_from_slice(&(bytes as u32).to_le_bytes());
-    buffer.extend_from_slice(&chunk.utc_ms.to_le_bytes());
-    for sample in &chunk.samples {
-        buffer.extend_from_slice(&sample.to_le_bytes());
-    }
-    stream.write_all(buffer)?;
-    stream.flush()?;
+    // Half-close so the sidecar sees a clean end of audio rather than a reset.
+    let _ = writer.shutdown().await;
     Ok(())
 }
 
-fn utterance_row(event: &SidecarEvent, engine: &str) -> Option<UtteranceRow> {
-    let text = event.text.clone().unwrap_or_default();
+async fn write_with_timeout(
+    writer: &mut OwnedWriteHalf,
+    kind: MsgType,
+    payload: &[u8],
+) -> Result<(), StreamError> {
+    match tokio::time::timeout(WRITE_TIMEOUT, wire::write_frame(writer, kind, payload)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(StreamError::Stalled),
+    }
+}
+
+// MARK: - events in
+
+async fn read_loop(
+    mut reader: OwnedReadHalf,
+    store: std::sync::mpsc::Sender<Stored>,
+    metrics: Arc<Metrics>,
+    hub: Arc<TranscriptHub>,
+    engine: String,
+) -> Result<(), StreamError> {
+    let mut frames: u64 = 0;
+    loop {
+        let Some(frame) = wire::read_frame(&mut reader, Direction::SidecarToServer).await? else {
+            tracing::info!(frames, "sidecar closed the stream");
+            return Ok(());
+        };
+        frames += 1;
+        match frame.kind {
+            MsgType::Transcript => {
+                let event: SidecarTranscript = serde_json::from_slice(&frame.payload)?;
+                match event.kind.as_str() {
+                    "final" => {
+                        // Debug, not info: one line per recognised phrase. This is
+                        // the only place that can tell "the sidecar never
+                        // finalised a phrase" from "it did and we refused to
+                        // store it".
+                        tracing::debug!(
+                            text = %event.text,
+                            start_ms = ?event.start_ms,
+                            end_ms = ?event.end_ms,
+                            "sidecar sent a final"
+                        );
+                        match utterance_row(&event, &engine) {
+                            Some(row) => {
+                                if store.send(Stored::Utterance(Box::new(row))).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            None => tracing::debug!(
+                                "final dropped: empty text or missing timestamps (never guessed)"
+                            ),
+                        }
+                    }
+                    "partial" => {
+                        metrics.set_stt_partial(Some(event.text.clone()));
+                        hub.publish(TranscriptEvent::Partial { text: event.text });
+                    }
+                    other => tracing::debug!(kind = other, "ignoring unknown transcript kind"),
+                }
+            }
+            MsgType::Snore => {
+                let event: SnoreEvent = serde_json::from_slice(&frame.payload)?;
+                if !event.is_usable() {
+                    tracing::warn!(
+                        start_ms = event.start_ms,
+                        end_ms = event.end_ms,
+                        label = %event.label,
+                        "sidecar sent an unusable snore episode"
+                    );
+                    continue;
+                }
+                if store.send(Stored::Snore(Box::new(event))).is_err() {
+                    return Ok(());
+                }
+            }
+            MsgType::Session => {
+                let event: SessionEvent = serde_json::from_slice(&frame.payload)?;
+                handle_session(&event, &metrics, &hub);
+            }
+            other => tracing::warn!(kind = %other, "ignoring an uplink frame the server has no use for"),
+        }
+    }
+}
+
+fn handle_session(event: &SessionEvent, metrics: &Arc<Metrics>, hub: &Arc<TranscriptHub>) {
+    match event.state.as_str() {
+        "ready" => {
+            metrics.stt_connected.store(true, Ordering::Relaxed);
+            metrics.set_stt_error(None);
+            // A browser that connected before the sidecar is worth telling that
+            // the recogniser just came up.
+            hub.publish(TranscriptEvent::State {
+                state: "ready".to_string(),
+            });
+            tracing::info!(
+                engine = event.engine.as_deref().unwrap_or("unknown"),
+                locale = event.locale.as_deref().unwrap_or("unknown"),
+                snore = event.snore.as_deref().unwrap_or("off"),
+                "stt stream ready"
+            );
+        }
+        "error" => {
+            let message = session_message(event);
+            tracing::warn!(%message, "recogniser error");
+            metrics.set_stt_error(Some(message.clone()));
+            hub.publish(TranscriptEvent::Error { message });
+        }
+        // `status` answers a `control: status`, `degraded` says one lane is
+        // running and another is not, `stopped` is the sidecar agreeing to go.
+        // None of them is a failure, and none may clear the error state that a
+        // real failure set.
+        other => tracing::info!(
+            state = other,
+            message = event.message.as_deref().unwrap_or(""),
+            "stt stream notice"
+        ),
+    }
+}
+
+fn session_message(event: &SessionEvent) -> String {
+    event
+        .message
+        .clone()
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| format!("the recogniser reported {}", event.state))
+}
+
+// MARK: - storage
+
+/// The single thread that writes results. Publishing happens *after* the row
+/// exists: a client must never show a phrase the database rejected.
+fn store_loop(
+    database: Database,
+    events: std::sync::mpsc::Receiver<Stored>,
+    metrics: Arc<Metrics>,
+    hub: Arc<TranscriptHub>,
+) {
+    for event in events {
+        match event {
+            Stored::Utterance(row) => match database.save_utterance(&row) {
+                Ok(()) => {
+                    metrics.stt_finals.fetch_add(1, Ordering::Relaxed);
+                    metrics.set_stt_partial(None);
+                    hub.publish(TranscriptEvent::final_from_row(&row));
+                    tracing::debug!(text = %row.text, "utterance stored");
+                }
+                Err(error) => tracing::warn!(%error, "cannot store utterance"),
+            },
+            Stored::Snore(event) => {
+                let draft = classified_event(&event);
+                match database.insert_classified_event(&draft) {
+                    Ok(0) => tracing::warn!(
+                        start_ms = event.start_ms,
+                        end_ms = event.end_ms,
+                        "snore episode has no recorded segment behind it; not stored"
+                    ),
+                    Ok(rows) => {
+                        metrics.stt_snores.fetch_add(1, Ordering::Relaxed);
+                        // Published after the rows exist, like a final: a client
+                        // must never show an episode the database rejected.
+                        hub.publish(TranscriptEvent::Snore {
+                            start_ms: event.start_ms,
+                            end_ms: event.end_ms,
+                            label: event.label.clone(),
+                            peak: event.peak,
+                            mean: event.mean,
+                            windows: event.windows,
+                            threshold: event.threshold,
+                        });
+                        // The audio is already on disk: the row is a pointer into
+                        // the segment that holds this range, nothing is copied.
+                        tracing::info!(
+                            rows,
+                            start_ms = event.start_ms,
+                            end_ms = event.end_ms,
+                            peak = event.peak,
+                            windows = event.windows,
+                            "snore episode stored"
+                        );
+                    }
+                    Err(error) => tracing::warn!(%error, "cannot store snore episode"),
+                }
+            }
+        }
+    }
+}
+
+fn classified_event(event: &SnoreEvent) -> ClassifiedEvent {
+    ClassifiedEvent {
+        started_at_utc: chrono::DateTime::from_timestamp_millis(event.start_ms)
+            .unwrap_or_else(Utc::now),
+        ended_at_utc: chrono::DateTime::from_timestamp_millis(event.end_ms)
+            .unwrap_or_else(Utc::now),
+        label: event.label.clone(),
+        confidence: event.peak,
+        threshold: event.threshold,
+        source: CLASSIFIER_SOURCE.to_string(),
+        end_reason: match event.end_reason.as_str() {
+            // Anything the schema does not know is `normal`: an episode that
+            // ended because the session stopped is the only other case this
+            // sidecar produces, and it says so explicitly.
+            "shutdown" => "shutdown".to_string(),
+            _ => "normal".to_string(),
+        },
+    }
+}
+
+fn utterance_row(event: &SidecarTranscript, engine: &str) -> Option<UtteranceRow> {
+    let text = event.text.clone();
     let (Some(start_ms), Some(end_ms)) = (event.start_ms, event.end_ms) else {
         return None;
     };
-    // Silence produces empty finals (one per quiet stretch). Storing those
-    // would bury the real sentences, and the event timeline already shows when
-    // the room was quiet.
+    // Silence produces empty finals. Storing those would bury the real
+    // sentences, and the event timeline already shows when the room was quiet.
     if text.trim().is_empty() {
         return None;
     }
@@ -432,8 +619,8 @@ fn utterance_row(event: &SidecarEvent, engine: &str) -> Option<UtteranceRow> {
     })
 }
 
-/// Utterance ids only need to be unique within one database; a time-ordered
-/// hex string is enough and avoids pulling in a UUID dependency here.
+/// Utterance ids only need to be unique within one database; a time-ordered hex
+/// string is enough and avoids pulling in a UUID dependency here.
 fn utterance_id() -> String {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -445,6 +632,12 @@ fn utterance_id() -> String {
 pub enum StreamError {
     #[error("stt stream io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("stt stream protocol error: {0}")]
+    Wire(#[from] wire::WireError),
+    #[error("stt stream payload error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("stt stream storage error: {0}")]
+    Storage(#[from] steno_lib::error::Error),
     #[error("cannot launch {program}: {source}")]
     Launch {
         program: String,
@@ -453,6 +646,8 @@ pub enum StreamError {
     },
     #[error("the recogniser did not connect within the timeout")]
     NotConnected,
+    #[error("the sidecar stopped reading; write timed out")]
+    Stalled,
     #[error("stopping")]
     Stopped,
 }
@@ -461,37 +656,93 @@ pub enum StreamError {
 mod tests {
     use super::*;
 
+    fn snore(start_ms: i64, end_ms: i64) -> SnoreEvent {
+        SnoreEvent {
+            start_ms,
+            end_ms,
+            label: "snoring".to_string(),
+            peak: 0.81,
+            mean: 0.74,
+            windows: 4,
+            threshold: 0.5,
+            end_reason: "normal".to_string(),
+        }
+    }
+
     #[test]
-    fn frame_layout_is_length_then_utc_then_pcm() {
-        let chunk = SttChunk {
-            samples: vec![1, -2, 3],
-            utc_ms: 1_700_000_000_123,
-        };
-        let mut buffer = Vec::new();
-        let pair = UnixStream::pair().expect("socketpair");
-        let mut stream = pair.0;
-        write_frame(&mut stream, &mut buffer, &chunk).expect("write");
-        assert_eq!(buffer.len(), 4 + 8 + 6);
-        assert_eq!(u32::from_le_bytes(buffer[0..4].try_into().unwrap()), 6);
+    fn the_audio_pump_drains_the_queue_into_the_writer_channel() {
+        // The pump runs inside `spawn_blocking`, so it must be a synchronous
+        // function: an `async fn` there returns an unpolled future and the queue
+        // stops draining while every block is counted as dropped. This test fails
+        // in exactly that case, which is the way it was first written.
+        let queue = Arc::new(BoundedQueue::new(8, 1));
+        queue
+            .push_audio(SttChunk {
+                samples: vec![1, 2, 3],
+                utc_ms: 42,
+            })
+            .expect("push");
+        let (tx, mut rx) = mpsc::channel::<Outbound>(4);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let pump_queue = Arc::clone(&queue);
+        let pump_cancel = Arc::clone(&cancel);
+        let pump = std::thread::spawn(move || audio_pump(pump_queue, tx, pump_cancel));
+
+        // Bounded wait rather than `blocking_recv`: if the pump is not draining,
+        // this must fail in two seconds instead of hanging the test suite.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received = None;
+        while Instant::now() < deadline {
+            if let Ok(item) = rx.try_recv() {
+                received = Some(item);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let received = received.expect("the pump never drained the queue");
+        match received {
+            Outbound::Audio(chunk) => {
+                assert_eq!(chunk.samples, vec![1, 2, 3]);
+                assert_eq!(chunk.utc_ms, 42);
+            }
+            other => panic!("expected audio, got {other:?}"),
+        }
+        cancel.store(true, Ordering::Relaxed);
+        pump.join().expect("pump thread");
+    }
+
+    #[test]
+    fn a_classified_episode_keeps_its_clock_and_its_confidence() {
+        let draft = classified_event(&snore(1_700_000_000_000, 1_700_000_004_200));
+        assert_eq!(draft.source, CLASSIFIER_SOURCE);
+        assert_eq!(draft.confidence, 0.81);
+        assert_eq!(draft.label, "snoring");
         assert_eq!(
-            i64::from_le_bytes(buffer[4..12].try_into().unwrap()),
-            1_700_000_000_123
+            draft.ended_at_utc.timestamp_millis() - draft.started_at_utc.timestamp_millis(),
+            4_200
         );
-        assert_eq!(i16::from_le_bytes(buffer[12..14].try_into().unwrap()), 1);
-        assert_eq!(i16::from_le_bytes(buffer[14..16].try_into().unwrap()), -2);
+    }
+
+    #[test]
+    fn an_unknown_end_reason_is_recorded_as_normal_not_invented() {
+        let mut event = snore(0, 1000);
+        event.end_reason = "classifier_reset".to_string();
+        assert_eq!(classified_event(&event).end_reason, "normal");
+        event.end_reason = "shutdown".to_string();
+        assert_eq!(classified_event(&event).end_reason, "shutdown");
     }
 
     #[test]
     fn a_final_event_becomes_a_row_with_wall_clock_bounds() {
-        let event = SidecarEvent {
+        let event = SidecarTranscript {
             kind: "final".to_string(),
-            text: Some("打呼了".to_string()),
+            text: "打呼了".to_string(),
             start_ms: Some(1_700_000_000_000),
             end_ms: Some(1_700_000_001_500),
-            segments: Some(serde_json::json!([])),
             engine: Some("apple-sfspeech".to_string()),
             language: Some("zh-CN".to_string()),
-            message: None,
+            segments: Some(serde_json::json!([])),
         };
         let row = utterance_row(&event, "fallback").expect("row");
         assert_eq!(row.text, "打呼了");
@@ -504,16 +755,15 @@ mod tests {
 
     #[test]
     fn a_final_without_timestamps_is_dropped_rather_than_guessed() {
-        let event = SidecarEvent {
+        let event = SidecarTranscript {
             kind: "final".to_string(),
-            text: Some("hello".to_string()),
+            text: "hello".to_string(),
             start_ms: None,
             end_ms: None,
-            segments: None,
             engine: None,
             language: None,
-            message: None,
+            segments: None,
         };
-        assert!(utterance_row(&event, "apple-sfspeech").is_none());
+        assert!(utterance_row(&event, "apple-speechanalyzer").is_none());
     }
 }

@@ -28,6 +28,7 @@
 | `decisions/2026-10-29-split-deployment.md` | 采集端/服务端拆分：线格式、时间轴重建、失败模型 |
 | `decisions/2026-10-30-control-centre.md` | 控制中心的三件事，以及「识别器未连接」为什么一直出现 |
 | `decisions/2026-10-30-stt-accuracy.md` | 识别不准时先量再改：量法、结论、以及当时的兜底路径 |
+| `decisions/2026-10-31-wire-format.md` | 线上格式变成常量：16 kHz mono 只在采集端转换一次，两条采集路径归一 |
 
 **operations —— 现在要照做**
 

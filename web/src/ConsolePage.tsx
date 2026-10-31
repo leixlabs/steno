@@ -124,16 +124,12 @@ export default function ConsolePage() {
         <TranscriptionCard status={status} />
       </section>
 
-      <StoragePoolCard status={status} />
-
       <LaunchPanel status={status} />
 
-      <section className="panel console-hint">
-        <p>
-          录音本身在<strong>录音</strong>页：按天查看时间轴、候选片段、试听与语句。
-          <a href="#/recordings">前往录音 →</a>
-        </p>
-      </section>
+      {/* Last, not first: the pool is a slow-moving fact — it answers "how many
+          nights will fit" once a week, while the three cards above answer "is it
+          running" every time the page is opened. */}
+      <StoragePoolCard status={status} />
     </>
   )
 }
@@ -163,7 +159,17 @@ function ServiceCard({
         </div>
         <div>
           <dt>信号</dt>
-          <dd>{signalText(status)}</dd>
+          <dd className={status?.signal_state === 'dead' ? 'bad' : undefined}>
+            {signalText(status)}
+          </dd>
+        </div>
+        <div>
+          <dt>电平</dt>
+          <dd>
+            {status?.capture.level_peak_dbfs == null
+              ? '—'
+              : `${status.capture.level_peak_dbfs.toFixed(1)} dBFS 峰值`}
+          </dd>
         </div>
         <div>
           <dt>时间质量</dt>
@@ -178,6 +184,9 @@ function ServiceCard({
           </dd>
         </div>
       </dl>
+      {signalHint(status) && (
+        <p className="signal-hint">{signalHint(status)}</p>
+      )}
       <UnitActions target="server" control={control} busy={busy} act={act} />
     </article>
   )
@@ -195,11 +204,20 @@ function CaptureCard({
   act: (target: ControlTarget, action: ControlAction) => void
 }) {
   const isNode = status?.source.kind === 'net'
+  const peer = status?.source.peer ?? null
   return (
     <article className="card">
       <CardHead
         title={isNode ? '采集端（节点）' : '采集端（本机）'}
         state={isNode ? nodeState(status) : { text: micLabel(status), tone: micTone(status) }}
+        // The node's address is the one fact the wire protocol does not carry:
+        // it comes from the receiving socket, which is why this is the only
+        // place on the page that can answer "which machine is sending".
+        meta={
+          isNode && peer
+            ? { text: peer, title: '采集节点最后收包的来源地址（IP:端口）' }
+            : undefined
+        }
       />
       {isNode ? (
         <dl className="facts tight">
@@ -238,11 +256,7 @@ function CaptureCard({
           </div>
           <div>
             <dt>采样</dt>
-            <dd>
-              {status
-                ? `${status.microphone.capture_rate_hz} Hz · ${status.microphone.channels} ch`
-                : '—'}
-            </dd>
+            <dd title={formatTitle(status)}>{formatSummary(status)}</dd>
           </div>
           <div>
             <dt>丢帧</dt>
@@ -507,10 +521,10 @@ function UnitActions({
     )
   }
   if (!control.available) {
-    // Never render a button that cannot work: say why instead. The prefix keeps
-    // this note about *starting and stopping*, so it cannot be misread as the
-    // card's own state being unknown — that comes from /status and the heartbeat.
-    return <p className="card-note">启停不可用 —— {control.reason ?? '原因未知'}</p>
+    // Deliberately silent: on a host without systemd the reason is a property of
+    // the machine, not news, and a paragraph saying so sat under two different
+    // cards on every page load. The actions are simply not offered.
+    return null
   }
   const unit = control.units.find((item) => item.target === target)
   return (
@@ -577,6 +591,34 @@ function gatedText(status: Status | null): string {
   return duration((frames / rate) * 1000)
 }
 
+/**
+ * The recording format is always 16 kHz mono, so showing it alone says nothing.
+ * What an operator actually needs is the pair: what is stored, and what the
+ * microphone (or the node's microphone) runs at. They differ whenever the device
+ * needed converting, and that difference is the first thing to check when a
+ * transcript comes out stretched.
+ */
+function formatSummary(status: Status | null): string {
+  const mic = status?.microphone
+  if (!mic || !mic.capture_rate_hz) return '—'
+  const recorded = `${mic.capture_rate_hz} Hz · ${mic.channels} ch`
+  if (!mic.device_rate_hz) return recorded
+  if (
+    mic.device_rate_hz === mic.capture_rate_hz &&
+    mic.device_channels === mic.channels
+  ) {
+    return recorded
+  }
+  return `${mic.device_rate_hz} Hz · ${mic.device_channels} ch → ${recorded}`
+}
+
+function formatTitle(status: Status | null): string {
+  const mic = status?.microphone
+  if (!mic || !mic.capture_rate_hz) return ''
+  if (!mic.device_rate_hz) return `录制格式 ${mic.capture_rate_hz} Hz · ${mic.channels} ch`
+  return `设备 ${mic.device_rate_hz} Hz · ${mic.device_channels} ch，录制 ${mic.capture_rate_hz} Hz · ${mic.channels} ch`
+}
+
 function micLabel(status: Status | null): string {
   if (!status) return '未知'
   switch (status.microphone.state) {
@@ -626,6 +668,11 @@ function recordingText(status: Status | null): string {
  * `signal_state` is `ok` whenever the pipeline is running and not silent, which
  * is true with no capture node attached — there is simply no audio to judge. In
  * that case the honest answer is "unknown", not "有信号".
+ *
+ * `dead` is the state that matters most: samples arrive, every byte-level
+ * counter is healthy, and the audio carries only dither because the capsule is
+ * muted or the mic is unseated. It used to read as `有信号`, which is how a
+ * silent microphone spent hours looking like a working one.
  */
 function signalText(status: Status | null): string {
   if (!status) return '未知'
@@ -634,8 +681,25 @@ function signalText(status: Status | null): string {
     case 'ok':
       return '有信号'
     case 'silent':
-      return '静默'
+      return '静默（无数据流）'
+    case 'dead':
+      return '无可用信号'
     default:
       return '未知'
   }
+}
+
+/** One line explaining what to do about a signal problem, or null when fine. */
+function signalHint(status: Status | null): string | null {
+  if (!status) return null
+  const peak = status.capture.level_peak_dbfs
+  if (status.signal_state === 'dead') {
+    return peak == null
+      ? '麦克风没有拾音：检查话筒的静音开关、话筒是否插在话筒座上、输入增益是否为 0。'
+      : `麦克风没有拾音（峰值 ${peak.toFixed(1)} dBFS）：检查静音开关、话筒是否插在话筒座上、输入增益是否为 0。`
+  }
+  if (status.signal_state === 'silent') {
+    return '采集端在发数据，但每个采样都是 0：检查设备选择与采集端用户是否在 audio 组。'
+  }
+  return null
 }

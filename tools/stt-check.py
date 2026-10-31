@@ -4,7 +4,7 @@
 "识别不准" is not something you can debug by ear. A TTS corpus gives ground
 truth, so the *same* sentence can be scored twice:
 
-  file    SFSpeechURLRecognitionRequest on the whole WAV   -> the engine's floor
+  file    the sidecar's own --file path (whole WAV at once)  -> the engine's floor
   stream  the production socket path, 20 ms frames, real time -> what we ship
 
 Comparing the two scores separates three causes that look identical in a
@@ -35,6 +35,7 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -208,6 +209,23 @@ def degrade(source: Path, path: Path, strength: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+# The sidecar's framing (`crates/server/src/sidecar_wire.rs`).
+#
+# The direction byte names the *producer*, not the reader: 0x00 is the sidecar's
+# own uplink, 0x01 is anything the server sends. This script plays the server, so
+# it writes 0x01 and accepts only 0x00 — and the sidecar refuses a session whose
+# first frame arrived with the wrong one.
+MAGIC = 0x5352
+DIR_FROM_SIDECAR = 0x00
+DIR_FROM_SERVER = 0x01
+TYPE_AUDIO = 0x01
+TYPE_SNORE = 0x02
+TYPE_TRANSCRIPT = 0x03
+TYPE_SESSION = 0x04
+TYPE_CONTROL = 0x81
+TYPE_CONFIG_FRAME = 0x82
+
+
 @dataclass
 class Result:
     mode: str
@@ -241,11 +259,18 @@ def recognize_file(app: Path, wav: Path, timeout: float = 120.0) -> Result:
 
 
 class StreamClient:
-    """Speaks the sidecar's socket protocol exactly as the Rust server does."""
+    """Speaks the sidecar's socket protocol exactly as the Rust server does.
 
-    def __init__(self, app: Path, rate: int) -> None:
+    `[u16 BE "SR"][u8 direction][u8 type][u32 BE length][payload]`, with audio
+    payloads of `[i64 BE utc_ms][s16le]` and JSON for everything else. The server
+    also speaks first: the sidecar reads one frame before it starts a session, so
+    a client that only listens deadlocks (both ends waiting for the other).
+    """
+
+    def __init__(self, app: Path, rate: int, locale: str = "zh-CN") -> None:
         self.app = app
         self.rate = rate
+        self.locale = locale
         self.dir = Path(tempfile.mkdtemp(prefix="stt-check-"))
         self.path = self.dir / "stt.sock"
         self.events: list[dict] = []
@@ -273,6 +298,10 @@ class StreamClient:
             raise RuntimeError("the sidecar never connected to the socket")
         self._conn.settimeout(0.2)
         threading.Thread(target=self._read, daemon=True).start()
+        # The session configuration, and the first frame on the wire. The snore
+        # lane is switched off: this measures transcription, and a classifier
+        # competing for the same CPU would only add noise to the timing.
+        self._send_json(TYPE_CONFIG_FRAME, {"locale": self.locale, "snore": False})
         if not self.ready.wait(timeout=20):
             raise RuntimeError("the sidecar connected but never announced ready")
         return self
@@ -292,24 +321,52 @@ class StreamClient:
             if not chunk:
                 break
             buffer += chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                self.events.append(event)
-                if event.get("type") == "ready":
-                    self.ready.set()
+            while len(buffer) >= 8:
+                magic, direction, kind, length = struct.unpack(">HBBI", buffer[:8])
+                if magic != MAGIC:
+                    self.events.append({"type": "error", "message": f"bad magic 0x{magic:04X}"})
+                    return
+                if direction != DIR_FROM_SIDECAR:
+                    self.events.append({"type": "error", "message": "frame points the wrong way"})
+                    return
+                if len(buffer) < 8 + length:
+                    break
+                payload = buffer[8 : 8 + length]
+                buffer = buffer[8 + length :]
+                self._handle(kind, payload)
         self.ready.set()
+
+    def _handle(self, kind: int, payload: bytes) -> None:
+        """Normalises a frame into the flat event dicts the report expects."""
+        if kind == TYPE_SESSION:
+            event = json.loads(payload)
+            state = event.get("state", "")
+            self.events.append({**event, "type": state})
+            if state == "ready":
+                self.ready.set()
+        elif kind == TYPE_TRANSCRIPT:
+            event = json.loads(payload)
+            self.events.append(
+                {
+                    "type": event.get("kind", "transcript"),
+                    "text": event.get("text", ""),
+                    "start_ms": event.get("start_ms"),
+                    "end_ms": event.get("end_ms"),
+                }
+            )
+        elif kind == TYPE_SNORE:
+            self.events.append({**json.loads(payload), "type": "snore"})
+
+    def _send_json(self, kind: int, payload: dict) -> None:
+        assert self._conn is not None
+        body = json.dumps(payload).encode()
+        self._conn.sendall(struct.pack(">HBBI", MAGIC, DIR_FROM_SERVER, kind, len(body)) + body)
 
     def send(self, samples: list[int], utc_ms: int) -> None:
         assert self._conn is not None
-        payload = b"".join(s.to_bytes(2, "little", signed=True) for s in samples)
-        header = len(payload).to_bytes(4, "little") + utc_ms.to_bytes(8, "little", signed=True)
-        self._conn.sendall(header + payload)
+        pcm = b"".join(s.to_bytes(2, "little", signed=True) for s in samples)
+        payload = struct.pack(">q", utc_ms) + pcm
+        self._conn.sendall(struct.pack(">HBBI", MAGIC, DIR_FROM_SERVER, TYPE_AUDIO, len(payload)) + payload)
 
     def stream_file(self, wav: Path, realtime: bool, tail_seconds: float) -> Result:
         samples, rate = read_pcm(wav)
@@ -370,6 +427,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--app", default=os.path.expanduser("~/.local/lib/steno-stt-sidecar.app"))
     parser.add_argument("--voice", default="Tingting", help="say(1) voice; any zh_CN voice works")
+    parser.add_argument("--locale", default="zh-CN", help="language sent to the sidecar in its config frame")
     parser.add_argument("--mode", choices=("both", "file", "stream"), default="both")
     parser.add_argument("--conditions", default="clean,farfield", help="comma separated: clean,farfield")
     parser.add_argument("--corpus", help="file with one sentence per line, overrides the built-in corpus")
@@ -437,7 +495,7 @@ def main() -> int:
             row["file"] = recognize_file(app, wav)
         if args.mode in ("both", "stream"):
             _, rate = read_pcm(wav)
-            with StreamClient(app, rate) as client:
+            with StreamClient(app, rate, locale=args.locale) as client:
                 row["stream"] = client.stream_file(wav, realtime=True, tail_seconds=2.0)
 
     print(f"{'#':>3} {'cond':<12} {'file':>14} {'stream':>14}  sentence")

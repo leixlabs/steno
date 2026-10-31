@@ -52,7 +52,7 @@
 
 use steno_lib::audio_capture::{CaptureMeta, CaptureRing, NegotiatedFormat};
 use steno_lib::bounded_queue::{BoundedQueue, QueueItem};
-use steno_lib::config::{AudioConfig, Config, SampleFormat};
+use steno_lib::config::{AudioConfig, Config, SampleFormat, WIRE_RATE_HZ};
 use crate::db_writer::{DbCommand, DbWriterHandle};
 use steno_lib::metrics::Metrics;
 use crate::recorder::segment_relative_path;
@@ -71,6 +71,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Continuous frames with peak-zero needed to flag `signal_silent` (TECH_SPEC §5.2).
 pub const DIGITAL_SILENT_SECONDS: u32 = 1;
+
+/// Blocks whose peak stays under this level are treated as "no usable signal".
+///
+/// `signal_silent` alone only catches a stream where every sample is exactly `0`.
+/// A muted capsule, a microphone unseated from the capsule, or an input gain at
+/// zero does not produce zeros: it produces a few LSB of dither, measured at
+/// about -78 dBFS peak on the bedside device. That is not silence to a byte-level
+/// test, so the Portal reported `有信号` while every recorded WAV was inaudible
+/// and the recogniser never emitted a single final. -60 dBFS is below anything a
+/// working microphone produces in a quiet room and far above digital silence.
+pub const NO_SIGNAL_PEAK_DBFS: f32 = -60.0;
+
+/// How long the peak must stay under [`NO_SIGNAL_PEAK_DBFS`] before `signal_dead`
+/// is raised. One second is the same window `signal_silent` uses: a real quiet
+/// stretch between two snores never lasts that long with a working microphone.
+pub const NO_SIGNAL_SECONDS: u32 = 1;
 
 /// Fraction of samples inside a one-second window that flags clipped capture.
 const CLIP_FRACTION_WARN: f32 = 0.01;
@@ -249,6 +265,9 @@ struct ActiveSegment {
     pending_lost_kind: Option<GapKind>,
     /// Count of consecutive frames with peak-zero (used for digital silence).
     silent_frames_in_a_row: u32,
+    /// Count of consecutive frames whose peak stayed under
+    /// [`NO_SIGNAL_PEAK_DBFS`] (used for `signal_dead`).
+    quiet_frames_in_a_row: u32,
     /// Sliding one-second window used to detect over-amplified capture input.
     clip_window_clipped: u64,
     clip_window_total: u64,
@@ -287,6 +306,7 @@ impl ActiveSegment {
             pending_lost_frames: 0,
             pending_lost_kind: None,
             silent_frames_in_a_row: 0,
+            quiet_frames_in_a_row: 0,
             clip_window_clipped: 0,
             clip_window_total: 0,
             gaps: Vec::new(),
@@ -339,7 +359,7 @@ impl Dispatcher {
         let max_segment_bytes = audio_cfg.max_segment_bytes();
         let gap_rotate_frames = audio_cfg
             .gap_rotate_seconds
-            .saturating_mul(audio_cfg.preferred_rate_hz as u64);
+            .saturating_mul(u64::from(WIRE_RATE_HZ));
         let capture_ring_overflows_at_start = inputs.capture.overflow_frames();
         let xrun_at_start = inputs.metrics.xrun_count.load(Ordering::Relaxed);
         // Establish the first real clock-trust reading before the anchor is built,
@@ -459,7 +479,18 @@ impl Dispatcher {
             capture_rate_hz: self.inputs.negotiated.rate_hz,
             channels: self.inputs.negotiated.channels,
             sample_format: self.inputs.negotiated.format.as_str().to_string(),
-            channel_mapping: format!("mono:{}", self.audio_cfg.mono_channel_index),
+            // The stored stream is mono by construction, so the mapping here is
+            // the identity. Which *device* channel became that stream is a
+            // capture-side fact: on the single-box path this process chose it and
+            // can name it; for a network source the node chose it and reports it
+            // in its own INFO message. Claiming `mono:0` in that case would be
+            // inventing a value the server never observed.
+            channel_mapping: match self.inputs.config.source.kind {
+                steno_lib::config::SourceKind::Alsa => {
+                    format!("mono:{}", self.audio_cfg.mono_channel_index)
+                }
+                steno_lib::config::SourceKind::Net => "mono".to_string(),
+            },
             time_quality,
             boot_id: boot_id.clone(),
         };
@@ -581,10 +612,12 @@ impl Dispatcher {
         if self.segment.is_none() {
             self.open_segment();
         }
-        // The block's frames are at the meta rate. The current segment's
-        // `format.rate_hz` may be different only across a stream rebuild that
-        // changed the negotiated format; in that case we close the current
-        // segment and open a new one before processing.
+        // The block's frames are at the meta rate. Every source now converts to
+        // the wire format before the ring, so `meta` should always match the
+        // segment — this branch is kept as a guard, not as a normal path. It used
+        // to fire whenever a device renegotiated mid-stream, and rotating is still
+        // the right answer if that ever leaks through: appending different-rate
+        // frames to one WAV would corrupt every duration after the change.
         if let Some(seg) = self.segment.as_ref() {
             let same_format = meta.rate_hz == seg.format.rate_hz && meta.channels == seg.format.channels;
             if !same_format {
@@ -673,6 +706,46 @@ impl Dispatcher {
             self.inputs
                 .metrics
                 .set_last_error("dispatcher: digital silence detected (signal_silent)");
+        }
+
+        // "No usable signal" — audio arrives but carries only dither. This is the
+        // failure that hid behind `signal_state = ok`: a muted capsule sends
+        // samples of ±1..±5, which is not digital silence, so `signal_silent`
+        // never fired and the Portal claimed the microphone was hearing something
+        // while every segment transcribed to nothing.
+        //
+        // Measured from the same block level that `/status` reports, so what the
+        // page shows and what this decides cannot disagree.
+        let peak_dbfs = steno_lib::dsp::block_level(pcm).peak_dbfs;
+        let quiet = peak_dbfs < NO_SIGNAL_PEAK_DBFS;
+        let dead_now = {
+            let segment = match self.segment.as_mut() {
+                Some(s) => s,
+                None => return,
+            };
+            if quiet && meta.frames > 0 {
+                let window = u64::from(NO_SIGNAL_SECONDS).saturating_mul(u64::from(meta.rate_hz));
+                segment.quiet_frames_in_a_row = segment
+                    .quiet_frames_in_a_row
+                    .saturating_add(meta.frames);
+                u64::from(segment.quiet_frames_in_a_row) >= window
+            } else {
+                segment.quiet_frames_in_a_row = 0;
+                false
+            }
+        };
+        if dead_now {
+            if !self.inputs.metrics.signal_dead.load(Ordering::Relaxed) {
+                // Raised on the transition only: the error slot holds one string,
+                // and re-setting it every block would push a real later error out.
+                self.inputs.metrics.signal_dead.store(true, Ordering::Relaxed);
+                self.inputs.metrics.set_last_error(format!(
+                    "dispatcher: no usable signal (peak {peak_dbfs:.1} dBFS); the microphone is \
+                     muted, unseated, or at zero gain"
+                ));
+            }
+        } else if self.inputs.metrics.signal_dead.load(Ordering::Relaxed) {
+            self.inputs.metrics.signal_dead.store(false, Ordering::Relaxed);
         }
         // Sliding one-second clip window.
         {
@@ -877,6 +950,14 @@ impl Dispatcher {
                 return;
             }
         }
+        // The live level is measured here because every block passes through
+        // exactly once: it is what `/status` shows and what a watcher draws, and
+        // computing it anywhere else would need the samples again.
+        let level = steno_lib::dsp::block_level(&pcm);
+        self.inputs
+            .metrics
+            .set_live_level(level.peak_dbfs, level.rms_dbfs);
+
         // The recogniser gets its own copy: it is the only consumer that wants
         // audio across segment boundaries, and it must never hold up the lanes
         // that persist data.
@@ -1031,14 +1112,14 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
-    fn test_config(rate_hz: u32, channels: u16) -> Arc<Config> {
+    fn test_config(device_rate_hz: u32, device_channels: u16) -> Arc<Config> {
         Arc::new(Config {
             server: Default::default(),
             source: Default::default(),
             audio: AudioConfig {
                 segment_duration_seconds: 60,
-                preferred_rate_hz: rate_hz,
-                channels,
+                device_rate_hz,
+                device_channels,
                 rumble_highpass_hz: 120,
                 recording_queue_ms: 1000,
                 detection_queue_ms: 1000,
@@ -1861,5 +1942,81 @@ mod tests {
         } else {
             panic!("expected Audio");
         }
+    }
+
+    /// Push `seconds` worth of one constant sample value through the dispatcher.
+    fn feed_constant(d: &mut Dispatcher, value: i16, seconds: u32) {
+        let frames_per_block = 160u32;
+        let blocks = (16_000 * seconds) / frames_per_block;
+        for i in 0..blocks {
+            let meta = CaptureMeta {
+                frames: frames_per_block,
+                channels: 1,
+                rate_hz: 16_000,
+                capture_seq: u64::from(i) * u64::from(frames_per_block),
+                mono_start_ns: u64::from(i) * 10_000_000,
+                stream_generation: 1,
+            };
+            d.process_block(meta, vec![value; frames_per_block as usize]);
+        }
+    }
+
+    /// The failure that made a dead microphone look healthy.
+    ///
+    /// A muted capsule does not emit zeros — it emits a few LSB of dither, which
+    /// measured about -78 dBFS peak on the bedside device. `signal_silent` only
+    /// fires on a block where every sample is exactly `0`, so this input used to
+    /// leave `signal_state` at `ok` while every recorded WAV was inaudible and
+    /// the recogniser produced no final at all. `signal_dead` is what closes that
+    /// gap, and this test is what keeps it closed.
+    #[test]
+    fn dither_only_audio_is_reported_as_no_usable_signal() {
+        let ti = make_inputs(negotiated_mono(), 1024, 1024);
+        let mut d = Dispatcher::new(ti.inputs, Arc::new(AtomicBool::new(false)));
+        d.open_segment();
+
+        // Peak 5/32768 ≈ -76 dBFS: exactly what the muted Razer Seiren produced.
+        feed_constant(&mut d, 5, 3);
+        assert!(
+            ti.metrics.signal_dead.load(Ordering::Relaxed),
+            "a stream whose peak is -76 dBFS carries no usable signal"
+        );
+        assert!(
+            !ti.metrics.signal_silent.load(Ordering::Relaxed),
+            "samples of 5 are not digital silence; the two states must not be conflated"
+        );
+
+        // ... and it clears once the microphone is actually hearing something.
+        feed_constant(&mut d, 2_000, 1);
+        assert!(
+            !ti.metrics.signal_dead.load(Ordering::Relaxed),
+            "a -24 dBFS block must clear the no-signal state"
+        );
+    }
+
+    /// The converse, so the test above cannot pass by always raising the flag.
+    #[test]
+    fn ordinary_quiet_room_is_not_reported_as_no_signal() {
+        let ti = make_inputs(negotiated_mono(), 1024, 1024);
+        let mut d = Dispatcher::new(ti.inputs, Arc::new(AtomicBool::new(false)));
+        d.open_segment();
+
+        // Peak 100/32768 ≈ -50 dBFS: a quiet room with a working microphone.
+        // Above NO_SIGNAL_PEAK_DBFS, so it must not be called dead — otherwise a
+        // genuinely quiet bedroom would page an operator every night.
+        feed_constant(&mut d, 100, 3);
+        assert!(!ti.metrics.signal_dead.load(Ordering::Relaxed));
+    }
+
+    /// Digital silence keeps its own state: it means "no stream at all", which is
+    /// a different fault from "a stream of dither".
+    #[test]
+    fn digital_silence_still_reports_silent() {
+        let ti = make_inputs(negotiated_mono(), 1024, 1024);
+        let mut d = Dispatcher::new(ti.inputs, Arc::new(AtomicBool::new(false)));
+        d.open_segment();
+
+        feed_constant(&mut d, 0, 2);
+        assert!(ti.metrics.signal_silent.load(Ordering::Relaxed));
     }
 }
