@@ -102,13 +102,19 @@ export interface Status {
     state: string
     connected: boolean
     engine: string
+    /** The language the recogniser was told to listen for, e.g. `zh-CN`. */
+    locale: string
     finals_total: number
+    /** Snore episodes the sidecar's classifier reported, across recognisers. */
+    snore_events_total: number
     dropped_blocks: number
     /** The phrase being recognised right now; never stored. */
     partial: string | null
     error: string | null
     /** The recogniser command line the worker uses; null when it is off. */
     launch: { command: string; args: string[] } | null
+    /** Browsers holding a transcript socket open; a leak shows up here. */
+    stream_clients: number
     /** One entry per recogniser process the server runs. */
     recognizers: {
       name: string
@@ -440,4 +446,80 @@ export function sttStateLabel(status: Status['stt']): { text: string; tone: Tone
     default:
       return { text: '未开启', tone: 'idle' }
   }
+}
+
+/**
+ * The two annotators that can write into `episodes.source`, as `stt_stream`
+ * spells them: the server's own rule detector and the sidecar's classifier.
+ */
+export const RULE_DETECTOR = 'rule-v1'
+export const CLASSIFIER_ENGINE = 'apple-soundanalysis-v1'
+
+/** Which engine serves which lane. Empty strings mean "nothing is running". */
+export interface LaneEngines {
+  /** The engine that turns audio into text. */
+  text: string
+  /** Why that name: which recogniser said it, or that it is only a label. */
+  textDetail: string
+  /** The engine that marks snore candidates. */
+  snore: string
+  snoreDetail: string
+  /** A recogniser declared the `snore` lane, so the classifier is running too. */
+  classifier: boolean
+}
+
+/**
+ * Names the engines behind each lane, separately.
+ *
+ * One process can serve both lanes and two processes can serve one lane each, so
+ * a single "engine" line would be wrong either way: the console has to say which
+ * engine is transcribing and which is marking snoring.
+ *
+ * The name a recogniser *declared* on `ready` beats the config label, because
+ * `[stt] engine` is "what was asked for" (and is what old rows were stamped
+ * with) while the declaration is what is actually decoding. The snore lane
+ * names the classifier rather than the process: `apple-soundanalysis-v1` is what
+ * the sidecar's classifier writes into `source`, and it is not the same engine as
+ * the process's transcriber.
+ *
+ * `rule-v1` is the floor: the server's detector annotates whether or not any
+ * recogniser exists, so when no process offers the snore lane that is the honest
+ * answer — never "off".
+ */
+export function laneEngines(stt: Status['stt']): LaneEngines {
+  // A server older than the `recognizers` field is not an error here: the lanes
+  // then have no declared engine, which is exactly what an empty list means.
+  const recognizers = Array.isArray(stt.recognizers) ? stt.recognizers : []
+  const declaring = (lane: string) => recognizers.filter((r) => r.lanes.includes(lane))
+  const declaredNames = (list: Status['stt']['recognizers']) => {
+    const names: string[] = []
+    for (const recognizer of list) {
+      if (recognizer.engine && !names.includes(recognizer.engine)) {
+        names.push(recognizer.engine)
+      }
+    }
+    return names
+  }
+  const recognizerNames = (list: Status['stt']['recognizers']) =>
+    list.map((recognizer) => recognizer.name).join('、')
+
+  const textRecognizers = declaring('text')
+  const snoreRecognizers = declaring('snore')
+  const textNames = declaredNames(textRecognizers)
+
+  const text = textNames.length > 0 ? textNames.join(' · ') : stt.engine
+  const textDetail =
+    textNames.length > 0
+      ? `识别器 ${recognizerNames(textRecognizers)} 在 ready 时自报的引擎`
+      : stt.engine
+        ? `识别器还没有自报引擎，显示的是配置里的 [stt] engine 标签（${stt.engine}）`
+        : '没有在跑的识别器'
+
+  const classifier = snoreRecognizers.length > 0
+  const snore = classifier ? CLASSIFIER_ENGINE : RULE_DETECTOR
+  const snoreDetail = classifier
+    ? `识别器 ${recognizerNames(snoreRecognizers)} 的 snore 通道提供分类器 ${CLASSIFIER_ENGINE}；规则检测器 ${RULE_DETECTOR} 同时在标注`
+    : `没有识别器提供 snore 通道；只有规则检测器 ${RULE_DETECTOR} 在标注`
+
+  return { text, textDetail, snore, snoreDetail, classifier }
 }

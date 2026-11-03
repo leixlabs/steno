@@ -79,7 +79,7 @@ interface EpisodeGroup {
   soundMs: number
   /** Events whose recording still has a file; the rest are counted, not playable. */
   playable: number
-  /** Why these rows are in this zone, deduplicated: "分类器 · 未复核" and so on. */
+  /** Why these rows are in this zone, deduplicated: "分类器 · 已排除" and so on. */
   reasons: string[]
   /** One bar per bucket of `span`, as a fraction of that bucket — a shape, not a metric. */
   density: number[]
@@ -139,20 +139,29 @@ function sourceLabel(source: string): string {
   return source.startsWith(CLASSIFIER_PREFIX) ? '分类器' : '规则候选'
 }
 
-function reviewLabel(status: Episode['review_status']): string {
+/**
+ * The readable name of a reviewer's decision, or `null` when nobody made one.
+ *
+ * Unreviewed is the state of almost every row for almost every night, so
+ * printing it put the same two words on a thousand lines and buried the two
+ * labels that do carry information.
+ */
+function reviewLabel(status: Episode['review_status']): string | null {
   switch (status) {
     case 'snore':
       return '已确认鼾声'
     case 'not_snore':
       return '已排除'
     default:
-      return '未复核'
+      return null
   }
 }
 
 /** Why a row is in the zone it is in, in the row's own words. */
 function reasonOf(event: Episode): string {
-  return `${sourceLabel(event.source)} · ${reviewLabel(event.review_status)}`
+  const review = reviewLabel(event.review_status)
+  const source = sourceLabel(event.source)
+  return review ? `${source} · ${review}` : source
 }
 
 /**

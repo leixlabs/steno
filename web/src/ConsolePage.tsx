@@ -12,8 +12,10 @@ import {
   api,
   bytes,
   duration,
+  laneEngines,
   share,
   sttStateLabel,
+  RULE_DETECTOR,
   unitStateLabel,
   type ControlAction,
   type ControlTarget,
@@ -281,17 +283,33 @@ function CaptureCard({
 function TranscriptionCard({ status }: { status: Status | null }) {
   const stt = status?.stt
   const label = stt ? sttStateLabel(stt) : { text: '未知', tone: 'idle' as Tone }
+  // Two engines, two lines: the transcriber and the snore annotator are
+  // separate facts and often separate processes. Collapsing them into one
+  // "engine" row is what made the card unreadable for a mixed deployment.
+  const engines = stt ? laneEngines(stt) : null
   return (
     <article className="card">
       <CardHead title="语音转写" state={label} />
       <dl className="facts tight">
-        <div>
-          <dt>引擎</dt>
-          <dd>{stt?.engine || '—'}</dd>
+        <div className="wide">
+          <dt>转写引擎</dt>
+          <dd className="ellipsis" title={engines?.textDetail ?? ''}>
+            {engines?.text || '—'}
+          </dd>
+        </div>
+        <div className="wide">
+          <dt>鼾声引擎</dt>
+          <dd className="ellipsis" title={engines?.snoreDetail ?? ''}>
+            {engines?.snore || '—'}
+          </dd>
         </div>
         <div>
           <dt>模式</dt>
           <dd>{stt ? (stt.mode === 'segment' ? '逐段' : '流式') : '—'}</dd>
+        </div>
+        <div>
+          <dt>鼾声事件</dt>
+          <dd>{count(stt?.snore_events_total)}</dd>
         </div>
         <div>
           <dt>已存语句</dt>
@@ -309,16 +327,26 @@ function TranscriptionCard({ status }: { status: Status | null }) {
         </p>
       )}
       {stt?.error && <p className="card-note bad">{stt.error}</p>}
-      {stt?.recognizers?.map((r) => (
-        <p key={r.name} className={r.missing_lanes.length ? 'card-note bad' : 'card-note'}>
-          识别器 {r.name}：{r.connected ? '已连接' : '未连接'}
-          {r.connected && ` · 通道 ${r.lanes.join('/') || '—'}`}
-          {r.missing_lanes.length > 0 && ` · 缺少通道 ${r.missing_lanes.join('/')}（该进程不提供，不会有结果）`}
-          {r.wanted.includes('snore') && ` · 鼾声 ${count(r.snore_events_total)}`}
-        </p>
-      ))}
+      {/* The healthy "recogniser primary: connected, lanes text/snore" line used
+          to sit here and said nothing the grid above does not: the engine names
+          are on their own rows now, and a broken lane has its own note below.
+          Only the two states that are wrong get a sentence. */}
+      {stt?.recognizers?.map((r) =>
+        r.error || r.missing_lanes.length > 0 ? (
+          <p key={r.name} className="card-note bad">
+            识别器 {r.name}：
+            {r.error
+              ? r.error
+              : `缺少通道 ${r.missing_lanes.join('/')}（该进程不提供，不会有结果）`}
+          </p>
+        ) : null,
+      )}
       {stt?.enabled && stt.recognizers && !stt.recognizers.some((r) => r.wanted.includes('snore')) && (
-        <p className="card-note">没有识别器被要求提供鼾声通道；只有规则检测器 rule-v1 在标注鼾声。</p>
+        <p className="card-note">
+          没有识别器被要求提供 snore 通道（<code>[stt] lanes</code>），鼾声只有规则检测器
+          <code>{RULE_DETECTOR}</code> 在标注：它只看频段能量是否高于噪声底，语音和电视同样会触发，
+          那只是一张“当时有声音”的图，不是鼾声结论。
+        </p>
       )}
     </article>
   )
@@ -399,6 +427,9 @@ function LaunchPanel({ status }: { status: Status | null }) {
   const node = status?.source.node_report ?? null
   const stt = status?.stt.launch ?? null
   const sttMode = status?.stt.mode
+  // The same derived name the card shows: the label the recogniser declared,
+  // not the configured one it was launched with.
+  const engines = status ? laneEngines(status.stt) : null
 
   return (
     <section className="panel launch-panel">
@@ -476,8 +507,16 @@ function LaunchPanel({ status }: { status: Status | null }) {
               </code>
               <dl className="facts tight">
                 <div>
-                  <dt>引擎</dt>
-                  <dd>{status?.stt.engine || '—'}</dd>
+                  <dt>转写引擎</dt>
+                  <dd className="ellipsis" title={engines?.textDetail ?? ''}>
+                    {engines?.text || '—'}
+                  </dd>
+                </div>
+                <div>
+                  <dt>鼾声引擎</dt>
+                  <dd className="ellipsis" title={engines?.snoreDetail ?? ''}>
+                    {engines?.snore || '—'}
+                  </dd>
                 </div>
                 <div>
                   <dt>状态</dt>

@@ -229,6 +229,19 @@ body {
   padding: 5px 0;
 }
 
+/* A row whose value is a name rather than a number, so it needs the full card
+   width: `apple-soundanalysis-v1` cut in half by a two-column grid tells the
+   operator less than a taller card does. */
+.facts div.wide {
+  grid-column: span 2;
+}
+
+/* Labels are two or three characters; letting them wrap ("转写引 / 擎") makes a
+   narrow card look broken. The value gives way instead — it can ellipsis. */
+.facts dt {
+  white-space: nowrap;
+}
+
 .card-actions {
   display: flex;
   gap: 6px;
@@ -368,9 +381,12 @@ body {
   gap: 10px;
 }
 
+/* Wide enough for a four-character label (`转写引擎`), not just two: a fixed
+   34px column pushed the value against the label instead of wrapping, which
+   read as one run-on word. */
 .launch-item .facts.tight dt {
   flex: none;
-  width: 34px;
+  width: 48px;
 }
 
 /* --- banners ------------------------------------------------------------- */
@@ -1143,9 +1159,9 @@ button.on {
   font-weight: 600;
 }
 
-/* Why a row is in this zone: the annotator and the review label. The sound
-   zone leans on this column — "规则候选 · 未复核" is the fact that keeps it out
-   of the snoring list above. */
+/* Why a row is in this zone: who annotated it, plus the reviewer's decision
+   when there is one. The sound zone leans on this column — a bare "规则候选"
+   is the fact that keeps it out of the snoring list above. */
 .episode-reason {
   font-size: 10px;
   color: #6d8095;
