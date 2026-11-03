@@ -81,6 +81,12 @@ pub struct SttChunk {
 /// Everything the streaming worker needs that does not change between restarts.
 #[derive(Debug, Clone)]
 pub struct StreamOptions {
+    /// Which configured recogniser this worker drives (`primary` or a
+    /// `[[stt.recognizer]]` name). Keys its entry in `Metrics`.
+    pub name: String,
+    /// Lanes the server wants from it. Results from a lane that was not asked
+    /// for are dropped, never stored.
+    pub lanes: Vec<String>,
     pub socket_path: PathBuf,
     /// Wrapper that starts the sidecar through LaunchServices.
     pub launcher: String,
@@ -158,10 +164,13 @@ fn run(
             Err(StreamError::Stopped) => break,
             Err(error) => {
                 tracing::warn!(%error, "stt stream failed");
-                metrics.set_stt_error(Some(error.to_string()));
+                metrics.update_recognizer(&options.name, |r| r.error = Some(error.to_string()));
             }
         }
-        metrics.stt_connected.store(false, Ordering::Relaxed);
+        metrics.update_recognizer(&options.name, |r| {
+            r.connected = false;
+            r.lanes.clear();
+        });
         // A dead session cannot have a phrase in flight: leaving the last
         // partial on screen would look like the recogniser is still working.
         metrics.set_stt_partial(None);
@@ -208,8 +217,9 @@ async fn serve(
     let (store_tx, store_rx) = std::sync::mpsc::channel::<Stored>();
     let store_metrics = Arc::clone(metrics);
     let store_hub = Arc::clone(hub);
+    let store_name = options.name.clone();
     let store = tokio::task::spawn_blocking(move || {
-        store_loop(database, store_rx, store_metrics, store_hub)
+        store_loop(database, store_rx, store_metrics, store_hub, store_name)
     });
 
     let (outbound_tx, outbound_rx) = mpsc::channel::<Outbound>(OUTBOUND_DEPTH);
@@ -217,7 +227,10 @@ async fn serve(
     // on the wrong language wastes a model load and produces a `ready` that is
     // already wrong.
     outbound_tx
-        .send(Outbound::Config(Config::for_stream(&options.locale)))
+        .send(Outbound::Config(Config::for_stream(
+            &options.locale,
+            options.lanes.iter().any(|l| l == "snore"),
+        )))
         .await
         .map_err(|_| StreamError::Stalled)?;
     let writer = tokio::spawn(writer_loop(write_half, outbound_rx));
@@ -234,6 +247,8 @@ async fn serve(
         Arc::clone(metrics),
         Arc::clone(hub),
         options.engine.clone(),
+        options.name.clone(),
+        options.lanes.clone(),
     );
     tokio::pin!(reader);
 
@@ -445,7 +460,11 @@ async fn read_loop(
     metrics: Arc<Metrics>,
     hub: Arc<TranscriptHub>,
     engine: String,
+    name: String,
+    lanes: Vec<String>,
 ) -> Result<(), StreamError> {
+    let wants_text = lanes.iter().any(|l| l == "text");
+    let wants_snore = lanes.iter().any(|l| l == "snore");
     let mut frames: u64 = 0;
     loop {
         let Some(frame) = wire::read_frame(&mut reader, Direction::SidecarToServer).await? else {
@@ -454,6 +473,9 @@ async fn read_loop(
         };
         frames += 1;
         match frame.kind {
+            MsgType::Transcript if !wants_text => {
+                tracing::debug!(recognizer = %name, "transcript dropped: the text lane was not requested");
+            }
             MsgType::Transcript => {
                 let event: SidecarTranscript = serde_json::from_slice(&frame.payload)?;
                 match event.kind.as_str() {
@@ -486,6 +508,9 @@ async fn read_loop(
                     other => tracing::debug!(kind = other, "ignoring unknown transcript kind"),
                 }
             }
+            MsgType::Snore if !wants_snore => {
+                tracing::debug!(recognizer = %name, "snore episode dropped: the snore lane was not requested");
+            }
             MsgType::Snore => {
                 let event: SnoreEvent = serde_json::from_slice(&frame.payload)?;
                 if !event.is_usable() {
@@ -503,24 +528,64 @@ async fn read_loop(
             }
             MsgType::Session => {
                 let event: SessionEvent = serde_json::from_slice(&frame.payload)?;
-                handle_session(&event, &metrics, &hub);
+                handle_session(&event, &metrics, &hub, &name);
             }
             other => tracing::warn!(kind = %other, "ignoring an uplink frame the server has no use for"),
         }
     }
 }
 
-fn handle_session(event: &SessionEvent, metrics: &Arc<Metrics>, hub: &Arc<TranscriptHub>) {
+/// The lanes a `ready` frame declares. A sidecar that predates the `lanes`
+/// field is read as what it unambiguously said: text always, snore only when it
+/// named a snore lane.
+fn declared_lanes(event: &SessionEvent) -> Vec<String> {
+    if let Some(lanes) = &event.lanes {
+        return lanes.clone();
+    }
+    let mut lanes = vec!["text".to_string()];
+    if event.snore.is_some() {
+        lanes.push("snore".to_string());
+    }
+    lanes
+}
+
+fn handle_session(
+    event: &SessionEvent,
+    metrics: &Arc<Metrics>,
+    hub: &Arc<TranscriptHub>,
+    name: &str,
+) {
     match event.state.as_str() {
         "ready" => {
-            metrics.stt_connected.store(true, Ordering::Relaxed);
-            metrics.set_stt_error(None);
+            let lanes = declared_lanes(event);
+            metrics.update_recognizer(name, |r| {
+                r.connected = true;
+                r.error = None;
+                r.lanes = lanes.clone();
+                r.engine = event.engine.clone();
+            });
+            for missing in metrics
+                .recognizers()
+                .into_iter()
+                .find(|r| r.name == name)
+                .map(|r| r.missing_lanes())
+                .unwrap_or_default()
+            {
+                tracing::warn!(
+                    recognizer = name,
+                    lane = %missing,
+                    offered = ?lanes,
+                    "this recogniser does not offer a lane the server asked for"
+                );
+            }
             // A browser that connected before the sidecar is worth telling that
             // the recogniser just came up.
             hub.publish(TranscriptEvent::State {
                 state: "ready".to_string(),
             });
             tracing::info!(
+                recognizer = name,
+                lanes = ?lanes,
                 engine = event.engine.as_deref().unwrap_or("unknown"),
                 locale = event.locale.as_deref().unwrap_or("unknown"),
                 snore = event.snore.as_deref().unwrap_or("off"),
@@ -530,7 +595,7 @@ fn handle_session(event: &SessionEvent, metrics: &Arc<Metrics>, hub: &Arc<Transc
         "error" => {
             let message = session_message(event);
             tracing::warn!(%message, "recogniser error");
-            metrics.set_stt_error(Some(message.clone()));
+            metrics.update_recognizer(name, |r| r.error = Some(message.clone()));
             hub.publish(TranscriptEvent::Error { message });
         }
         // `status` answers a `control: status`, `degraded` says one lane is
@@ -562,12 +627,14 @@ fn store_loop(
     events: std::sync::mpsc::Receiver<Stored>,
     metrics: Arc<Metrics>,
     hub: Arc<TranscriptHub>,
+    name: String,
 ) {
     for event in events {
         match event {
             Stored::Phrase(row) => match database.insert_transcript(&row) {
                 Ok(()) => {
                     metrics.stt_finals.fetch_add(1, Ordering::Relaxed);
+                    metrics.update_recognizer(&name, |r| r.finals += 1);
                     metrics.set_stt_partial(None);
                     // Published only after the row exists: a client must never
                     // show a phrase the database rejected.
@@ -584,6 +651,7 @@ fn store_loop(
                 match database.insert_episode(&draft.episode_row(None)) {
                     Ok(()) => {
                         metrics.stt_snores.fetch_add(1, Ordering::Relaxed);
+                        metrics.update_recognizer(&name, |r| r.snores += 1);
                         // Published after the row exists, like a final: a client
                         // must never show an episode the database rejected.
                         hub.publish(TranscriptEvent::Snore {
@@ -827,6 +895,8 @@ mod tests {
 
     fn launcher_options(launcher: std::path::PathBuf) -> StreamOptions {
         StreamOptions {
+            name: "primary".to_string(),
+            lanes: vec!["text".to_string()],
             socket_path: std::env::temp_dir().join("steno-launch-test.sock"),
             launcher: launcher.display().to_string(),
             engine: "test".to_string(),

@@ -311,6 +311,10 @@ struct SessionPayload: Encodable {
     /// `"model:<name>"` or `null` when it is off. A string, not a bool, so the
     /// transcript history can say which detector produced an annotation.
     let snore: String?
+    /// The lanes this process runs, so the server can tell "asked for and
+    /// absent" from "asked for and running": `"text"` always, `"snore"` when
+    /// the classifier lane is on.
+    let lanes: [String]?
     let message: String?
 }
 

@@ -269,12 +269,21 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
     // The recogniser lane is deliberately short: if transcription cannot keep
     // up, dropping audio is the right answer — it must never apply backpressure
     // to recording.
-    let stt_queue = starts_streaming(&config).then(|| {
-        Arc::new(BoundedQueue::new(
-            queue_slots(2_000, config.audio.period_ms),
-            CONTROL_SLOTS,
-        ))
-    });
+    let stt_queues: Vec<_> = if starts_streaming(&config) {
+        config
+            .stt
+            .recognizers()
+            .iter()
+            .map(|_| {
+                Arc::new(BoundedQueue::new(
+                    queue_slots(2_000, config.audio.period_ms),
+                    CONTROL_SLOTS,
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // --- workers ----------------------------------------------------------
     let recorder = spawn_recorder_worker(
@@ -296,17 +305,17 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
         capture: Arc::clone(&ring),
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
-        stt_queue: stt_queue.clone(),
+        stt_queues: stt_queues.clone(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated: wire.clone(),
     });
 
     // Transcription sits entirely off the audio path: it reads finished segments
     // from the database, so it can start before capture and can never block it.
-    let stt_worker = start_transcription(
+    let stt_workers = start_transcription(
         &config,
         Arc::clone(&shutting_down),
-        stt_queue.clone(),
+        stt_queues.clone(),
         Arc::clone(&metrics),
         Arc::clone(&transcript_hub),
     );
@@ -487,7 +496,7 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
     }
     // 5. The transcription worker owns its own connection and observes the same
     //    shutdown flag; join it so a sidecar process is not left behind.
-    if let Some(handle) = stt_worker {
+    for handle in stt_workers {
         let _ = handle.join();
     }
     // 6. Last, close the listener. Everything the operator could still want to
@@ -521,48 +530,78 @@ fn starts_streaming(config: &Config) -> bool {
 fn start_transcription(
     config: &Config,
     shutting_down: Arc<AtomicBool>,
-    stt_queue: Option<Arc<BoundedQueue<steno_server::stt_stream::SttChunk>>>,
+    stt_queues: Vec<Arc<BoundedQueue<steno_server::stt_stream::SttChunk>>>,
     metrics: Arc<Metrics>,
     hub: Arc<steno_server::transcript_hub::TranscriptHub>,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> Vec<std::thread::JoinHandle<()>> {
     if !config.stt.enabled {
-        return None;
+        return Vec::new();
     }
     metrics.set_stt_engine(config.stt.engine.clone());
-    let Some(queue) = stt_queue else {
+    let recognizers = config.stt.recognizers();
+    if stt_queues.len() != recognizers.len() {
         tracing::warn!("streaming speech-to-text has no audio lane; it will stay idle");
-        return None;
-    };
-    let socket_path = if config.stt.socket_path.trim().is_empty() {
-        std::env::temp_dir().join(format!("steno-stt-{}.sock", std::process::id()))
-    } else {
-        std::path::PathBuf::from(config.stt.socket_path.trim())
-    };
-    // Recorded before the worker starts so the control centre shows the
-    // socket that is really in use (an empty config value is resolved here).
-    metrics.set_stt_launch(
-        config.stt.stream_command.clone(),
-        vec![socket_path.display().to_string()],
-    );
-    let options = steno_server::stt_stream::StreamOptions {
-        socket_path,
-        launcher: config.stt.stream_command.clone(),
-        engine: config.stt.engine.clone(),
-        locale: config.stt.locale.clone(),
-        database_path: config.storage.database_path.clone(),
-        ready_timeout: Duration::from_secs(30),
-        restart_delay: Duration::from_secs(5),
-    };
-    match steno_server::stt_stream::spawn(queue, options, metrics, shutting_down, hub) {
-        Ok(handle) => {
-            tracing::info!(engine = %config.stt.engine, "streaming speech-to-text enabled");
-            Some(handle)
+        return Vec::new();
+    }
+    let mut handles = Vec::new();
+    for (index, (recognizer, queue)) in recognizers.into_iter().zip(stt_queues).enumerate() {
+        let socket_path = if recognizer.socket_path.trim().is_empty() {
+            let suffix = if index == 0 {
+                String::new()
+            } else {
+                format!("-{}", recognizer.name)
+            };
+            std::env::temp_dir().join(format!("steno-stt-{}{suffix}.sock", std::process::id()))
+        } else {
+            std::path::PathBuf::from(recognizer.socket_path.trim())
+        };
+        if index == 0 {
+            // Recorded before the worker starts so the control centre shows the
+            // socket that is really in use (an empty config value is resolved here).
+            metrics.set_stt_launch(
+                recognizer.stream_command.clone(),
+                vec![socket_path.display().to_string()],
+            );
         }
-        Err(error) => {
-            tracing::error!(%error, "cannot start the streaming speech-to-text worker");
-            None
+        metrics.register_recognizer(&recognizer.name, recognizer.lanes.clone());
+        let engine = if recognizer.engine.trim().is_empty() {
+            config.stt.engine.clone()
+        } else {
+            recognizer.engine.clone()
+        };
+        let options = steno_server::stt_stream::StreamOptions {
+            name: recognizer.name.clone(),
+            lanes: recognizer.lanes.clone(),
+            socket_path,
+            launcher: recognizer.stream_command.clone(),
+            engine,
+            locale: config.stt.locale.clone(),
+            database_path: config.storage.database_path.clone(),
+            ready_timeout: Duration::from_secs(30),
+            restart_delay: Duration::from_secs(5),
+        };
+        match steno_server::stt_stream::spawn(
+            queue,
+            options,
+            Arc::clone(&metrics),
+            Arc::clone(&shutting_down),
+            Arc::clone(&hub),
+        ) {
+            Ok(handle) => {
+                tracing::info!(
+                    recognizer = %recognizer.name,
+                    lanes = ?recognizer.lanes,
+                    "streaming recogniser enabled"
+                );
+                handles.push(handle);
+            }
+            Err(error) => tracing::error!(
+                recognizer = %recognizer.name, %error,
+                "cannot start the streaming recogniser worker"
+            ),
         }
     }
+    handles
 }
 
 fn serve_without_capture(

@@ -212,6 +212,25 @@ engine = "apple-speechanalyzer"
 # wrong one. Must be a locale the sidecar reports in `--check`.
 locale = "zh-CN"
 
+# What the first recogniser is asked for: `text`, `snore`, or both (default).
+# Apple's sidecar has both. A text-only engine such as audio.cpp must say
+# `lanes = ["text"]`, otherwise the status page reports `snore` as asked for and
+# not offered.
+# lanes = ["text", "snore"]
+
+# More recogniser processes, one block each. The keys above describe the first
+# one (`primary`). Add a block when a lane lives in another
+# process — e.g. Qwen3-ASR for text above, and the Apple sidecar only for snore
+# episodes here. Each process declares the lanes it really has on `ready`;
+# `/api/v1/status` -> `stt.recognizers[].missing_lanes` lists any lane asked for
+# here that the connected process does not offer, instead of staying silent.
+#
+# [[stt.recognizer]]
+# name = "apple"                       # unique; ascii letters, digits, - _
+# stream_command = "steno-stt-sidecar"
+# lanes = ["snore"]                    # subset of "text", "snore"
+# engine = ""                          # optional fallback label
+
 [control]
 # Service lifecycle control, used by the Portal's control centre to start, stop
 # and restart the two systemd units below.

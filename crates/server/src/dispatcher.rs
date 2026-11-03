@@ -208,10 +208,10 @@ pub struct DispatcherInputs {
     pub capture: Arc<CaptureRing>,
     pub recording_queue: Arc<BoundedQueue<DispatcherMessage>>,
     pub detection_queue: Arc<BoundedQueue<DispatcherMessage>>,
-    /// Best-effort copy of the audio for the streaming recogniser. Optional and
-    /// allowed to overflow: transcription must never slow down recording.
-    #[allow(clippy::type_complexity)]
-    pub stt_queue: Option<Arc<BoundedQueue<crate::stt_stream::SttChunk>>>,
+    /// One best-effort copy of the audio per recogniser process. Each queue is
+    /// independent and allowed to overflow: a slow recogniser must neither slow
+    /// down recording nor starve another recogniser.
+    pub stt_queues: Vec<Arc<BoundedQueue<crate::stt_stream::SttChunk>>>,
     pub shutting_down: Arc<AtomicBool>,
     pub negotiated: NegotiatedFormat,
 }
@@ -832,21 +832,23 @@ impl Dispatcher {
         // The recogniser gets its own copy: it is the only consumer that wants
         // audio across segment boundaries, and it must never hold up the lanes
         // that persist data.
-        if let Some(queue) = self.inputs.stt_queue.as_ref() {
+        if !self.inputs.stt_queues.is_empty() {
             let utc_ms = self
                 .clock_map
                 .wall_at(meta.mono_start_ns)
                 .map(|wall| wall.timestamp_millis())
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-            let chunk = crate::stt_stream::SttChunk {
-                samples: pcm.to_vec(),
-                utc_ms,
-            };
-            if queue.push_audio(chunk).is_err() {
-                self.inputs
-                    .metrics
-                    .dropped_stt_blocks
-                    .fetch_add(1, Ordering::Relaxed);
+            for queue in &self.inputs.stt_queues {
+                let chunk = crate::stt_stream::SttChunk {
+                    samples: pcm.to_vec(),
+                    utc_ms,
+                };
+                if queue.push_audio(chunk).is_err() {
+                    self.inputs
+                        .metrics
+                        .dropped_stt_blocks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1048,7 +1050,7 @@ mod tests {
             capture: Arc::clone(&capture),
             recording_queue: Arc::clone(&recording),
             detection_queue: Arc::clone(&detection),
-            stt_queue: None,
+            stt_queues: Vec::new(),
             shutting_down: Arc::clone(&shutting_down),
             negotiated,
         };
@@ -1605,7 +1607,7 @@ mod tests {
             capture: Arc::clone(&capture),
             recording_queue: Arc::clone(&recording),
             detection_queue: Arc::clone(&detection),
-            stt_queue: None,
+            stt_queues: Vec::new(),
             shutting_down: Arc::clone(&shutting_down),
             negotiated,
         };

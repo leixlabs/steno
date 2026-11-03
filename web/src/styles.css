@@ -418,22 +418,6 @@ body {
   flex: none;
 }
 
-/* Three buttons that narrow the strip. They are small and quiet on purpose: the
-   strip is the content, this only decides what it lists. */
-.day-filter {
-  display: flex;
-  gap: 4px;
-  flex: none;
-}
-
-.day-filter button {
-  padding: 5px 9px;
-  font-size: 11.5px;
-  background: transparent;
-  border-color: transparent;
-  color: var(--muted);
-}
-
 .day-empty {
   align-self: center;
   padding: 0 6px;
@@ -581,28 +565,11 @@ button.on {
 
 /* --- layout ------------------------------------------------------------- */
 
-.layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  grid-template-areas:
-    'timeline detail'
-    'snore snore';
-  gap: 16px;
-  margin-bottom: 16px;
-}
-
-.timeline-panel {
-  grid-area: timeline;
-}
-
-/* The episodes span the page: they are a table, and a table squeezed into the
-   half-width column wraps every column into a paragraph. */
+/* The page is three full-width panels stacked: capture timeline, snoring,
+   transcript. Each is a table or a track and wants the whole width. */
+.timeline-panel,
 .snore-panel {
-  grid-area: snore;
-}
-
-.detail-panel {
-  grid-area: detail;
+  margin-bottom: 16px;
 }
 
 .utterances-panel {
@@ -866,30 +833,6 @@ button.on {
   opacity: 0.85;
 }
 
-/* Both zones are on the track at once (see `zoneOf`). Snoring keeps the accent
-   and the height it always had; a row that only claims "there was sound" is
-   shorter and dimmer, so the night reads at a glance as "these are the snores,
-   those are the rest" rather than as one undifferentiated column of ticks.
-   Height matters as much as hue: at day zoom the ticks are 2 px apart and a
-   difference in colour alone would not be visible. */
-.tick.sound {
-  top: 11px;
-  height: 7px;
-  background: #5d7c99;
-  opacity: 0.55;
-}
-
-/* A row a reviewer excluded. Still stored, still shown — but it is the one
-   label that says "not snoring", so it is drawn as an outline, not a claim. */
-.tick.not_snore {
-  background: transparent;
-  border: 1px solid #46586b;
-  width: 3px;
-}
-
-.tick.not_snore.sound {
-  border-color: #3d4f60;
-}
 
 .timeline-legend {
   display: flex;
@@ -917,16 +860,11 @@ button.on {
   background: var(--accent);
 }
 
-.legend-item.sound i {
+.legend-item.segment-key i {
+  width: 14px;
   height: 7px;
-  background: #5d7c99;
-}
-
-.legend-item.excluded i {
-  width: 3px;
-  height: 9px;
-  background: transparent;
-  border: 1px solid #46586b;
+  border-radius: 2px;
+  background: #2f4a63;
 }
 
 /* --- window selection ---------------------------------------------------- */
@@ -982,84 +920,7 @@ button.on {
   right: 4px;
 }
 
-/* --- two zones: snoring, and everything else ----------------------------- */
-
-/* The panel holds two lists rather than one filtered list, so the boundary has
-   to be structural, not just a caption. The snoring zone keeps the page's own
-   surface; the sound zone is a recessed block inside it, which reads as "this
-   is the rest" before any label is parsed. */
-.zone {
-  min-width: 0;
-}
-
-.zone + .zone {
-  margin-top: 18px;
-}
-
-.zone-sound {
-  padding: 12px 12px 10px;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  background: #0d141b;
-}
-
-.zone-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px 12px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
-
-.zone-head h3 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
-.zone-snore .zone-head h3 {
-  color: #ffd08a;
-}
-
-.zone-sound .zone-head h3 {
-  color: var(--muted);
-  font-weight: 500;
-}
-
-.zone-total {
-  font-size: 11px;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-/* The secondary zone is dimmer throughout: same numbers, less ink. Its rows are
-   still clickable and still playable, so this is emphasis, not disablement. */
-.zone-sound .episode-row {
-  opacity: 0.82;
-}
-
-.zone-sound .episode-row:hover,
-.zone-sound .episode-row.active {
-  opacity: 1;
-}
-
-.zone-sound .episode-density i {
-  background: rgba(93, 124, 153, 0.5);
-}
-
-.zone-sound .snore-block {
-  background: rgba(93, 124, 153, 0.6);
-}
-
-.zone-sound .snore-block:hover:not(:disabled) {
-  background: #7fa3c4;
-}
-
-.zone-sound .snore-block.active {
-  background: var(--ok);
-}
+/* --- snoring panel -------------------------------------------------------- */
 
 /* --- snore episodes ------------------------------------------------------ */
 
@@ -1293,10 +1154,6 @@ button.on {
   text-overflow: ellipsis;
 }
 
-.zone-snore .episode-reason {
-  color: #8c9caf;
-}
-
 /* Play / stop. A glyph, not a button inside a button: the whole row is the
    control, this only says what clicking it does. */
 .episode-play {
@@ -1321,17 +1178,6 @@ button.on {
 /* Shown whenever the panel is aggregating rule-v1 rows. Amber, not red: the
    layer is useful, it is just answering a different question than the one the
    panel's title asks. */
-.snore-caveat {
-  margin: 0 0 12px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(240, 182, 75, 0.28);
-  background: rgba(240, 182, 75, 0.07);
-  font-size: 11px;
-  line-height: 1.6;
-  color: #f6d9a2;
-}
-
 .snore-foot {
   margin: 10px 0 0;
   font-size: 11px;
@@ -1339,24 +1185,62 @@ button.on {
   color: var(--muted);
 }
 
-/* --- detail ------------------------------------------------------------- */
+/* --- player --------------------------------------------------------------- */
+
+/* The one <audio> on the page. It is always mounted (a click has to be able to
+   seek it) but only takes space once something was started. */
+.now-playing {
+  position: sticky;
+  top: 8px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0c1218;
+  box-shadow: 0 8px 24px -12px rgba(0, 0, 0, 0.7);
+}
+
+.now-playing.idle {
+  display: none;
+}
+
+.now-label {
+  flex: none;
+  font-size: 11.5px;
+  color: #ffd08a;
+  white-space: nowrap;
+}
 
 .player {
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   height: 34px;
-  margin-bottom: 14px;
   filter: invert(0.92) hue-rotate(180deg) saturate(0.7);
   border-radius: 8px;
 }
 
-/* Stands where the player would be when retention has taken the audio. */
-.player-missing {
-  margin: 0 0 14px;
-  padding: 10px 12px;
-  border: 1px dashed var(--line);
-  border-radius: 8px;
-  background: #0c1218;
-  font-size: 11.5px;
+.transcript-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 6px;
+}
+
+.filler-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.filler-toggle i {
+  font-style: normal;
+  color: #5c6c7d;
 }
 
 .facts {
@@ -1395,10 +1279,6 @@ button.on {
 /* The annotation the panel is explaining: source, review, label, confidence.
    It sits above the player because it is the *reason* the player is loaded with
    this file, not a fact about the file. */
-.facts.annotation {
-  margin-bottom: 12px;
-}
-
 /* The one actionable sentence under a card whose state needs explaining. Not a
    banner: the card is still working, one input of it is not. */
 .signal-hint {
@@ -1413,30 +1293,20 @@ button.on {
 }
 
 @media (max-width: 900px) {
-  .layout {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas:
-      'timeline'
-      'snore'
-      'detail';
-  }
   .pool-facts {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .app {
     padding: 20px 14px 48px;
   }
-  /* The strip gets its own line once the arrows, the date and the filters no
-     longer fit beside it. */
+  /* The strip gets its own line once the arrows and the date no longer fit
+     beside it. */
   .daybar {
     flex-wrap: wrap;
   }
   .day-scroll {
     order: 3;
     flex-basis: 100%;
-  }
-  .day-filter {
-    margin-left: auto;
   }
 }
 

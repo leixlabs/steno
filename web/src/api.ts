@@ -109,6 +109,20 @@ export interface Status {
     error: string | null
     /** The recogniser command line the worker uses; null when it is off. */
     launch: { command: string; args: string[] } | null
+    /** One entry per recogniser process the server runs. */
+    recognizers: {
+      name: string
+      wanted: string[]
+      /** What the process declared on ready; empty until then. */
+      lanes: string[]
+      /** Asked for, and not offered by the connected process. */
+      missing_lanes: string[]
+      engine: string | null
+      connected: boolean
+      error: string | null
+      finals_total: number
+      snore_events_total: number
+    }[]
   }
   /**
    * `ok` | `silent` | `dead` | `unknown`.
@@ -201,6 +215,8 @@ export interface Day {
   date: string
   recording_count: number
   episode_count: number
+  /** Rows that claim snoring (classifier or reviewer-confirmed); the list's own count. */
+  snore_count: number
   recorded_ms: number
   lost_frames: number
 }

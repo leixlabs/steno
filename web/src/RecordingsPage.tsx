@@ -1,32 +1,21 @@
-// The recordings page: a day of audio, one bar, one player.
+// The recordings page: one night, three stacked views.
 //
-// This page owns everything that is scoped to a date — the day strip, the
-// timeline, the two episode lists (snoring, and sound-only), the player and the
-// transcript. It asks the server for `/status` too, but only to phrase the
-// transcript's empty state correctly ("转写未开启" versus "今天还没有识别到语音");
-// it never shows an operational card, because that is the console's job.
+//   1. 采集时间轴 — where the night has audio at all (recorded segments) and where
+//      the classifier heard snoring. Zoom, pan and drag a window here; the window
+//      narrows the stats and the transcript below.
+//   2. 鼾声 — the snoring the classifier (or a reviewer) claimed: an overview
+//      strip, the grouped episodes, and replay of each group.
+//   3. 转录 — what was said, as a clock-stamped list; a row replays its audio.
 //
-// The episode list is split in two rather than filtered down to one: `zoneOf`
-// decides which rows claim *snoring* (the classifier's label, or a reviewer's
-// confirmation) and which merely claim *there was sound* (rule-v1's band
-// energy, or a row a reviewer excluded). Both are on screen at once, because
-// "was I snoring" and "was the room noisy" are different questions about the
-// same night, and the answer to one is not a substitute for the other.
+// There is one <audio> element and no detail panel. Both replay paths (a snore
+// group, a transcript row) drive it, and a slim "now playing" bar sits above the
+// snoring panel and appears only once something has been started, so the page never shows a player with nothing
+// behind it. Rows the rule detector alone produced are not drawn: they only mean
+// "something was audible", which the segment blocks already say.
 //
-// Three selections talk to each other, and each one answers a different
-// question: the day strip picks a *date*, the timeline picks a *window* on the
-// night, and the transcript picks an *instant*. A sentence is a jump target, so
-// clicking one seeks the player and selects the segment that holds it; a window
-// is a measurement, so its summary lives in the timeline's own panel head —
-// "how much of the night was this" is only ever asked while looking at the
-// selection, and a separate card for it would outlive the selection.
-//
-// The fourth thing this page does is *replay*: the detector emits thousands of
-// short candidate events per night (1653 on a real one), and nobody wants to
-// listen to eight hours to find them. So events are aggregated into episodes
-// (see `buildEpisodes`), and an episode plays back as a cue list — one clip per
-// event, skipping the silence in between, following the audio across segments
-// because a 30-minute episode spans dozens of one-hour segments.
+// Replay is a cursor over cues (see `buildCues`): an episode is a list of clips,
+// each inside whatever segment held it, so moving the cursor may swap the
+// player's `src`. A transcript row is a single seek.
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -212,14 +201,6 @@ const PASSAGE_GAP_MS = 60_000
 const PASSAGE_MAX_MS = 120_000
 const PASSAGE_MAX_PHRASES = 32
 
-const DAY_FILTERS = [
-  { id: 'all', label: '全部' },
-  { id: 'recorded', label: '有录音' },
-  { id: 'events', label: '有鼾声' },
-] as const
-
-type DayFilter = (typeof DAY_FILTERS)[number]['id']
-
 export default function RecordingsPage() {
   const [date, setDate] = useState(todayISO())
   const [status, setStatus] = useState<Status | null>(null)
@@ -229,11 +210,9 @@ export default function RecordingsPage() {
   const [selectedSegment, setSelectedSegment] = useState<string | null>(null)
   const [utterances, setUtterances] = useState<Utterance[]>([])
   const [error, setError] = useState<string | null>(null)
-  // The window picked on the timeline, and how the day strip is narrowed. Both
-  // are view state, so neither survives a date change — a window on Tuesday
-  // means nothing on Wednesday.
+  // The window picked on the timeline. It is view state, so it does not survive
+  // a date change — a window on Tuesday means nothing on Wednesday.
   const [range, setRange] = useState<TimeRange | null>(null)
-  const [dayFilter, setDayFilter] = useState<DayFilter>('all')
   /** Where the player should be after a jump; consumed by `onLoadedMetadata`. */
   const pendingSeek = useRef<{ segmentId: string; offsetMs: number } | null>(null)
   const [playhead, setPlayhead] = useState<number | null>(null)
@@ -241,13 +220,9 @@ export default function RecordingsPage() {
   const audioRef = useRef<HTMLAudioElement>(null)
   /** How long a silence splits one episode into two. Shared by both zones. */
   const [episodeGap, setEpisodeGap] = useState(DEFAULT_EPISODE_GAP_MS)
-  /**
-   * The one annotation the detail panel is explaining, or `null` for "the
-   * selected recording". Clicking a row is a question about that row — who
-   * wrote it, did a reviewer touch it, is its audio still here — and the
-   * recording facts alone cannot answer it.
-   */
-  const [focus, setFocus] = useState<Episode | null>(null)
+  /** What the player is loaded for, in words; `null` until something was started. */
+  const [nowPlaying, setNowPlaying] = useState<string | null>(null)
+  const [hideFiller, setHideFiller] = useState(true)
   const [replay, setReplay] = useState<Replay | null>(null)
   const [replayNote, setReplayNote] = useState<string | null>(null)
   // The same replay, readable from event handlers that were captured in an
@@ -277,7 +252,7 @@ export default function RecordingsPage() {
     replayRef.current = null
     setReplay(null)
     setReplayNote(null)
-    setFocus(null)
+    setNowPlaying(null)
     Promise.all([api.recordings(date), api.events(date), api.utterances(date)])
       .then(([nextSegments, nextEvents, nextUtterances]) => {
         if (cancelled) return
@@ -364,59 +339,20 @@ export default function RecordingsPage() {
     return merged
   }, [segments])
 
-  /**
-   * The recording the player is allowed to load, or `null` when there is none.
-   *
-   * The player's `src` is always the selected recording, so the media callbacks
-   * and the timeline agree about what is loaded. `null` happens when the focused
-   * annotation has no audio at all — `recording_id = null` (retention took the
-   * file and the foreign key was set to null), or an id this day does not hold.
-   * The player is then disabled rather than pointed at a path that cannot be
-   * served, and no neighbouring recording is guessed in its place.
-   */
-  const focusRecording = useMemo(
-    () =>
-      focus === null || focus.recording_id === null
-        ? null
-        : (segments.find((item) => item.id === focus.recording_id) ?? null),
-    [focus, segments],
-  )
-  const playableSegment = focus !== null && focusRecording === null ? null : segment
-
-  /** What the panel's recording holds, split by zone: counts and durations. */
-  const segmentZones = useMemo(() => {
-    const totals = {
-      snore: { count: 0, ms: 0 },
-      sound: { count: 0, ms: 0 },
-    }
-    for (const event of events) {
-      if (event.recording_id === null || event.recording_id !== playableSegment?.id) continue
-      const bucket = totals[zoneOf(event)]
-      bucket.count += 1
-      bucket.ms += event.duration_ms
-    }
-    return totals
-  }, [events, playableSegment])
+  const snoreEvents = useMemo(() => events.filter((event) => zoneOf(event) === 'snore'), [events])
 
   /**
-   * The day's rows, aggregated once per zone. Rebuilt when the threshold
-   * changes because the threshold *is* the aggregation: there is no canonical
-   * episode list to cache, only this view's answer to "how close must two bouts
-   * be to be one".
+   * The day's snoring, aggregated. Rebuilt when the threshold changes because
+   * the threshold *is* the aggregation: there is no canonical episode list to
+   * cache, only this view's answer to "how close must two bouts be to be one".
    */
   const snoreGroups = useMemo(
     () => buildEpisodes(events, episodeGap, segments, 'snore'),
     [events, episodeGap, segments],
   )
-  const soundGroups = useMemo(
-    () => buildEpisodes(events, episodeGap, segments, 'sound'),
-    [events, episodeGap, segments],
-  )
   const snoreTotals = useMemo(() => totalsOf(snoreGroups), [snoreGroups])
-  const soundTotals = useMemo(() => totalsOf(soundGroups), [soundGroups])
-  /** First and last record of each zone: the span its overview strip is drawn over. */
+  /** First and last record: the span the overview strip is drawn over. */
   const snoreNight = useMemo(() => nightOf(snoreGroups), [snoreGroups])
-  const soundNight = useMemo(() => nightOf(soundGroups), [soundGroups])
 
   /** What the selected window contains. `null` when nothing is selected. */
   const rangeStats = useMemo(() => {
@@ -439,15 +375,13 @@ export default function RecordingsPage() {
       }
     }
 
-    // The same partition the two lists use, or the head would count rows the
-    // panels below it do not show in that zone.
+    // The same partition the list uses, or the head would count rows the
+    // panel below it does not show.
     let snoreCount = 0
-    let soundCount = 0
     for (const event of events) {
       const at = Date.parse(event.started_at_utc)
       if (at < from || at > to) continue
       if (zoneOf(event) === 'snore') snoreCount += 1
-      else soundCount += 1
     }
 
     let utteranceCount = 0
@@ -467,7 +401,6 @@ export default function RecordingsPage() {
       segmentCount,
       recordedMs,
       snoreCount,
-      soundCount,
       utteranceCount,
       spokenMs: spoken,
     }
@@ -480,6 +413,15 @@ export default function RecordingsPage() {
    * See `buildPassages` for the rule.
    */
   const passages = useMemo(() => buildPassages(allUtterances), [allUtterances])
+  // A recogniser given a quiet room answers "嗯。" / "哦。" over and over. They are
+  // real rows in the database and stay there; the toggle only decides whether the
+  // list is made of them. Judged per passage, so a sentence that merely *contains*
+  // a filler word is never hidden.
+  const fillerCount = useMemo(() => passages.filter(isFillerPassage).length, [passages])
+  const shownPassages = useMemo(
+    () => (hideFiller ? passages.filter((passage) => !isFillerPassage(passage)) : passages),
+    [passages, hideFiller],
+  )
 
   /** The passage the player is currently inside. */
   const playingPassageId = useMemo(() => {
@@ -516,7 +458,7 @@ export default function RecordingsPage() {
     // steer the player back to its own cue list, and the panel stops explaining
     // a record it is no longer playing.
     if (replayRef.current) stopReplay(null)
-    setFocus(null)
+    setNowPlaying(`转录 ${localClock(item.started_at_utc)}`)
     setSelectedSegment(host.id)
     const player = audioRef.current
     if (player && host.id === segment?.id) {
@@ -585,9 +527,6 @@ export default function RecordingsPage() {
   }
 
   const seekToCue = (cue: Cue) => {
-    // The panel follows the cursor: the row being played is the row worth
-    // explaining, and it is the only row whose recording is certainly loaded.
-    setFocus(cue.event)
     const offsetMs = Math.max(cue.offsetMs - PRE_ROLL_MS, 0)
     const player = audioRef.current
     // Same src and loaded enough to seek: no round trip through React needed.
@@ -616,26 +555,21 @@ export default function RecordingsPage() {
 
   /**
    * Starts an episode. The window it covers becomes the page's selection, so
-   * the timeline, the head stats and the transcript all narrow to the same half
-   * hour the audio is coming from.
-   *
-   * The first record also becomes the detail panel's subject: a row that was
-   * clicked is a row the reader wants explained, and "which annotator wrote
-   * this, and is the audio still there" is exactly what the panel answers.
+   * the timeline, the head stats and the transcript all narrow to the same
+   * stretch the audio is coming from.
    */
   const playEpisode = (group: EpisodeGroup) => {
     setRange({ from: group.from, to: group.to })
     const { cues, dropped } = buildCues(group, segments)
     if (cues.length === 0) {
       commitReplay(null)
-      // Nothing to seek to, so the panel explains the first row instead of a
-      // recording: this is the `recording_id = null` case, said out loud.
-      setFocus(group.events[0])
+      // Nothing to seek to: the `recording_id = null` case, said out loud.
       setReplayNote('这一段的录音都不在本机了（容量回收）；标注仍然保留。')
       return
     }
     setReplayNote(dropped > 0 ? `${dropped} 条记录所在的录音已被回收，回放会跳过它们。` : null)
     const state: Replay = { episodeId: group.id, cues, index: 0 }
+    setNowPlaying(`鼾声 ${clockOfMs(group.from)} – ${clockOfMs(group.to)}`)
     commitReplay(state)
     seekToCue(cues[0])
   }
@@ -657,9 +591,8 @@ export default function RecordingsPage() {
   /** Selecting a recording by hand ends the replay, or its cursor would drag the player back. */
   const selectSegment = (id: string) => {
     if (replayRef.current) stopReplay(null)
-    // The detail panel follows the recording again; a record picked earlier no
-    // longer describes what the player is loaded with.
-    setFocus(null)
+    const picked = segments.find((item) => item.id === id)
+    if (picked) setNowPlaying(`录音 ${localClock(picked.started_at_utc)} 起`)
     setSelectedSegment(id)
   }
 
@@ -679,9 +612,6 @@ export default function RecordingsPage() {
   // The day strip: the busiest day of the window sets the scale for every bar,
   // so a chip's bar means the same thing across the whole strip.
   const peakRecordedMs = Math.max(1, ...days.map((item) => item.recorded_ms))
-  const visibleDays = days.filter(
-    (item) => item.date === date || matchesDayFilter(item, dayFilter),
-  )
 
   return (
     <>
@@ -718,14 +648,14 @@ export default function RecordingsPage() {
         </div>
 
         <div className="day-scroll">
-          {visibleDays.map((item) => (
+          {days.map((item) => (
             <button
               key={item.date}
               className={[
                 'day-chip',
                 item.date === date ? 'active' : '',
                 item.date === todayISO() ? 'today' : '',
-                item.episode_count > 0 ? 'has-events' : '',
+                item.snore_count > 0 ? 'has-events' : '',
               ]
                 .filter(Boolean)
                 .join(' ')}
@@ -734,7 +664,7 @@ export default function RecordingsPage() {
                 weekdayOf(item.date),
                 `${item.recording_count} 段录音`,
                 duration(item.recorded_ms),
-                item.episode_count ? `${item.episode_count} 条鼾声` : '',
+                item.snore_count ? `${item.snore_count} 条鼾声` : '',
                 item.lost_frames ? `丢帧 ${item.lost_frames.toLocaleString()}` : '',
               ]
                 .filter(Boolean)
@@ -749,309 +679,161 @@ export default function RecordingsPage() {
               </span>
             </button>
           ))}
-          {visibleDays.length === 0 && <span className="day-empty">这 30 天里没有符合条件的日期</span>}
+          {days.length === 0 && <span className="day-empty">这 30 天里没有日期</span>}
         </div>
 
-        <div className="day-filter" role="group" aria-label="按天筛选">
-          {DAY_FILTERS.map((item) => (
-            <button
-              key={item.id}
-              className={item.id === dayFilter ? 'on' : ''}
-              onClick={() => setDayFilter(item.id)}
-              aria-pressed={item.id === dayFilter}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
       </div>
 
-      <section className="layout">
-        <div className="panel timeline-panel">
-          <div className="panel-head timeline-head">
-            <h2>录音时间轴</h2>
-            {rangeStats ? (
-              <div className="head-stats">
-                <span className="head-span">
-                  {clockOfMs(rangeStats.from)} – {clockOfMs(rangeStats.to)}
-                </span>
-                <span>
-                  时长 <b>{duration(rangeStats.ms)}</b>
-                </span>
-                <span>
-                  录音 <b>{rangeStats.segmentCount}</b> 段 · <b>{duration(rangeStats.recordedMs)}</b>
-                </span>
-                <span>
-                  鼾声 <b>{rangeStats.snoreCount}</b>
-                </span>
-                <span>
-                  声音 <b>{rangeStats.soundCount}</b>
-                </span>
-                <span>
-                  语句 <b>{rangeStats.utteranceCount}</b> · <b>{duration(rangeStats.spokenMs)}</b>
-                </span>
-                <button className="ghost tiny" onClick={() => setRange(null)} title="清除区间（Esc）">
-                  清除
-                </button>
-              </div>
-            ) : (
+      {/* 1 — where the night has sound. */}
+      <section className="panel timeline-panel">
+        <div className="panel-head timeline-head">
+          <h2>采集时间轴</h2>
+          {rangeStats ? (
+            <div className="head-stats">
+              <span className="head-span">
+                {clockOfMs(rangeStats.from)} – {clockOfMs(rangeStats.to)}
+              </span>
               <span>
-                {segments.length
-                  ? `${segments.length} 段 · ${duration(
-                      segments.reduce((sum, item) => sum + item.duration_ms, 0),
-                    )}`
-                  : '这一天没有录音'}
+                时长 <b>{duration(rangeStats.ms)}</b>
               </span>
-            )}
-          </div>
-          <NightTimeline
-            segments={segments}
-            events={events}
-            selected={selectedSegment}
-            onSelect={selectSegment}
-            range={range}
-            onRange={setRange}
-          />
-        </div>
-
-        <div className="panel snore-panel">
-          <div className="panel-head snore-head">
-            <h2>鼾声与声音</h2>
-            <div className="head-controls">
               <span>
-                {snoreTotals.count + soundTotals.count
-                  ? `鼾声 ${snoreTotals.count} 条 · 声音 ${soundTotals.count} 条`
-                  : '这一天没有标注'}
+                录音 <b>{rangeStats.segmentCount}</b> 段 · <b>{duration(rangeStats.recordedMs)}</b>
               </span>
-              {/* The threshold is a lens, not a setting: it re-groups the same
-                  records, it never writes anything back. One control for both
-                  zones, so their rows stay comparable. */}
-              <div className="gap-control" role="group" aria-label="合并间隔">
-                <span>合并间隔</span>
-                {EPISODE_GAPS.map((item) => (
-                  <button
-                    key={item.ms}
-                    className={item.ms === episodeGap ? 'on' : ''}
-                    onClick={() => chooseGap(item.ms)}
-                    aria-pressed={item.ms === episodeGap}
-                    title={`相隔不到 ${item.label} 的记录就算同一段`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {/* Primary: rows that claim *snoring* — the classifier's label, or a
-              reviewer's confirmation. Read first, drawn in the page's accent. */}
-          <section className="zone zone-snore" aria-labelledby="zone-snore">
-            <div className="zone-head">
-              <h3 id="zone-snore">鼾声</h3>
-              <span className="zone-total">
-                {snoreTotals.groups
-                  ? `${snoreTotals.groups} 段 · 共 ${duration(snoreTotals.soundMs)} · ${snoreTotals.count} 条`
-                  : '0 段 · 0 条'}
+              <span>
+                鼾声 <b>{rangeStats.snoreCount}</b>
               </span>
-            </div>
-            {snoreGroups.length === 0 ? (
-              <Empty text="今天没有分类器判定的鼾声。" />
-            ) : (
-              <>
-                {snoreNight && (
-                  <ZoneStrip
-                    groups={snoreGroups}
-                    night={snoreNight}
-                    activeId={replay?.episodeId ?? null}
-                    onPick={onEpisodePick}
-                  />
-                )}
-                <EpisodeTable
-                  groups={snoreGroups}
-                  activeId={replay?.episodeId ?? null}
-                  onPick={onEpisodePick}
-                  zone="snore"
-                />
-              </>
-            )}
-          </section>
-
-          {/* Secondary: everything that only claims *there was sound* — rule-v1
-              rows nobody confirmed, and rows a reviewer excluded. Same shape,
-              dimmer: it answers a different question than the title asks. */}
-          <section className="zone zone-sound" aria-labelledby="zone-sound">
-            <div className="zone-head">
-              <h3 id="zone-sound">非鼾声 · 只是有声音</h3>
-              <span className="zone-total">
-                {soundTotals.groups
-                  ? `${soundTotals.groups} 段 · 共 ${duration(soundTotals.soundMs)} · ${soundTotals.count} 条`
-                  : '0 段 · 0 条'}
+              <span>
+                语句 <b>{rangeStats.utteranceCount}</b> · <b>{duration(rangeStats.spokenMs)}</b>
               </span>
+              <button className="ghost tiny" onClick={() => setRange(null)} title="清除区间（Esc）">
+                清除
+              </button>
             </div>
-            {/* Said out loud whenever this zone has rows: it is a map of
-                "something was audible", and reading it as snoring is the exact
-                mistake the split exists to prevent. */}
-            {soundGroups.length > 0 && (
-              <p className="snore-caveat">
-                规则候选：rule-v1 只看频带能量与噪声底，说话、电视、播放中的故事都会触发。这里回答的是「什么时候有声音」，不是「什么时候在打鼾」
-              </p>
-            )}
-            {soundGroups.length === 0 ? (
-              <Empty text="今天没有只检测到声音的片段。" />
-            ) : (
-              <>
-                {soundNight && (
-                  <ZoneStrip
-                    groups={soundGroups}
-                    night={soundNight}
-                    activeId={replay?.episodeId ?? null}
-                    onPick={onEpisodePick}
-                  />
-                )}
-                <EpisodeTable
-                  groups={soundGroups}
-                  activeId={replay?.episodeId ?? null}
-                  onPick={onEpisodePick}
-                  zone="sound"
-                />
-              </>
-            )}
-          </section>
-
-          {replayNote && <p className="snore-note">{replayNote}</p>}
-
-          {(snoreGroups.length > 0 || soundGroups.length > 0) && (
-            <p className="snore-foot">
-              相邻的记录按合并间隔拼成一段：上面的时长是这一段的跨度，声音时长与百分比只算记录本身。点一行按记录逐条回放，中间的安静会跳过。
-              {snoreTotals.playable + soundTotals.playable <
-                snoreTotals.count + soundTotals.count &&
-                `其中 ${
-                  snoreTotals.count +
-                  soundTotals.count -
-                  snoreTotals.playable -
-                  soundTotals.playable
-                } 条所在的录音已被容量回收。`}
-            </p>
-          )}
-        </div>
-
-        <div className="panel detail-panel">
-          <PanelHead
-            title={focus ? '标注详情' : '录音详情'}
-            meta={
-              focus
-                ? `${localClock(focus.started_at_utc)} · ${duration(focus.duration_ms)}`
-                : segment
-                  ? `${localClock(segment.started_at_utc)} 起 · ${duration(segment.duration_ms)}`
-                  : '选择一段录音'
-            }
-          />
-          {focus && (
-            <dl className="facts annotation">
-              <div>
-                <dt>来源</dt>
-                <dd>{sourceLabel(focus.source)}</dd>
-              </div>
-              <div>
-                <dt>复核</dt>
-                <dd>{reviewLabel(focus.review_status)}</dd>
-              </div>
-              <div>
-                <dt>标签</dt>
-                <dd>{focus.label ?? '—'}</dd>
-              </div>
-              <div>
-                <dt>置信度</dt>
-                <dd>{focus.confidence === null ? '—' : focus.confidence.toFixed(2)}</dd>
-              </div>
-            </dl>
-          )}
-          {focus && focusRecording === null ? (
-            /* The row survives retention; its file does not. Saying so is the
-               whole answer — there is no path to load and no audio to play. */
-            <p className="player-missing">
-              {focus.recording_id === null
-                ? '该片段的音频已被回收；标注仍然保留，但无法播放。'
-                : '该片段指向的录音不在这一天的列表里，无法播放。'}
-            </p>
-          ) : playableSegment ? (
-            <>
-              {/* `metadata` (not `none`) so the player shows a real duration:
-                  the header is two range requests, and "0:00 / 0:00" read as a
-                  broken recording. A file that disappeared under the row is
-                  reported by the element's own error, never guessed at here. */}
-              <audio
-                ref={audioRef}
-                controls
-                preload="metadata"
-                src={playableSegment.audio_url}
-                className="player"
-                onLoadedMetadata={onLoadedMetadata}
-                onTimeUpdate={onTimeUpdate}
-                onSeeked={onTimeUpdate}
-                // A cue that runs to the end of its file never sees a
-                // `timeupdate` past its end, so the recording has to hand over.
-                onEnded={onSegmentEnded}
-                onError={() => {
-                  if (replayRef.current) stopReplay('这一段音频读不出来，可能文件已缺失。')
-                }}
-              />
-              <dl className="facts">
-                <div>
-                  <dt>本段鼾声</dt>
-                  <dd>
-                    {segmentZones.snore.count
-                      ? `${segmentZones.snore.count} 条 · ${duration(segmentZones.snore.ms)}`
-                      : '无'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>本段声音</dt>
-                  <dd>
-                    {segmentZones.sound.count
-                      ? `${segmentZones.sound.count} 条 · ${duration(segmentZones.sound.ms)}`
-                      : '无'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>时长</dt>
-                  <dd>{duration(playableSegment.duration_ms)}</dd>
-                </div>
-                <div>
-                  <dt>丢帧</dt>
-                  <dd>{playableSegment.lost_frames.toLocaleString()}</dd>
-                </div>
-              </dl>
-            </>
           ) : (
-            <Empty text="还没有选中录音。" />
+            <span>
+              {segments.length
+                ? `${segments.length} 段 · ${duration(
+                    segments.reduce((sum, item) => sum + item.duration_ms, 0),
+                  )}`
+                : '这一天没有录音'}
+            </span>
           )}
         </div>
+        <NightTimeline
+          segments={segments}
+          events={snoreEvents}
+          selected={selectedSegment}
+          onSelect={selectSegment}
+          range={range}
+          onRange={setRange}
+        />
       </section>
 
+    {/* Mounted from the start so a click can seek it, but only shown once
+          something has been started: a player with nothing behind it reads as
+          broken. */}
+      <div className={`now-playing ${nowPlaying && segment ? '' : 'idle'}`}>
+        {nowPlaying && <span className="now-label">{nowPlaying}</span>}
+        <audio
+          ref={audioRef}
+          controls
+          preload="metadata"
+          src={segment?.audio_url}
+          className="player"
+          onLoadedMetadata={onLoadedMetadata}
+          onTimeUpdate={onTimeUpdate}
+          onSeeked={onTimeUpdate}
+          onEnded={onSegmentEnded}
+          onError={() => {
+            if (replayRef.current) stopReplay('这一段音频读不出来，可能文件已缺失。')
+          }}
+        />
+      </div>
+
+      {/* 2 — the snoring itself. */}
+      <section className="panel snore-panel">
+        <div className="panel-head snore-head">
+          <h2>鼾声</h2>
+          <div className="head-controls">
+            <span>
+              {snoreTotals.groups
+                ? `${snoreTotals.groups} 段 · 共 ${duration(snoreTotals.soundMs)} · ${snoreTotals.count} 条`
+                : '这一天没有鼾声'}
+            </span>
+            {/* The threshold is a lens, not a setting: it re-groups the same
+                records, it never writes anything back. */}
+            <div className="gap-control" role="group" aria-label="合并间隔">
+              <span>合并间隔</span>
+              {EPISODE_GAPS.map((item) => (
+                <button
+                  key={item.ms}
+                  className={item.ms === episodeGap ? 'on' : ''}
+                  onClick={() => chooseGap(item.ms)}
+                  aria-pressed={item.ms === episodeGap}
+                  title={`相隔不到 ${item.label} 的记录就算同一段`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {snoreGroups.length === 0 ? (
+          <Empty text="今天没有分类器判定的鼾声。" />
+        ) : (
+          <>
+            {snoreNight && (
+              <ZoneStrip
+                groups={snoreGroups}
+                night={snoreNight}
+                activeId={replay?.episodeId ?? null}
+                onPick={onEpisodePick}
+              />
+            )}
+            <EpisodeTable
+              groups={snoreGroups}
+              activeId={replay?.episodeId ?? null}
+              onPick={onEpisodePick}
+            />
+          </>
+        )}
+        {replayNote && <p className="snore-note">{replayNote}</p>}
+        {snoreGroups.length > 0 && (
+          <p className="snore-foot">
+            相邻的记录按合并间隔拼成一段。点一行逐条回放，中间的安静会跳过。
+            {snoreTotals.playable < snoreTotals.count &&
+              `其中 ${snoreTotals.count - snoreTotals.playable} 条所在的录音已被容量回收。`}
+          </p>
+        )}
+      </section>
+
+      {/* 3 — what was said. Clicking a row plays it in the bar above. */}
       <section className="panel utterances-panel">
         <PanelHead
           title={`${date} 转录`}
           meta={
-            // `allUtterances`, not `utterances`: the header has to count what the
-            // body shows, including phrases that arrived over the socket after
-            // the day was fetched.
             status?.stt.enabled
               ? `${status.stt.engine} · ${allUtterances.length} 句 · ${duration(spokenMs)}`
               : `${allUtterances.length} 句 · 转写未开启`
           }
         />
+        <div className="transcript-tools">
+          <label className="filler-toggle">
+            <input
+              type="checkbox"
+              checked={hideFiller}
+              onChange={(event) => setHideFiller(event.target.checked)}
+            />
+            折叠语气词
+            {fillerCount > 0 && <i>{fillerCount} 条</i>}
+          </label>
+        </div>
         {allUtterances.length === 0 && !(isToday && live.partial) && (
           <Empty text={transcriptEmptyHint(status)} />
         )}
-        {/* One row per passage with its clock in a left rail: not one flowing
-            block (a paragraph you cannot point at), and not one row per
-            recogniser final either (a column of "嗯。" that is complete and
-            unreadable). A merged row is still a jump target — it starts where
-            its first phrase does. */}
-        {passages.length > 0 && (
+        {shownPassages.length > 0 && (
           <ol className="transcript">
-            {passages.map((passage) => {
+            {shownPassages.map((passage) => {
               const first = passage.phrases[0]
               const outside =
                 rangeStats !== null &&
@@ -1070,7 +852,7 @@ export default function RecordingsPage() {
                       .join(' ')}
                     onClick={() => jumpTo(first)}
                     title={`${passageTitle(passage)} · ${
-                      reachable ? '点击跳到这一段的录音' : '这一段录音已被回收'
+                      reachable ? '点击回放这一段' : '这一段录音已被回收'
                     }`}
                   >
                     <span className="transcript-time">
@@ -1086,9 +868,6 @@ export default function RecordingsPage() {
             })}
           </ol>
         )}
-        {/* The live half-sentence belongs to *now*, so it is only shown on today.
-            It comes off the socket, not off a poll: a 4 s poll showed it stuttering
-            and could miss a short phrase entirely. */}
         {isToday && live.partial && (
           <p className="transcript-live">
             <span className="transcript-live-mark">正在识别</span>
@@ -1101,7 +880,9 @@ export default function RecordingsPage() {
         {passages.length > 0 && (
           <p className="transcript-foot">
             共 {allUtterances.length} 句，按停顿合并为 {passages.length} 条，覆盖{' '}
-            {duration(spokenMs)}；点击任一条跳到它开头的录音，播放时会跟随高亮。
+            {duration(spokenMs)}
+            {hideFiller && fillerCount > 0 && `；已折叠 ${fillerCount} 条只有语气词的短句`}
+            ；点击任一条回放它开头的录音，播放时会跟随高亮。
           </p>
         )}
       </section>
@@ -1164,7 +945,7 @@ function ZoneStrip({
 }
 
 /**
- * The episode table for one zone, memoised.
+ * The snoring table, memoised.
  *
  * Playing a night re-renders this page about four times a second, because the
  * player's `timeupdate` drives the transcript highlight — and each table is
@@ -1176,13 +957,10 @@ const EpisodeTable = memo(function EpisodeTable({
   groups,
   activeId,
   onPick,
-  zone,
 }: {
   groups: EpisodeGroup[]
   activeId: string | null
   onPick: (group: EpisodeGroup) => void
-  /** Which zone's wording the columns use. */
-  zone: Zone
 }) {
   const listRef = useRef<HTMLOListElement>(null)
   // A group can be started from the overview strip above, where the matching
@@ -1197,7 +975,7 @@ const EpisodeTable = memo(function EpisodeTable({
   }, [activeId])
 
   if (groups.length === 0) return null
-  const noun = zone === 'snore' ? '鼾声' : '声音'
+  const noun = '鼾声'
   return (
     <>
       <div className="episode-cols" aria-hidden>
@@ -1269,9 +1047,7 @@ const EpisodeTable = memo(function EpisodeTable({
                 <span className="episode-count">
                   <b>{group.events.length}</b> 条
                 </span>
-                {/* Why this row is in this zone. The sound zone needs it most:
-                    "rule-v1, never reviewed" is the fact that separates it from
-                    the snoring above. */}
+                {/* Who wrote the row and whether a reviewer touched it. */}
                 <span className="episode-reason">{group.reasons.join(' / ')}</span>
                 <span className="episode-play" aria-hidden>
                   {active ? '■' : '▶'}
@@ -1513,20 +1289,14 @@ function NightTimeline({
         <span>{clockOf(end, span)}</span>
       </div>
 
-      {/* Both zones are drawn at once, so the legend has to name them: a tick's
-          colour is the only thing telling "snoring" from "there was sound". */}
       <div className="timeline-legend">
+        <span className="legend-item segment-key">
+          <i />
+          有录音
+        </span>
         <span className="legend-item snore">
           <i />
           鼾声
-        </span>
-        <span className="legend-item sound">
-          <i />
-          非鼾声 · 有声音
-        </span>
-        <span className="legend-item excluded">
-          <i />
-          已排除
         </span>
       </div>
 
@@ -1853,6 +1623,16 @@ function buildPassages(phrases: Utterance[]): Passage[] {
   return passages
 }
 
+/** Words that carry no content when they are all a passage says. */
+const FILLER = new Set(['嗯', '哦', '啊', '呃', '额', '唉', '哎', '哈', '噢', '喔', '是', '好', '对', '呀', '哼', '诶'])
+
+/** True when every character of the passage is a filler word or punctuation. */
+function isFillerPassage(passage: Passage): boolean {
+  const text = passage.phrases.map((item) => item.text).join('')
+  const letters = [...text].filter((char) => !/[\s。，、！？,.!?…~～]/.test(char))
+  return letters.length > 0 && letters.every((char) => FILLER.has(char))
+}
+
 /** Hover text: the exact clock, and how many phrases the row stands for. */
 function passageTitle(passage: Passage): string {
   const first = passage.phrases[0]
@@ -1864,12 +1644,6 @@ function passageTitle(passage: Passage): string {
 function weekdayOf(date: string): string {
   const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
   return names[new Date(`${date}T12:00:00`).getDay()] ?? ''
-}
-
-function matchesDayFilter(day: Day, filter: DayFilter): boolean {
-  if (filter === 'recorded') return day.recording_count > 0
-  if (filter === 'events') return day.episode_count > 0
-  return true
 }
 
 /**

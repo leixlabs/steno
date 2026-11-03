@@ -641,6 +641,24 @@ struct SttView {
     /// normal; a number that stays above zero after every page is closed means a
     /// socket leaked.
     stream_clients: usize,
+    /// One entry per configured recogniser process, with the lanes it declared.
+    recognizers: Vec<RecognizerView>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecognizerView {
+    name: String,
+    /// Lanes the server asked for.
+    wanted: Vec<String>,
+    /// Lanes the process declared on `ready`; empty until it is ready.
+    lanes: Vec<String>,
+    /// Asked for, and the connected process does not offer it.
+    missing_lanes: Vec<String>,
+    engine: Option<String>,
+    connected: bool,
+    error: Option<String>,
+    finals_total: u64,
+    snore_events_total: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -971,6 +989,21 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                     .as_ref()
                     .map(|hub| hub.subscribers())
                     .unwrap_or(0),
+                recognizers: metrics
+                    .recognizers()
+                    .into_iter()
+                    .map(|r| RecognizerView {
+                        missing_lanes: r.missing_lanes(),
+                        name: r.name,
+                        wanted: r.wanted,
+                        lanes: r.lanes,
+                        engine: r.engine,
+                        connected: r.connected,
+                        error: r.error,
+                        finals_total: r.finals,
+                        snore_events_total: r.snores,
+                    })
+                    .collect(),
             },
             signal_state,
         },
@@ -1093,11 +1126,27 @@ struct DaysView {
     days: Vec<DayView>,
 }
 
+/// Mirrors `zoneOf` in `web/src/RecordingsPage.tsx`: a reviewer's label decides,
+/// and otherwise only the classifier's rows claim snoring.
+fn claims_snoring(episode: &crate::storage::EpisodeRow) -> bool {
+    use crate::storage::ReviewStatus;
+    match episode.review_status {
+        ReviewStatus::NotSnore => false,
+        ReviewStatus::Snore => true,
+        ReviewStatus::Unreviewed => episode.source.starts_with("apple-soundanalysis"),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DayView {
     date: String,
     recording_count: usize,
+    /// Every annotation, whoever wrote it (the rule detector's included).
     episode_count: usize,
+    /// Annotations that claim snoring: the classifier's rows and rows a reviewer
+    /// confirmed, minus rows a reviewer excluded. The same partition the Portal's
+    /// snoring list uses, so the day strip and the list cannot disagree.
+    snore_count: usize,
     recorded_ms: u64,
     lost_frames: u64,
 }
@@ -1154,6 +1203,7 @@ async fn get_days(
                     date: date.format("%Y-%m-%d").to_string(),
                     recording_count: recordings.len(),
                     episode_count: episodes.len(),
+                    snore_count: episodes.iter().filter(|e| claims_snoring(e)).count(),
                     recorded_ms: recordings
                         .iter()
                         .map(|recording| duration_ms(recording.frame_count, recording.capture_rate_hz))

@@ -133,6 +133,36 @@ impl TimingStats {
 }
 
 /// All counters and status flags shared across threads.
+/// What one recogniser process is, and what it has said about itself.
+#[derive(Debug, Clone, Default)]
+pub struct RecognizerStatus {
+    pub name: String,
+    /// Lanes the server asked this recogniser for (`text`, `snore`).
+    pub wanted: Vec<String>,
+    /// Lanes the recogniser declared on `ready`. Empty until it is ready: an
+    /// unknown capability is never guessed.
+    pub lanes: Vec<String>,
+    pub engine: Option<String>,
+    pub connected: bool,
+    pub error: Option<String>,
+    pub finals: u64,
+    pub snores: u64,
+}
+
+impl RecognizerStatus {
+    /// Lanes that were asked for and not offered. Only meaningful once ready.
+    pub fn missing_lanes(&self) -> Vec<String> {
+        if !self.connected {
+            return Vec::new();
+        }
+        self.wanted
+            .iter()
+            .filter(|w| !self.lanes.contains(w))
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     // --- capture / timeline (TECH_SPEC §4.1, §4.3) ---
@@ -251,6 +281,9 @@ pub struct Metrics {
     stt_launch: Mutex<Option<(String, Vec<String>)>>,
     stt_partial: Mutex<Option<String>>,
     stt_error: Mutex<Option<String>>,
+    /// One entry per configured recogniser process. The aggregate fields above
+    /// are derived from these, so existing readers keep working.
+    recognizers: Mutex<Vec<RecognizerStatus>>,
 
     // --- last error, for the status page ---
     last_error: Mutex<Option<String>>,
@@ -312,6 +345,40 @@ impl Metrics {
 
     pub fn stt_partial(&self) -> Option<String> {
         self.stt_partial.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Declares a recogniser before it connects, so the status page can say
+    /// "configured, not yet ready" instead of omitting it.
+    pub fn register_recognizer(&self, name: &str, wanted: Vec<String>) {
+        if let Ok(mut all) = self.recognizers.lock() {
+            all.retain(|r| r.name != name);
+            all.push(RecognizerStatus {
+                name: name.to_string(),
+                wanted,
+                ..RecognizerStatus::default()
+            });
+        }
+    }
+
+    /// Mutates one recogniser's status, then re-derives the aggregates.
+    pub fn update_recognizer(&self, name: &str, change: impl FnOnce(&mut RecognizerStatus)) {
+        let Ok(mut all) = self.recognizers.lock() else {
+            return;
+        };
+        if let Some(entry) = all.iter_mut().find(|r| r.name == name) {
+            change(entry);
+        }
+        self.stt_connected
+            .store(all.iter().any(|r| r.connected), Ordering::Relaxed);
+        let error = all
+            .iter()
+            .find_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.name)));
+        drop(all);
+        self.set_stt_error(error);
+    }
+
+    pub fn recognizers(&self) -> Vec<RecognizerStatus> {
+        self.recognizers.lock().map(|a| a.clone()).unwrap_or_default()
     }
 
     pub fn set_stt_error(&self, message: Option<String>) {

@@ -437,6 +437,7 @@ impl LineContext {
             MsgType::Session,
             serde_json::json!({
                 "state": "ready",
+                "lanes": ["text"],
                 "engine": ENGINE_LABEL,
                 "language": self.language,
                 "locale": self.locale,

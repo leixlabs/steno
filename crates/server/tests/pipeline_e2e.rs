@@ -93,7 +93,7 @@ fn audio_flows_from_ring_through_dispatcher_into_wav_and_db() {
         capture: Arc::clone(&ring),
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
-        stt_queue: None,
+        stt_queues: Vec::new(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated,
     });
@@ -345,7 +345,7 @@ fn a_48k_stereo_device_still_records_16k_mono() {
         capture: Arc::clone(&wire_ring),
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
-        stt_queue: None,
+        stt_queues: Vec::new(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated: wire,
     });

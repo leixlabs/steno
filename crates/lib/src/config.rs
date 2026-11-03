@@ -164,6 +164,56 @@ pub struct SttConfig {
     /// default would silently transcribe the night in the wrong language.
     #[serde(default = "default_stt_locale")]
     pub locale: String,
+    /// Additional recogniser processes, each with its own launcher and lanes.
+    /// The `[stt]` keys above describe the first one (named `primary`, lanes
+    /// from `stt.lanes`); an entry here adds another, so one machine can run Qwen3-ASR for
+    /// text and the Apple sidecar for snores at the same time.
+    #[serde(default)]
+    pub recognizer: Vec<RecognizerConfig>,
+    /// Lanes the first recogniser is asked for. The default asks for both, which
+    /// is what the Apple sidecar offers; a text-only engine (audio.cpp) must say
+    /// `["text"]` here, and until it does the status page lists `snore` as a
+    /// lane that was asked for and is not offered.
+    #[serde(default = "default_primary_lanes")]
+    pub lanes: Vec<String>,
+}
+
+fn default_primary_lanes() -> Vec<String> {
+    vec!["text".to_string(), "snore".to_string()]
+}
+
+/// One recogniser process. The server decides which lanes it wants from it; the
+/// process declares which it has on `ready`, and a mismatch is reported.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecognizerConfig {
+    pub name: String,
+    pub stream_command: String,
+    /// Empty derives `$TMPDIR/steno-stt-<pid>-<name>.sock`.
+    #[serde(default)]
+    pub socket_path: String,
+    /// Fallback label for rows this recogniser stores.
+    #[serde(default)]
+    pub engine: String,
+    /// Subset of `text` / `snore`. Must be non-empty.
+    pub lanes: Vec<String>,
+}
+
+pub const KNOWN_LANES: [&str; 2] = ["text", "snore"];
+
+impl SttConfig {
+    /// Every recogniser the server runs, the legacy `[stt]` keys first.
+    pub fn recognizers(&self) -> Vec<RecognizerConfig> {
+        let mut all = vec![RecognizerConfig {
+            name: "primary".to_string(),
+            stream_command: self.stream_command.clone(),
+            socket_path: self.socket_path.clone(),
+            engine: self.engine.clone(),
+            lanes: self.lanes.clone(),
+        }];
+        all.extend(self.recognizer.iter().cloned());
+        all
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -511,6 +561,8 @@ impl Default for SttConfig {
             socket_path: String::new(),
             engine: default_stt_engine(),
             locale: default_stt_locale(),
+            recognizer: Vec::new(),
+            lanes: default_primary_lanes(),
         }
     }
 }
@@ -542,6 +594,36 @@ impl SttConfig {
             errors.push(
                 "stt.locale: must name the recogniser language when stt.mode = \"stream\"".to_string(),
             );
+        }
+        if self.lanes.is_empty() {
+            errors.push("stt.lanes: must list at least one of text, snore".to_string());
+        }
+        for lane in &self.lanes {
+            if !KNOWN_LANES.contains(&lane.as_str()) {
+                errors.push(format!("stt.lanes: unknown lane \"{lane}\" (known: text, snore)"));
+            }
+        }
+        let mut names = vec!["primary".to_string()];
+        for (i, r) in self.recognizer.iter().enumerate() {
+            let at = format!("stt.recognizer[{i}]");
+            if r.name.trim().is_empty() || !r.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                errors.push(format!("{at}.name: must be non-empty ascii letters, digits, '-' or '_'"));
+            } else if names.contains(&r.name) {
+                errors.push(format!("{at}.name: \"{}\" is already used", r.name));
+            } else {
+                names.push(r.name.clone());
+            }
+            if r.stream_command.trim().is_empty() {
+                errors.push(format!("{at}.stream_command: must name a launcher"));
+            }
+            if r.lanes.is_empty() {
+                errors.push(format!("{at}.lanes: must list at least one of text, snore"));
+            }
+            for lane in &r.lanes {
+                if !KNOWN_LANES.contains(&lane.as_str()) {
+                    errors.push(format!("{at}.lanes: unknown lane \"{lane}\" (known: text, snore)"));
+                }
+            }
         }
     }
 }
@@ -1170,6 +1252,29 @@ mod control_tests {
         assert!(!config.control.enabled);
         assert_eq!(config.control.server_unit, "steno-monitor");
         assert_eq!(config.control.node_unit, "steno-node");
+    }
+
+    #[test]
+    fn a_second_recogniser_is_accepted_and_listed_after_primary() {
+        let config = Config::from_toml_str(&document(
+            "[stt]\nenabled = true\n[[stt.recognizer]]\nname = \"apple\"\nstream_command = \"steno-stt-sidecar\"\nlanes = [\"snore\"]\n",
+        ))
+        .expect("a named extra recogniser must validate");
+        let all = config.stt.recognizers();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].name, "primary");
+        assert_eq!(all[1].lanes, vec!["snore".to_string()]);
+    }
+
+    #[test]
+    fn a_bad_recogniser_entry_is_refused_with_its_key_named() {
+        let error = Config::from_toml_str(&document(
+            "[stt]\nenabled = true\n[[stt.recognizer]]\nname = \"primary\"\nstream_command = \"x\"\nlanes = [\"video\"]\n",
+        ))
+        .expect_err("duplicate name and unknown lane must not validate");
+        let message = error.to_string();
+        assert!(message.contains("stt.recognizer[0].name"), "got: {message}");
+        assert!(message.contains("unknown lane"), "got: {message}");
     }
 
     #[test]

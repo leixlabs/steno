@@ -644,6 +644,10 @@ async fn days_lists_only_nights_that_hold_data() {
     assert_eq!(days[0]["date"], "2025-01-01");
     assert_eq!(days[0]["recording_count"], 2);
     assert_eq!(days[0]["episode_count"], 1);
+    assert_eq!(
+        days[0]["snore_count"], 0,
+        "a rule-v1 row alone does not claim snoring"
+    );
     assert_eq!(days[0]["recorded_ms"], 3_000);
     assert_eq!(days[0]["lost_frames"], 0);
 }

@@ -43,7 +43,9 @@ final class WireSink: EventSink {
 
     func session(state: String, message: String?, engine: String?, language: String?, locale: String?, snore: String?) {
         let payload = SessionPayload(
-            state: state, engine: engine, language: language, locale: locale, snore: snore, message: message
+            state: state, engine: engine, language: language, locale: locale, snore: snore,
+            lanes: state == "ready" ? ["text"] + (snore == nil ? [] : ["snore"]) : nil,
+            message: message
         )
         send(type: .session, payload: payload)
     }

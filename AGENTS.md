@@ -186,7 +186,8 @@ Two scripts cover the loop; both are the documented path, so keep them working.
 tools/dev.sh                     # web + server + sidecar, all watched
 tools/dev.sh --with-node         # ...plus a local capture node (real UDP path)
 tools/dev.sh --only server,sidecar
-tools/dev.sh --backend audiocpp  # audio.cpp's Qwen3-ASR instead of Apple
+tools/dev.sh --asr audiocpp      # audio.cpp's Qwen3-ASR for text; apple-stt still marks snores (two sidecars)
+tools/dev.sh --asr apple-stt --snore apple-stt   # default: one Apple sidecar does both
 tools/dev.sh status              # one-shot panel from any shell
 tools/dev.sh logs sidecar -f     # the sidecar's own log, live
 tools/dev.sh reload sidecar      # rebuild + relaunch one service
@@ -197,7 +198,7 @@ tools/dev.sh stop web | start web | logs server | schema | quit
 The supervisor owns `web` (Vite), `server`, `sidecar` and, optionally, `node`. The
 sidecar is still launched *by the server* — dev.sh only points `[stt]
 stream_command` at a generated wrapper that runs the recogniser built in this repo
-(the Swift bundle, or `target/debug/steno-stt-sidecar-audiocpp` under `--backend
+(the Swift bundle, or `target/debug/steno-stt-sidecar-audiocpp` under `--asr
 audiocpp`), detached, so no `install.sh` is needed and no LaunchServices launch
 hides the process. `reload sidecar` rebuilds it and kills the process; the stt
 worker reconnects and starts the new build within its 5 s restart delay.
@@ -206,8 +207,10 @@ Reload-on-change: `crates/**/*.rs` → build, then SIGTERM the old process and s
 the new one — but only after the build succeeds, so a syntax error leaves the
 running server alone instead of taking the page you were looking at off the air.
 `apple-stt-sidecar/Sources/**` rebuilds the bundle and restarts the sidecar (not
-watched under `--backend audiocpp`: that sidecar is a `[[bin]]` of the server
-crate, so `crates/server/**` already covers it and no Swift is built);
+for the text engine under `--asr audiocpp`: that sidecar is a `[[bin]]` of the
+server crate, so `crates/server/**` already covers it. The Apple bundle is still
+built there as the snore-only companion, and a Swift edit restarts only that
+process);
 `crates/node/**` does the same for the node when that role is on. `web/src/**`
 needs nothing: Vite HMR.
 
@@ -370,6 +373,19 @@ The one-writer rule is about the audio path, not the file: `DbWriter` owns the
 connection used by recorder and detector, while HTTP, both STT workers and the
 startup retention pass each open their own — `rusqlite::Connection` is not
 `Sync`.
+
+### Several recogniser processes
+
+`[stt]` describes the first recogniser (`primary`, lane `text`); each
+`[[stt.recognizer]]` block adds another with its own `stream_command`, socket and
+`lanes` (`text` / `snore`). The dispatcher gives every process its own lossy
+queue, and `stt_stream` runs one worker per process, so a slow or dead
+recogniser affects only itself. A sidecar declares its real lanes on `ready`
+(`lanes`); lanes the server asked for and the process does not offer appear in
+`/api/v1/status` as `stt.recognizers[].missing_lanes` and in the Portal, and
+results from a lane that was not asked for are dropped. The `audiocpp` sidecar
+has only `text`: with it as `primary` and no second block, snores come from
+`rule-v1` alone — that was the cause of "no snore result" on the Pi test.
 
 ### Where each box lives
 

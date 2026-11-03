@@ -309,6 +309,17 @@ function TranscriptionCard({ status }: { status: Status | null }) {
         </p>
       )}
       {stt?.error && <p className="card-note bad">{stt.error}</p>}
+      {stt?.recognizers?.map((r) => (
+        <p key={r.name} className={r.missing_lanes.length ? 'card-note bad' : 'card-note'}>
+          识别器 {r.name}：{r.connected ? '已连接' : '未连接'}
+          {r.connected && ` · 通道 ${r.lanes.join('/') || '—'}`}
+          {r.missing_lanes.length > 0 && ` · 缺少通道 ${r.missing_lanes.join('/')}（该进程不提供，不会有结果）`}
+          {r.wanted.includes('snore') && ` · 鼾声 ${count(r.snore_events_total)}`}
+        </p>
+      ))}
+      {stt?.enabled && stt.recognizers && !stt.recognizers.some((r) => r.wanted.includes('snore')) && (
+        <p className="card-note">没有识别器被要求提供鼾声通道；只有规则检测器 rule-v1 在标注鼾声。</p>
+      )}
     </article>
   )
 }

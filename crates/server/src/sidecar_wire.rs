@@ -437,6 +437,10 @@ pub struct SessionEvent {
     /// Which snore lane is running, or absent when it is off.
     #[serde(default)]
     pub snore: Option<String>,
+    /// Lanes this recogniser can run (`text`, `snore`). Absent from a sidecar
+    /// that predates the field; see `stt_stream::declared_lanes`.
+    #[serde(default)]
+    pub lanes: Option<Vec<String>>,
     #[serde(default)]
     pub message: Option<String>,
 }
@@ -477,11 +481,11 @@ pub struct Config {
 
 impl Config {
     /// The configuration this server actually knows how to state.
-    pub fn for_stream(locale: &str) -> Self {
+    pub fn for_stream(locale: &str, snore: bool) -> Self {
         Config {
             locale: Some(locale.to_string()),
             preset: None,
-            snore: None,
+            snore: Some(snore),
             snore_threshold: None,
             snore_window: None,
         }
@@ -650,7 +654,7 @@ mod tests {
 
     #[test]
     fn config_omits_what_the_server_has_no_opinion_about() {
-        let json = serde_json::to_string(&Config::for_stream("zh-CN")).expect("json");
-        assert_eq!(json, r#"{"locale":"zh-CN"}"#);
+        let json = serde_json::to_string(&Config::for_stream("zh-CN", false)).expect("json");
+        assert_eq!(json, r#"{"locale":"zh-CN","snore":false}"#);
     }
 }
