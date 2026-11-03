@@ -263,12 +263,12 @@ mod tests {
     #[test]
     fn files_are_versioned_and_named_the_sqlx_way() {
         let migrations = migration_files().unwrap();
-        assert!(migrations.len() >= 4);
+        // One file on purpose: the five-table history was collapsed, so a fresh
+        // install creates the three tables once and never drops anything.
+        assert_eq!(migrations.len(), 1);
         assert_eq!(migrations[0].version, 1);
-        assert!(migrations.windows(2).all(|w| w[0].version < w[1].version));
         // The description sqlx would print, not the file's underscores.
         assert_eq!(migrations[0].description, "init");
-        assert_eq!(migrations[3].description, "events source");
     }
 
     #[test]
@@ -282,21 +282,6 @@ mod tests {
         // Second startup: no DDL runs again, no row is duplicated.
         apply(&conn).unwrap();
         assert_eq!(recorded(&conn), (1..=newest).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn a_pre_migration_database_is_baselined_not_replayed() {
-        // A v3 file as it exists in the field: the tables, `user_version = 3`,
-        // and no `_sqlx_migrations` table at all.
-        let conn = fresh();
-        for migration in migration_files().unwrap().iter().take(3) {
-            conn.execute_batch(migration.sql).unwrap();
-        }
-        conn.execute_batch("PRAGMA user_version = 3;").unwrap();
-
-        apply(&conn).unwrap();
-        assert_eq!(recorded(&conn), (1..=4).collect::<Vec<_>>());
-        assert_eq!(user_version(&conn), 4);
     }
 
     #[test]

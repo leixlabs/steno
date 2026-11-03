@@ -1,66 +1,73 @@
--- 0001 — the recording spine: segments, gaps and candidate events.
+-- 0001 — three tables: what was kept, what was heard, what was said.
 --
--- Nothing here knows about the detector: a segment is cut by duration, and an
--- event is an annotation attached to a segment. `PRAGMA user_version` is set by
--- the applier (`crates/server/src/migrate.rs`), not by this file, so the same
--- text can also be run by `sqlx migrate run` on its own.
+-- The history is collapsed into this one file on purpose. Earlier versions built
+-- five tables (recording_segments / audio_gaps / snore_events /
+-- segment_transcripts / utterances) and then migrated to these three across
+-- 0005 and 0006; a fresh database should not create a schema in order to drop it.
+-- There is no compatibility path: an old file is refused rather than upgraded,
+-- and `var/db/app.db.before-3tables` is kept beside the database as the record of
+-- what it looked like.
+--
+--   recordings    one row per WAV that exists. Written when the file is closed, so
+--                 "a row exists" and "a file exists" say the same thing — there is
+--                 no status column to disbelieve.
+--   episodes      one row per episode a producer decided was snoring, with the
+--                 wall clock it started and ended. Two producers write here and
+--                 `source` says which: the rule detector answers "there was
+--                 sound", the classifier answers "this is snoring".
+--   transcripts   one row per recognised stretch of speech, with its own bounds.
+--
+-- Annotations are written the moment they are produced, which is usually before
+-- the file they belong to closes, so `recording_id` starts NULL and the recorder
+-- links it afterwards by wall clock. `ON DELETE SET NULL` lets a retention sweep
+-- remove audio without losing the annotation.
+--
+-- What was given up, and why it is not coming back: per-gap rows (an xrun and a
+-- queue overflow are now one `lost_frames` number), clock quality, channel
+-- mapping, boot id and the segment lifecycle statuses. All of them were diagnostic
+-- columns for a recorder that no longer has a lifecycle to report.
 
-CREATE TABLE recording_segments (
-    id TEXT PRIMARY KEY,
-    relative_path TEXT NOT NULL UNIQUE,
-    started_at_utc TEXT NOT NULL,
-    ended_at_utc TEXT,
+CREATE TABLE recordings (
+    id              TEXT PRIMARY KEY,
+    relative_path   TEXT NOT NULL UNIQUE,
+    started_at_utc  TEXT NOT NULL,
+    ended_at_utc    TEXT NOT NULL,
     capture_rate_hz INTEGER NOT NULL CHECK(capture_rate_hz > 0),
-    channels INTEGER NOT NULL CHECK(channels BETWEEN 1 AND 2),
-    sample_format TEXT NOT NULL CHECK(sample_format = 'S16_LE'),
-    channel_mapping TEXT NOT NULL,
-    frame_count INTEGER NOT NULL DEFAULT 0 CHECK(frame_count >= 0),
-    size_bytes INTEGER NOT NULL DEFAULT 0 CHECK(size_bytes >= 0),
-    xrun_count INTEGER NOT NULL DEFAULT 0 CHECK(xrun_count >= 0),
-    gap_count INTEGER NOT NULL DEFAULT 0 CHECK(gap_count >= 0),
-    lost_frames_total INTEGER NOT NULL DEFAULT 0 CHECK(lost_frames_total >= 0),
-    time_quality TEXT NOT NULL CHECK(time_quality IN ('synced','unsynced','corrected')),
-    boot_id TEXT NOT NULL,
-    clock_drift_ppm REAL,
-    end_reason TEXT CHECK(end_reason IS NULL OR end_reason IN ('duration','gap','time_step','format_change','size_limit','shutdown','error')),
-    status TEXT NOT NULL CHECK(status IN ('recording','complete','interrupted','deleted','missing')),
-    created_at_utc TEXT NOT NULL
+    channels        INTEGER NOT NULL CHECK(channels BETWEEN 1 AND 2),
+    frame_count     INTEGER NOT NULL CHECK(frame_count >= 0),
+    size_bytes      INTEGER NOT NULL CHECK(size_bytes >= 0),
+    lost_frames     INTEGER NOT NULL DEFAULT 0 CHECK(lost_frames >= 0),
+    created_at_utc  TEXT NOT NULL
 );
 
-CREATE TABLE audio_gaps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    segment_id TEXT NOT NULL REFERENCES recording_segments(id) ON DELETE CASCADE,
-    offset_frames INTEGER NOT NULL CHECK(offset_frames >= 0),
-    lost_frames INTEGER NOT NULL CHECK(lost_frames >= 0),
-    kind TEXT NOT NULL CHECK(kind IN ('xrun','stream_error','capture_ring_overflow','queue_overflow','stream_rebuild')),
-    estimate_source TEXT NOT NULL CHECK(estimate_source IN ('timestamp','counter','unknown')),
-    at_utc TEXT NOT NULL
+CREATE INDEX idx_recordings_started_at ON recordings(started_at_utc);
+
+CREATE TABLE episodes (
+    id              TEXT PRIMARY KEY,
+    recording_id    TEXT REFERENCES recordings(id) ON DELETE SET NULL,
+    started_at_utc  TEXT NOT NULL,
+    ended_at_utc    TEXT NOT NULL,
+    source          TEXT NOT NULL CHECK(source IN ('rule-v1','apple-soundanalysis-v1')),
+    label           TEXT,
+    confidence      REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    review_status   TEXT NOT NULL DEFAULT 'unreviewed'
+                    CHECK(review_status IN ('snore','not_snore','unreviewed')),
+    created_at_utc  TEXT NOT NULL
 );
 
--- Superseded by 0004, which rebuilds this table to add `source`; the definition
--- that counts is the one in that file. Keeping the original here is what makes
--- an existing v1 file a real starting point rather than a fiction.
-CREATE TABLE snore_events (
-    id TEXT PRIMARY KEY,
-    segment_id TEXT NOT NULL REFERENCES recording_segments(id) ON DELETE CASCADE,
-    start_offset_frames INTEGER NOT NULL CHECK(start_offset_frames >= 0),
-    end_offset_frames INTEGER NOT NULL CHECK(end_offset_frames >= start_offset_frames),
-    started_at_utc TEXT NOT NULL,
-    ended_at_utc TEXT NOT NULL,
-    duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
-    rule_score REAL CHECK(rule_score IS NULL OR (rule_score >= 0 AND rule_score <= 1)),
-    detector_version TEXT NOT NULL,
-    peak_dbfs REAL,
-    mean_level_dbfs REAL,
-    mean_band_ratio REAL,
-    noise_floor_dbfs REAL,
-    end_reason TEXT NOT NULL DEFAULT 'normal' CHECK(end_reason IN ('normal','max_duration','segment_end','gap','detector_gap','shutdown')),
-    review_status TEXT NOT NULL DEFAULT 'unreviewed' CHECK(review_status IN ('snore','not_snore','unreviewed')),
-    continued INTEGER NOT NULL DEFAULT 0 CHECK(continued IN (0,1)),
-    created_at_utc TEXT NOT NULL
+CREATE INDEX idx_episodes_started_at ON episodes(started_at_utc);
+CREATE INDEX idx_episodes_recording ON episodes(recording_id);
+
+CREATE TABLE transcripts (
+    id              TEXT PRIMARY KEY,
+    recording_id    TEXT REFERENCES recordings(id) ON DELETE SET NULL,
+    started_at_utc  TEXT NOT NULL,
+    ended_at_utc    TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    engine          TEXT NOT NULL,
+    language        TEXT,
+    created_at_utc  TEXT NOT NULL
 );
 
-CREATE INDEX idx_events_started_at ON snore_events(started_at_utc);
-CREATE INDEX idx_events_segment_offset ON snore_events(segment_id,start_offset_frames);
-CREATE INDEX idx_segments_started_at ON recording_segments(started_at_utc);
-CREATE INDEX idx_gaps_segment_offset ON audio_gaps(segment_id,offset_frames);
+CREATE INDEX idx_transcripts_started_at ON transcripts(started_at_utc);
+CREATE INDEX idx_transcripts_recording ON transcripts(recording_id);

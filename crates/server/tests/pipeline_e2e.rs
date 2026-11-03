@@ -12,9 +12,8 @@ use steno_server::db_writer::DbWriter;
 use steno_lib::detector::DetectionPipeline;
 use steno_server::dispatcher::{self, DispatcherInputs, DispatcherMessage, SegmentEndReason};
 use steno_lib::metrics::Metrics;
-use steno_server::recorder::{WavFormat, WavRecorder, payload_limit, segment_relative_path};
-use steno_server::storage::{Database, SegmentStarted, SegmentStatus};
-use steno_lib::timeline::TimeQuality;
+use steno_server::recorder::{WavFormat, WavRecorder, payload_limit, recording_relative_path};
+use steno_server::storage::{Database, RecordingDraft};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -95,7 +94,6 @@ fn audio_flows_from_ring_through_dispatcher_into_wav_and_db() {
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
         stt_queue: None,
-        db: writer.handle(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated,
     });
@@ -170,36 +168,27 @@ fn audio_flows_from_ring_through_dispatcher_into_wav_and_db() {
             PopOutcome::Empty | PopOutcome::Closed => break,
         }
     }
-    assert!(saw_start, "the dispatcher must announce the segment");
+    assert!(saw_start, "the dispatcher must announce the window");
     assert!(saw_audio, "the captured audio must be fanned out");
-    assert!(saw_end, "shutdown must close the open segment");
+    assert!(saw_end, "shutdown must close the open window");
 
-    // The segment row must exist and must not claim to be a finished recording.
-    let segments = http_db.segments_between(
-        chrono::DateTime::from_timestamp(0, 0).unwrap(),
-        chrono::DateTime::from_timestamp(i64::from(u32::MAX), 0).unwrap(),
-    );
-    let segments = segments.expect("segment query must succeed");
-    assert_eq!(
-        segments.len(),
-        1,
-        "exactly one segment should have been opened"
-    );
-    let segment = &segments[0];
+    // No recorder ran here, and only the recorder may publish a `recordings`
+    // row — the dispatcher's window is a timing boundary, not a row. Seeing one
+    // would mean a stale second writer came back.
+    let recordings = http_db
+        .recordings_between(
+            chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            chrono::DateTime::from_timestamp(i64::from(u32::MAX), 0).unwrap(),
+        )
+        .expect("recording query must succeed");
     assert!(
-        matches!(
-            segment.status.as_str(),
-            "recording" | "interrupted" | "complete"
-        ),
-        "unexpected status {}",
-        segment.status
+        recordings.is_empty(),
+        "the dispatcher must not write recordings itself: {recordings:?}"
     );
-    assert_eq!(segment.capture_rate_hz, rate);
-    assert_eq!(segment.channels, channels);
 }
 
 #[test]
-fn recorder_writes_a_playable_wav_for_a_dispatched_segment() {
+fn recorder_writes_a_playable_wav_for_a_dispatched_window() {
     // The recorder worker's exact sequence, driven directly so the WAV bytes and
     // the DB completion row can be asserted without races.
     let dir = tempdir().unwrap();
@@ -209,21 +198,9 @@ fn recorder_writes_a_playable_wav_for_a_dispatched_segment() {
     db.migrate().unwrap();
 
     let started_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-    let id = "seg-e2e".to_string();
+    let id = "rec-e2e".to_string();
     let format = WavFormat::new(16_000, 1).unwrap();
-    let rel = segment_relative_path(started_at, &id);
-    db.insert_segment_started(&SegmentStarted {
-        id: id.clone(),
-        relative_path: rel.clone(),
-        started_at_utc: started_at,
-        capture_rate_hz: 16_000,
-        channels: 1,
-        sample_format: "S16_LE".into(),
-        channel_mapping: "mono".into(),
-        time_quality: TimeQuality::Synced,
-        boot_id: "boot".into(),
-    })
-    .unwrap();
+    let rel = recording_relative_path(started_at, &id);
 
     let mut recorder = WavRecorder::create(
         &config.storage.recording_dir,
@@ -254,27 +231,28 @@ fn recorder_writes_a_playable_wav_for_a_dispatched_segment() {
     );
     assert!(
         !path.to_string_lossy().ends_with(".partial"),
-        "a closed segment must be renamed to .wav"
+        "a closed recording must be renamed to .wav"
     );
 
-    // Completing the row must succeed and be visible to the HTTP-side connection.
-    db.complete_segment(&steno_server::storage::SegmentCompleted {
+    // What the recorder publishes when it closes the file, and what the
+    // HTTP-side connection must then see.
+    db.insert_recording(&RecordingDraft {
         id: id.clone(),
+        relative_path: rel,
+        started_at_utc: started_at,
         ended_at_utc: started_at + chrono::Duration::milliseconds(200),
+        capture_rate_hz: 16_000,
+        channels: 1,
         frame_count: frames,
         size_bytes,
-        end_reason: "shutdown".into(),
-        clock_drift_ppm: None,
-        xrun_count: 0,
-        gap_count: 0,
-        lost_frames_total: 0,
-        status: SegmentStatus::Complete,
+        lost_frames: 0,
     })
     .unwrap();
     let http_db = Database::open(&config.storage.database_path).unwrap();
-    let row = http_db.segment(&id).unwrap().expect("row must be readable");
-    assert_eq!(row.status, "complete");
+    let row = http_db.recording(&id).unwrap().expect("row must be readable");
     assert_eq!(row.frame_count, 3200);
+    assert_eq!(row.size_bytes, size_bytes);
+    assert_eq!(row.capture_rate_hz, 16_000);
 
     // And the detector pipeline, given the same audio, must classify it without
     // panicking and without inventing an event out of nothing.
@@ -317,7 +295,6 @@ fn a_48k_stereo_device_still_records_16k_mono() {
     let config = Arc::new(test_config(dir.path()));
     std::fs::create_dir_all(&config.storage.recording_dir).unwrap();
 
-    let http_db = Database::open(&config.storage.database_path).unwrap();
     let writer_db = Database::open(&config.storage.database_path).unwrap();
     writer_db.migrate().unwrap();
     let writer = DbWriter::spawn(writer_db, |error| eprintln!("db error: {error}"));
@@ -369,7 +346,6 @@ fn a_48k_stereo_device_still_records_16k_mono() {
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
         stt_queue: None,
-        db: writer.handle(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated: wire,
     });
@@ -407,28 +383,16 @@ fn a_48k_stereo_device_still_records_16k_mono() {
     assert!(handle.join(Duration::from_secs(5)), "dispatcher must stop");
     assert!(writer.shutdown(Duration::from_secs(5)), "db writer must drain");
 
-    // The dispatcher was told the wire format, so the DB row carries it.
-    let segments = http_db
-        .segments_between(
-            chrono::DateTime::from_timestamp(0, 0).unwrap(),
-            chrono::DateTime::from_timestamp(i64::from(u32::MAX), 0).unwrap(),
-        )
-        .expect("segment query must succeed");
-    assert_eq!(segments.len(), 1);
-    assert_eq!(
-        segments[0].capture_rate_hz, WIRE_RATE_HZ,
-        "a segment must never be labelled with the device rate"
-    );
-    assert_eq!(segments[0].channels, WIRE_CHANNELS);
-
-    // What the recorder and detector were handed: wire format, and a tone. The
-    // peak is the check that channel 1 was taken rather than channel 0 (which is
-    // silent here) — an average would have halved it, and a mislabelled rate
-    // would have stretched it.
+    // The dispatcher was told the wire format, so the window it announces — and
+    // therefore the file the recorder will create — carries it.
     let mut frames: Vec<i16> = Vec::new();
+    let mut window_format = None;
     let mut fanout_format = None;
     loop {
         match recording_queue.pop_timeout(Duration::from_millis(10)) {
+            PopOutcome::Item(DispatcherMessage::SegmentStart { format, .. }) => {
+                window_format = Some((format.rate_hz, format.channels));
+            }
             PopOutcome::Item(DispatcherMessage::Audio { format, pcm, .. }) => {
                 fanout_format = Some((format.rate_hz, format.channels));
                 frames.extend_from_slice(&pcm);
@@ -437,6 +401,11 @@ fn a_48k_stereo_device_still_records_16k_mono() {
             PopOutcome::Empty | PopOutcome::Closed => break,
         }
     }
+    assert_eq!(
+        window_format,
+        Some((WIRE_RATE_HZ, WIRE_CHANNELS)),
+        "a window must never be labelled with the device rate"
+    );
     assert_eq!(
         fanout_format,
         Some((WIRE_RATE_HZ, WIRE_CHANNELS)),

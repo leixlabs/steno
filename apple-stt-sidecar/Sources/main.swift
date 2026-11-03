@@ -1,9 +1,9 @@
 // steno-stt-sidecar — audio in, text (and snore annotations) out.
 //
 // One job: turn a stream of 16 kHz mono PCM into recognised text and candidate
-// snore episodes, using whichever macOS on-device models are current. Nothing in
-// this process decides when a phrase is over, when a night ends, or what to do
-// about silence — those belong to the caller, and to the frameworks.
+// snore episodes. Nothing in this process decides when a phrase is over, when a
+// night ends, or what to do about silence — those belong to the caller, and to
+// the engine.
 //
 //   --mode socket --path <p>  framed duplex over a Unix socket (the server's path)
 //   --mode stdio              framed duplex over stdin/stdout
@@ -11,7 +11,13 @@
 //   --mode file <audio>       transcribe one finished file
 //   --stream                  raw PCM on stdin, no framing
 //   --check                   what this machine can do, as JSON
-//   --install-assets          download the on-device model for --locale
+//   --install-assets          download what --locale needs (Apple assets, GGUF)
+//
+// `--backend apple|audiocpp` chooses the recogniser behind all of those: Apple's
+// `SpeechAnalyzer` or audio.cpp running a Qwen3-ASR package (`--model`). It is a
+// command-line choice and not a wire one: switching engines means different
+// models on disk, so it happens where the sidecar is launched (the wrapper, the
+// unit), not per night. See `Backend.swift` for what a backend has to supply.
 //
 // Both framed modes are full duplex: audio and results go out while `config` and
 // `control` frames come in, on the same connection.
@@ -82,7 +88,12 @@ func connect(socketPath: String) -> Int32? {
 func applyWireConfig(_ payload: ConfigPayload, to options: inout Options) {
     if let locale = payload.locale { options.locale = locale }
     if let raw = payload.preset {
-        if let preset = TranscriptionPreset.parse(raw) {
+        // The wire may carry a preset because the server has always been able to
+        // ask for one; a backend that has no such thing must say it ignored it
+        // rather than look like it applied it.
+        if options.backend != .apple {
+            log("config: preset \(raw) ignored; backend \(options.backend.rawValue) has no presets")
+        } else if let preset = TranscriptionPreset.parse(raw) {
             options.preset = preset
         } else {
             log("config: unknown preset \(raw); keeping \(options.preset.rawValue) (expected \(TranscriptionPreset.known))")
@@ -95,11 +106,15 @@ func applyWireConfig(_ payload: ConfigPayload, to options: inout Options) {
     }
     if let threshold = payload.snoreThreshold { options.snore?.threshold = threshold }
     if let window = payload.snoreWindow { options.snore?.windowSeconds = window }
-    log("config: locale \(options.locale), preset \(options.preset.rawValue), snore \(options.snore?.label ?? "off")")
+    // A preset is only a fact for the backend that has them; printing one for a
+    // backend that does not would read as if it had been applied.
+    let presetNote = options.backend == .apple ? ", preset \(options.preset.rawValue)" : ""
+    log("config: backend \(options.backend.rawValue), locale \(options.locale)\(presetNote), snore \(options.snore?.label ?? "off")")
 }
 
 func makePipelineConfig(_ options: Options) -> PipelineConfig {
     PipelineConfig(
+        backend: options.backend,
         locale: options.locale,
         engine: options.engine,
         preset: options.preset,
@@ -247,9 +262,15 @@ func runMicrophone(options: Options) -> Never {
 
 func runCheck(options: Options) -> Never {
     Task.detached {
-        var report = await Transcriber.probe(localeIdentifier: options.locale)
+        // The report answers "what can this machine do with *this* backend", so
+        // the backend answers it. A backend that is not in this build says so
+        // here, which is the point of asking it rather than assuming Apple.
+        var report = await options.backend.probe(
+            locale: options.locale,
+            preset: options.preset
+        )
+        report["backend"] = options.backend.rawValue
         report["engine"] = options.engine
-        report["preset"] = options.preset.rawValue
         report["hub_format"] = AudioHub.canonicalFormat().description
         if let snore = options.snore {
             report["snore"] = SnoreDetector.probe(config: snore)
@@ -265,8 +286,11 @@ func runCheck(options: Options) -> Never {
 func runInstall(options: Options) -> Never {
     Task.detached {
         do {
-            let result = try await Transcriber.installAssets(localeIdentifier: options.locale)
-            emitJSON(["result": result])
+            let result = try await options.backend.install(
+                locale: options.locale,
+                preset: options.preset
+            )
+            emitJSON(["backend": options.backend.rawValue, "result": result])
             exit(0)
         } catch {
             log("cannot install assets: \(error)")

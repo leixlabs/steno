@@ -25,7 +25,23 @@ tools/dev.sh --with-node              # 再起一个本机采集节点，走真�
 tools/dev.sh --only server,sidecar    # 只跑某几个角色
 tools/dev.sh --stt off                # 关掉转写（默认是开的）
 tools/dev.sh --port 8081              # 另起一个实例，不影响已有的
+tools/dev.sh --backend audiocpp       # 用 audio.cpp 的 Qwen3-ASR 识别，不装 Apple 的
 ```
+
+`--backend audiocpp` 需要一份 GGUF。第一次把路径给它：
+
+```sh
+tools/dev.sh --backend audiocpp --model ~/models/qwen3-asr-0.6b-q8_0.gguf
+# 也可以给目录，但目录里必须只有一个 .gguf —— 引擎拒绝在多个包里挑
+tools/dev.sh --backend audiocpp --model ~/models/qwen3-asr-0.6b-q8_0.gguf --chunk 8
+```
+
+路径会记在 `var/stt-model.conf`（下次 `--backend audiocpp` 就够，删掉它才会重新问），
+`--chunk N` 覆盖 5 s 窗口。没给路径时还会去读 `install.sh` 给已安装的 audiocpp
+wrapper 写的那份 conf，所以部署过同一台机器的模型不必再答一次。这个后端的识别器
+是服务端 crate 的第二个 `[[bin]]`：`crates/server/**` 一变就跟着重建（不会去建
+Swift bundle），`--backend audiocpp --sidecar installed` 会被拒绝——安装的 wrapper
+是 Apple 那个。
 
 跑起来之后，在**任意终端**用子命令控制这个监督器（命令写进 `$RUNTIME_DIR/dev/cmd`，
 监督器每秒取一次）：
@@ -53,8 +69,10 @@ tools/dev.sh quit
 关于 sidecar 的两件事：
 
 - **它仍然由服务端拉起**，dev.sh 只是把 `[stt] stream_command` 指向生成的
-  `var/dev/steno-stt-sidecar-dev`。那个 wrapper 用 `nohup` 把**本仓库构建出来的** bundle
-  放后台跑，所以不需要 `install.sh`，也不会被 LaunchServices 藏起来。
+  `var/dev/steno-stt-sidecar-dev`。那个 wrapper 用 `nohup` 把**本仓库构建出来的**二进制
+  放后台跑（Apple 时是 `apple-stt-sidecar/build/` 里的 bundle，`--backend audiocpp`
+  时是 `target/debug/steno-stt-sidecar-audiocpp`），所以不需要 `install.sh`，也不会被
+  LaunchServices 藏起来。
 - `reload sidecar` 只会杀**本实例的** sidecar（按 `steno-stt-<server-pid>.sock` 匹配），
   不会误伤同机另一个实例。
 
@@ -157,7 +175,8 @@ tools/refresh-all.sh --dry-run       # 只打印计划
 4. 停服务：`SIGTERM`，最多等 20 秒，超时才 `SIGKILL`（会留 `.partial`）；顺手清掉遗留的
    `steno-stt-sidecar` 进程和旧 socket
 5. Apple sidecar：装到**它原本所在的**前缀（换前缀等于换一条启动路径）
-6. 节点：调 `deploy-node.sh`；**失败不中断**，只记一笔
+6. 节点：调 `deploy-node.sh`（默认带 `--enable`，把 Pi 上的 `steno-node` 设成开机自启；
+   `--no-enable-node` 可以关掉）；**失败不中断**，只记一笔
 7. 启动（`nohup` 后台，pid 写 `$STENO_RUNTIME_DIR/server.pid`；`--foreground` 则前台）
 8. 自检：轮询 `/api/v1/status`，打印服务端/采集端/转写/存储池 + Portal 的 HTTP 码；
    转写还在 `starting` 就等 3 秒再看一次
@@ -246,7 +265,8 @@ tools/stt-watch.py --json | jq -c .type   # 原始 NDJSON，给别人吃
 ```sh
 tools/deploy-node.sh --host 192.168.31.58 --server-host 192.168.31.10
 tools/deploy-node.sh --dry-run                     # 默认主机 pi.local
-tools/deploy-node.sh --host pi --no-build --enable
+tools/deploy-node.sh --host pi --no-build
+tools/deploy-node.sh --no-enable                   # 只部署，不动开机自启
 ```
 
 - 目标固定 `armv7-unknown-linux-gnueabihf`，glibc 钉在 2.28（Pi OS buster 的版本）。
@@ -254,8 +274,12 @@ tools/deploy-node.sh --host pi --no-build --enable
 - 前提：`cargo install cargo-zigbuild`、`zig`（`brew install zig`）、sysroot
   （`$ARMHF_SYSROOT`，默认 `~/armhf-sysroot`）、能免密 `sudo -n` 的 SSH 账号。
 - 远端动作：建服务用户、装二进制到 `/usr/local/bin`、配置到
-  `/etc/steno-monitor/node.toml`、单元到 `/etc/systemd/system/`，然后 `daemon-reload`
-  并 `restart`。默认不动开机自启，要加 `--enable`。
+  `/etc/steno-monitor/node.toml`、单元到 `/etc/systemd/system/`，然后 `daemon-reload`、
+  `enable`（默认，`--no-enable` 关掉）并 `restart`。
+- `enable` 和 `restart` 是两件事，不能合并成 `enable --now`：`--now` 只会**启动**一个
+  没在跑的单元，已经跑着的节点会继续执行刚被替换掉的旧二进制。部署结尾会回读
+  `systemctl is-enabled`，不是 enabled 就直接报错——"今晚在跑、下次断电就没声音"正是
+  这条检查要挡住的失败。
 - 可重复执行，等于原地升级；`--dry-run` 只打印计划。
 - Pi 上的 `[archive]` / `[gate]` 两段会被**原样保留**（连同注释）并追加到新配置后面：
   重新渲染这两段等于替设备决定"今晚的音频存哪里、能不能不发"，那不是部署该做的事。

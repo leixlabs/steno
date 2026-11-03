@@ -19,7 +19,7 @@
 //!
 //! Only what the server itself decided to keep. A `final` is published after the
 //! row is written, so a client never shows a phrase that the database rejected.
-//! That ordering is the whole reason this lives next to `save_utterance` rather
+//! That ordering is the whole reason this lives next to `insert_transcript` rather
 //! than inside the parser.
 
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::storage::UtteranceRow;
+use crate::storage::TranscriptRow;
 
 /// How many events a client may fall behind before it starts losing them.
 ///
@@ -117,7 +117,7 @@ impl TranscriptHub {
 impl TranscriptEvent {
     /// Builds a `Final` from the row that was just stored, so the wire format and
     /// the database cannot disagree about a phrase.
-    pub fn final_from_row(row: &UtteranceRow) -> Self {
+    pub fn final_from_row(row: &TranscriptRow) -> Self {
         TranscriptEvent::Final {
             id: row.id.clone(),
             started_at_utc: row.started_at_utc.to_rfc3339(),

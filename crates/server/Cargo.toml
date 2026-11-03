@@ -34,3 +34,9 @@ tower.workspace = true
 [[bin]]
 name = "steno-monitor"
 path = "src/main.rs"
+
+# The audio.cpp recogniser, built from the same crate so it ships and deploys with
+# the server: no app bundle, no shell wrapper, no conf file to be rewritten.
+[[bin]]
+name = "steno-stt-sidecar-audiocpp"
+path = "src/bin/steno-stt-sidecar-audiocpp.rs"

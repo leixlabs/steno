@@ -294,9 +294,16 @@ where
     }))
 }
 
-/// Writes one frame. The caller owns any timeout: this is the bare write.
-pub async fn write_frame<W>(
+/// Writes one frame, in the direction the caller writes *as*.
+///
+/// The server writes down and the sidecar writes up, and both have to produce
+/// exactly the same header. Keeping one encoder with the direction as an
+/// argument is what stops the two ends from drifting apart.
+///
+/// The caller owns any timeout: this is the bare write.
+pub async fn write_frame_as<W>(
     writer: &mut W,
+    direction: Direction,
     kind: MsgType,
     payload: &[u8],
 ) -> Result<(), WireError>
@@ -306,11 +313,23 @@ where
     if payload.len() > MAX_PAYLOAD {
         return Err(WireError::PayloadTooLarge(payload.len()));
     }
-    let header = Header::new(Direction::ServerToSidecar, kind, payload.len());
+    let header = Header::new(direction, kind, payload.len());
     writer.write_all(&header.encode()).await?;
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Writes one frame server-to-sidecar. See [`write_frame_as`].
+pub async fn write_frame<W>(
+    writer: &mut W,
+    kind: MsgType,
+    payload: &[u8],
+) -> Result<(), WireError>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_frame_as(writer, Direction::ServerToSidecar, kind, payload).await
 }
 
 // MARK: payload codecs

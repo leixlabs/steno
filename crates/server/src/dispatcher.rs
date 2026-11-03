@@ -1,11 +1,12 @@
 //! Dispatcher thread (TECH_SPEC §4.3, task T3.4).
 //!
-//! This module owns frame counting, segmentation decisions, gap registration and
-//! `segment_offset_frames` annotation. It is the only place in the process that
-//! decides when to rotate a WAV recording; the recorder and detector workers only
-//! react to the messages the dispatcher sends them. The DB writer is fed
-//! `SegmentStarted` before any `SegmentStart` reaches the audio consumers, so the
-//! segment row exists before any event referencing it.
+//! This module owns frame counting, segmentation decisions and gap accounting.
+//! It is the only place in the process that decides when to rotate a WAV
+//! recording; the recorder and detector workers only react to the messages the
+//! dispatcher sends them. Storage is deliberately not wired in here: the recorder
+//! publishes one `recordings` row when it closes the file, and the detector
+//! publishes its own episodes. `SegmentStart` / `SegmentEnd` name a recording
+//! window — a timing boundary, not a row.
 //!
 //! # Pipeline
 //!
@@ -34,8 +35,8 @@
 //!   `gap_before_frames`. That block is not delivered to detection, so the
 //!   detector sees the same gap and resets its state (§5.4).
 //! - Detection queue audio-slot full → drop the detection copy, count it and
-//!   log it with the segment and offset, and signal a detector watchdog restart.
-//!   The WAV branch and the `audio_gaps` table are unaffected.
+//!   log it with the window and offset, and signal a detector watchdog restart.
+//!   The WAV branch is unaffected.
 //! - Control slot full on either queue → the consumer is stuck; mark the
 //!   service degraded and signal a watchdog restart of that consumer. The
 //!   dispatcher never blocks waiting for a stuck consumer.
@@ -53,16 +54,11 @@
 use steno_lib::audio_capture::{CaptureMeta, CaptureRing, NegotiatedFormat};
 use steno_lib::bounded_queue::{BoundedQueue, QueueItem};
 use steno_lib::config::{AudioConfig, Config, SampleFormat, WIRE_RATE_HZ};
-use crate::db_writer::{DbCommand, DbWriterHandle};
-use steno_lib::metrics::Metrics;
-use crate::recorder::segment_relative_path;
-use crate::storage::{SegmentCompleted, SegmentStarted, SegmentStatus};
-use steno_lib::timeline::{
+use steno_lib::metrics::Metrics;use steno_lib::timeline::{
     boot_id as timeline_boot_id, ClockAnchor,
-    ClockMap, EstimateSource, GapKind, GapRecord, TimeQuality,
+    ClockMap, EstimateSource, GapKind, TimeQuality,
 };
 use chrono::{DateTime, Utc};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -91,8 +87,8 @@ pub const NO_SIGNAL_SECONDS: u32 = 1;
 /// Fraction of samples inside a one-second window that flags clipped capture.
 const CLIP_FRACTION_WARN: f32 = 0.01;
 
-/// Why a segment is being closed by the dispatcher. The string form mirrors the
-/// `recording_segments.end_reason` check constraint in the schema.
+/// Why a recording window is being closed by the dispatcher. The string form is
+/// what the recorder and detector see on `SegmentEnd`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentEndReason {
     Duration,
@@ -120,6 +116,10 @@ impl SegmentEndReason {
 
 /// Ordered message published to the recorder and detector workers
 /// (TECH_SPEC §4.3). `Audio` items are audio-class; everything else is control.
+///
+/// `SegmentStart` / `SegmentEnd` name the recording window the workers are
+/// inside — a timing boundary. Neither is a database event any more: the
+/// recorder writes the single `recordings` row when it closes the file.
 #[derive(Debug, Clone)]
 pub enum DispatcherMessage {
     SegmentStart {
@@ -150,11 +150,6 @@ pub enum DispatcherMessage {
     SegmentEnd {
         segment_id: String,
         ended_at_utc: DateTime<Utc>,
-        frame_count: u64,
-        size_bytes: u64,
-        xrun_count: u64,
-        gap_count: u64,
-        lost_frames_total: u64,
         end_reason: SegmentEndReason,
     },
 }
@@ -217,13 +212,12 @@ pub struct DispatcherInputs {
     /// allowed to overflow: transcription must never slow down recording.
     #[allow(clippy::type_complexity)]
     pub stt_queue: Option<Arc<BoundedQueue<crate::stt_stream::SttChunk>>>,
-    pub db: DbWriterHandle,
     pub shutting_down: Arc<AtomicBool>,
     pub negotiated: NegotiatedFormat,
 }
 
 /// Spawns the dispatcher thread and returns a [`DispatcherHandle`] the parent can
-/// use to coordinate shutdown. The dispatcher starts an initial segment
+/// use to coordinate shutdown. The dispatcher starts an initial window
 /// immediately and runs until either [`DispatcherHandle::request_shutdown`] is
 /// called, the parent-shared `shutting_down` flag is set, or [`run`] sees an
 /// unrecoverable configuration error.
@@ -243,18 +237,13 @@ pub fn spawn(inputs: DispatcherInputs) -> DispatcherHandle {
     }
 }
 
-/// Per-segment state the dispatcher owns while it is open.
+/// Per-window state the dispatcher owns while it is open.
 #[derive(Debug)]
 #[allow(dead_code)]
 struct ActiveSegment {
     id: String,
-    started_at_utc: DateTime<Utc>,
     format: NegotiatedFormat,
-    capture_rate_hz: u32,
     block_align: u32,
-    time_quality: TimeQuality,
-    boot_id: String,
-    relative_path: PathBuf,
     /// PCM frames already stored in the WAV. After dispatching a block this
     /// grows by `block.frames`; queue-overflow losses do not contribute.
     stored_frames: u64,
@@ -271,37 +260,19 @@ struct ActiveSegment {
     /// Sliding one-second window used to detect over-amplified capture input.
     clip_window_clipped: u64,
     clip_window_total: u64,
-    /// Gap records that should be flushed to the DB alongside SegmentStarted and
-    /// SegmentEnd. Recorder/detector Gap messages mirror these entries.
-    gaps: Vec<GapRecord>,
     /// Frames lost because the capture ring rejected the callback's push.
     capture_ring_overflow_frames: u64,
     /// Largest gap seen so far. Used to decide whether to force a `gap` rotation.
     max_gap_lost_frames: u64,
-    /// Monotonic ns of the segment start, used to compute clock drift.
-    started_mono_ns: u64,
 }
 
 impl ActiveSegment {
-    fn new(
-        id: String,
-        started_at_utc: DateTime<Utc>,
-        format: NegotiatedFormat,
-        time_quality: TimeQuality,
-        boot_id: String,
-        relative_path: PathBuf,
-        started_mono_ns: u64,
-    ) -> Self {
+    fn new(id: String, format: NegotiatedFormat) -> Self {
         let block_align = u32::from(format.channels) * SampleFormat::S16Le.bytes_per_sample() as u32;
         ActiveSegment {
             id,
-            started_at_utc,
-            format: format.clone(),
-            capture_rate_hz: format.rate_hz,
+            format,
             block_align,
-            time_quality,
-            boot_id,
-            relative_path,
             stored_frames: 0,
             pending_lost_frames: 0,
             pending_lost_kind: None,
@@ -309,10 +280,8 @@ impl ActiveSegment {
             quiet_frames_in_a_row: 0,
             clip_window_clipped: 0,
             clip_window_total: 0,
-            gaps: Vec::new(),
             capture_ring_overflow_frames: 0,
             max_gap_lost_frames: 0,
-            started_mono_ns,
         }
     }
 
@@ -329,18 +298,15 @@ struct Dispatcher {
     request_shutdown: Arc<AtomicBool>,
     segment: Option<ActiveSegment>,
     clock_map: ClockMap,
-    audio_cfg: AudioConfig,
     /// `segment_duration_seconds * capture_rate_hz` (TECH_SPEC §4.3).
     segment_frames: u64,
     max_segment_bytes: u64,
     /// `gap_rotate_seconds * capture_rate_hz`.
     gap_rotate_frames: u64,
     /// Frames dropped from the capture ring before this dispatcher started.
-    /// Subtracted from the counter at close so `xrun_count` for the segment
-    /// reflects only what happened during the segment.
+    /// Subtracted from the counter so the per-window gap accounting reflects
+    /// only what happened while it was running.
     capture_ring_overflows_at_start: u64,
-    /// `Metrics::xrun_count` sampled at dispatcher start.
-    xrun_at_start: u64,
     /// Consecutive audio blocks dispatched without a queue failure. Used to
     /// take the service out of `degraded` again: a bedside device runs for
     /// eight hours, so a single moment of back-pressure must not paint the
@@ -361,7 +327,6 @@ impl Dispatcher {
             .gap_rotate_seconds
             .saturating_mul(u64::from(WIRE_RATE_HZ));
         let capture_ring_overflows_at_start = inputs.capture.overflow_frames();
-        let xrun_at_start = inputs.metrics.xrun_count.load(Ordering::Relaxed);
         // Establish the first real clock-trust reading before the anchor is built,
         // so the very first segment is classified from the actual clock state and
         // not from the untrusted default.
@@ -378,12 +343,10 @@ impl Dispatcher {
             request_shutdown,
             segment: None,
             clock_map,
-            audio_cfg,
             segment_frames,
             max_segment_bytes,
             gap_rotate_frames,
             capture_ring_overflows_at_start,
-            xrun_at_start,
             healthy_blocks: 0,
         }
     }
@@ -459,57 +422,20 @@ impl Dispatcher {
         }
     }
 
-    /// Opens a brand-new segment, sending `SegmentStarted` to the DB writer
-    /// and `SegmentStart` to both downstream queues.
+    /// Opens a brand-new window and announces it to both downstream queues.
+    ///
+    /// Nothing is written to the database here: a `recordings` row needs the
+    /// final length, so it is published by the recorder when it closes the file.
     fn open_segment(&mut self) {
         let id = uuid_v4();
         let now = chrono::Utc::now();
-        let now_mono_ns = monotonic_now_ns();
         let time_quality = if host_time_synced(&self.inputs.metrics) {
             TimeQuality::Synced
         } else {
             TimeQuality::Unsynced
         };
         let boot_id = self.clock_map.boot_id().to_string();
-        let relative_path = segment_relative_path(now, &id);
-        let started = SegmentStarted {
-            id: id.clone(),
-            relative_path: relative_path.clone(),
-            started_at_utc: now,
-            capture_rate_hz: self.inputs.negotiated.rate_hz,
-            channels: self.inputs.negotiated.channels,
-            sample_format: self.inputs.negotiated.format.as_str().to_string(),
-            // The stored stream is mono by construction, so the mapping here is
-            // the identity. Which *device* channel became that stream is a
-            // capture-side fact: on the single-box path this process chose it and
-            // can name it; for a network source the node chose it and reports it
-            // in its own INFO message. Claiming `mono:0` in that case would be
-            // inventing a value the server never observed.
-            channel_mapping: match self.inputs.config.source.kind {
-                steno_lib::config::SourceKind::Alsa => {
-                    format!("mono:{}", self.audio_cfg.mono_channel_index)
-                }
-                steno_lib::config::SourceKind::Net => "mono".to_string(),
-            },
-            time_quality,
-            boot_id: boot_id.clone(),
-        };
-        // Insert the row before any audio fan-out (TECH_SPEC §4.3).
-        if let Err(error) = self.inputs.db.send(DbCommand::SegmentStarted(started)) {
-            self.inputs
-                .metrics
-                .set_last_error(format!("dispatcher: SegmentStarted send failed: {error}"));
-        }
-        let segment = ActiveSegment::new(
-            id.clone(),
-            now,
-            self.inputs.negotiated.clone(),
-            time_quality,
-            boot_id.clone(),
-            relative_path,
-            now_mono_ns,
-        );
-        self.segment = Some(segment);
+        self.segment = Some(ActiveSegment::new(id.clone(), self.inputs.negotiated.clone()));
         let start_msg = DispatcherMessage::SegmentStart {
             segment_id: id,
             started_at_utc: now,
@@ -525,60 +451,15 @@ impl Dispatcher {
         }
     }
 
-    /// Sends a `SegmentEnd` to the DB writer and both queues, then clears
+    /// Announces the end of the window to both queues, then clears
     /// `self.segment`.
     fn close_segment(&mut self, reason: SegmentEndReason) {
         let Some(segment) = self.segment.take() else {
             return;
         };
-        let ended_at_utc = chrono::Utc::now();
-        let frame_count = segment.stored_frames;
-        let size_bytes = segment.bytes_so_far() + 44; // standard WAV header is 44 bytes
-        let xrun_total = self
-            .inputs
-            .metrics
-            .xrun_count
-            .load(Ordering::Relaxed)
-            .saturating_sub(self.xrun_at_start);
-        let gap_count = segment.gaps.len() as u64;
-        let lost_frames_total: u64 = segment.gaps.iter().map(|g| g.lost_frames).sum();
-        let completed = SegmentCompleted {
-            id: segment.id.clone(),
-            ended_at_utc,
-            frame_count,
-            size_bytes,
-            end_reason: reason.as_str().to_string(),
-            clock_drift_ppm: steno_lib::timeline::clock_drift_ppm(
-                frame_count,
-                segment.capture_rate_hz,
-                monotonic_now_ns().saturating_sub(segment.started_mono_ns),
-            ),
-            xrun_count: xrun_total,
-            gap_count,
-            lost_frames_total,
-            status: SegmentStatus::Complete,
-        };
-        if let Err(error) = self.inputs.db.send(DbCommand::SegmentCompleted(completed)) {
-            self.inputs
-                .metrics
-                .set_last_error(format!("dispatcher: SegmentCompleted send failed: {error}"));
-        }
-        // Flush every GapRecord to the DB writer in offset order so the row
-        // layout is deterministic for tests.
-        for gap in &segment.gaps {
-            let _ = self.inputs.db.send(DbCommand::Gap {
-                segment_id: segment.id.clone(),
-                gap: *gap,
-            });
-        }
         let end_msg = DispatcherMessage::SegmentEnd {
-            segment_id: segment.id.clone(),
-            ended_at_utc,
-            frame_count,
-            size_bytes,
-            xrun_count: xrun_total,
-            gap_count,
-            lost_frames_total,
+            segment_id: segment.id,
+            ended_at_utc: chrono::Utc::now(),
             end_reason: reason,
         };
         if self.push_control_both(&end_msg).is_err() {
@@ -865,16 +746,15 @@ impl Dispatcher {
         let _ = meta;
     }
 
-    /// Helper: append a `GapRecord` to the current segment, updating peak-gap
-    /// and lost-frame accounting, and mirror a `Gap` control message to the
-    /// detector lane so it can reset per §5.4. Does not push anything to the
-    /// recorder lane.
+    /// Helper: update peak-gap and lost-frame accounting for the current window,
+    /// and mirror a `Gap` control message to the detector lane so it can reset per
+    /// §5.4. Does not push anything to the recorder lane.
     fn register_and_mirror_gap(&mut self, lost: u64, kind: GapKind) {
         let (segment_id, offset_frames) = match self.segment.as_ref() {
             Some(s) => (s.id.clone(), s.stored_frames),
             None => return,
         };
-        self.register_gap_locked(lost, kind, EstimateSource::Counter);
+        self.register_gap_locked(lost);
         let mirror = DispatcherMessage::Gap {
             segment_id,
             offset_frames,
@@ -888,23 +768,14 @@ impl Dispatcher {
         }
     }
 
-    /// Helper: append a `GapRecord` to the current segment, updating peak-gap
-    /// and lost-frame accounting. Does not push control messages.
-    fn register_gap_locked(&mut self, lost: u64, kind: GapKind, source: EstimateSource) {
+    /// Helper: update peak-gap and lost-frame accounting. Does not push control
+    /// messages.
+    fn register_gap_locked(&mut self, lost: u64) {
         let segment = match self.segment.as_mut() {
             Some(s) => s,
             None => return,
         };
-        let offset = segment.stored_frames;
-        let record = GapRecord {
-            offset_frames: offset,
-            lost_frames: lost,
-            kind,
-            estimate_source: source,
-            at_utc: chrono::Utc::now(),
-        };
         segment.max_gap_lost_frames = segment.max_gap_lost_frames.max(lost);
-        segment.gaps.push(record);
         self.inputs.metrics.lost_frames_total.fetch_add(lost, Ordering::Relaxed);
     }
 
@@ -1003,7 +874,8 @@ impl Dispatcher {
         }
         // Detection only receives an audio block when there is no pending gap.
         if !pending_gap && self.inputs.detection_queue.push_audio(audio_msg).is_err() {
-            // Detection dropped: do NOT touch audio_gaps, do NOT touch the WAV.
+            // Detection dropped: do NOT touch the timing accounting, do NOT
+            // touch the WAV.
             self.inputs.metrics.dropped_detection_blocks.fetch_add(1, Ordering::Relaxed);
             self.inputs.metrics.set_last_error(format!(
                 "dispatcher: dropped detection block (segment={}, offset={}, frames={})",
@@ -1107,10 +979,9 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use steno_lib::bounded_queue::PopOutcome;
-    use crate::storage::Database;
     use steno_lib::timeline::{GapKind, TimeQuality};
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
-    use tempfile::tempdir;
 
     fn test_config(device_rate_hz: u32, device_channels: u16) -> Arc<Config> {
         Arc::new(Config {
@@ -1153,15 +1024,6 @@ mod tests {
         recording_capacity: usize,
         detection_capacity: usize,
     ) -> TestInputs {
-        let _dir = tempdir().unwrap();
-        let db = Database::in_memory().unwrap();
-        let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let errors_for_writer = Arc::clone(&errors);
-        let writer = crate::db_writer::DbWriter::spawn(
-            db,
-            move |e| errors_for_writer.lock().unwrap().push(e),
-        );
-        let db_handle = writer.handle();
         let capture = Arc::new(CaptureRing::new(
             negotiated.rate_hz,
             negotiated.channels,
@@ -1187,7 +1049,6 @@ mod tests {
             recording_queue: Arc::clone(&recording),
             detection_queue: Arc::clone(&detection),
             stt_queue: None,
-            db: db_handle.clone(),
             shutting_down: Arc::clone(&shutting_down),
             negotiated,
         };
@@ -1198,7 +1059,6 @@ mod tests {
             capture,
             metrics,
             shutting_down,
-            db_handle,
         }
     }
 
@@ -1210,7 +1070,6 @@ mod tests {
         capture: Arc<CaptureRing>,
         metrics: Arc<Metrics>,
         shutting_down: Arc<AtomicBool>,
-        db_handle: DbWriterHandle,
     }
 
     fn negotiated_mono() -> NegotiatedFormat {
@@ -1281,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_emits_initial_segment_start_and_duration_rotation() {
+    fn dispatcher_emits_initial_window_start_and_duration_rotation() {
         // The duration test pushes 6 000 audio blocks; the queue needs to hold them.
         let ti = make_inputs(negotiated_mono(), 16_384, 16_384);
         let mut d = Dispatcher::new(ti.inputs, Arc::new(AtomicBool::new(false)));
@@ -1509,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_segment_rotates_on_duration_not_on_the_byte_cap() {
+    fn a_full_window_rotates_on_duration_not_on_the_byte_cap() {
         // 400 ms blocks are the production default, and one such block always
         // crosses the frame budget and the byte cap together. The rotation must
         // still be reported as `duration`: labelling normal rotations
@@ -1729,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_thread_runs_and_emits_initial_segment_start_then_shutdown() {
+    fn spawn_thread_runs_and_emits_initial_window_start_then_shutdown() {
         // Integration: spawn the real dispatcher thread and drive it via the
         // capture ring. The handle is then asked to shut down; join must
         // succeed before the configured timeout.
@@ -1738,15 +1597,6 @@ mod tests {
         let detection = Arc::new(BoundedQueue::<DispatcherMessage>::new(64, 4));
         let capture = Arc::new(CaptureRing::new(16_000, 1, 500, 10, 200));
         let metrics = Arc::new(Metrics::new());
-        let _dir = tempdir().unwrap();
-        let db = Database::in_memory().unwrap();
-        let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let errors_for_writer = Arc::clone(&errors);
-        let writer = crate::db_writer::DbWriter::spawn(
-            db,
-            move |e| errors_for_writer.lock().unwrap().push(e),
-        );
-        let db_handle = writer.handle();
         let shutting_down = Arc::new(AtomicBool::new(false));
         let config = test_config(16_000, 1);
         let inputs = DispatcherInputs {
@@ -1756,7 +1606,6 @@ mod tests {
             recording_queue: Arc::clone(&recording),
             detection_queue: Arc::clone(&detection),
             stt_queue: None,
-            db: db_handle.clone(),
             shutting_down: Arc::clone(&shutting_down),
             negotiated,
         };
@@ -1793,8 +1642,6 @@ mod tests {
         assert!(saw_audio, "dispatcher must emit Audio to the recording lane");
         handle.request_shutdown();
         assert!(handle.join(Duration::from_secs(2)));
-        writer.shutdown(Duration::from_secs(2));
-        assert!(errors.lock().unwrap().is_empty(), "writer errors: {:?}", *errors.lock().unwrap());
     }
 
     #[test]

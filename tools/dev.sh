@@ -10,6 +10,14 @@
 #   tools/dev.sh --only server   # one role; --only server,node for two
 #   tools/dev.sh --stt off       # run with transcription disabled
 #   tools/dev.sh status          # one-shot panel, from any shell
+#
+#   tools/dev.sh --backend audiocpp
+#                                # recognise with audio.cpp's Qwen3-ASR instead of
+#                                # Apple. The first run has to be told where the
+#                                # weights are; every run after it is the line
+#                                # above, because the path is remembered:
+#                                #   tools/dev.sh --backend audiocpp --model ~/models/qwen3-asr-0.6b-q8_0.gguf
+#                                # --chunk N overrides the 5 s window.
 #   tools/dev.sh reload sidecar  # rebuild it; the server re-launches it
 #   tools/dev.sh stop web|start web|restart server|logs server|schema|quit
 #
@@ -24,6 +32,10 @@
 #                         starts the new build. No install step involved.
 #   crates/node/**        watched when the node role is on.
 #   web/src/**            Vite HMR. No reload needed; no Rust involved.
+#
+# With `--backend audiocpp` the recogniser is a second [[bin]] of the server crate,
+# so its source is crates/server/**: a server reload rebuilds and restarts it, and
+# the Swift bundle is never built.
 #
 # The console panel (tools/dev-panel.py) polls /api/v1/status once a second and
 # tails the server log, so the pipeline state — capture, recording, detector, stt,
@@ -58,6 +70,24 @@ SIDECAR_APP="$REPO_ROOT/apple-stt-sidecar/build/steno-stt-sidecar.app"
 SIDECAR_BIN="$SIDECAR_APP/Contents/MacOS/steno-stt-sidecar"
 SIDECAR_WRAPPER="$DEV_DIR/steno-stt-sidecar-dev"
 SIDECAR_LOG="$DEV_DIR/sidecar.log"
+
+# Which recogniser the dev sidecar runs. Empty means the sidecar's own default
+# (Apple, `SpeechAnalyzer`); `--backend audiocpp` swaps in audio.cpp's Qwen3-ASR,
+# which needs a GGUF package. The path is asked for once (`--model`) and then
+# remembered, because a recogniser without weights starts, reports `ready` and
+# hears nothing all night — a failure that looks exactly like a quiet bedroom.
+#
+# The flags are the interface; the `STENO_STT_*` variables still work as the
+# fallback, so an exported environment or an existing script keeps behaving.
+MODEL_FILE="$RUNTIME_DIR/stt-model.conf"
+STT_BACKEND="${STENO_STT_BACKEND:-}"
+STT_MODEL="${STENO_STT_MODEL:-}"
+STT_CHUNK="${STENO_STT_CHUNK:-}"
+MODEL_GIVEN=0
+
+# The audio.cpp recogniser, built by the same `cargo build` as the server (it is a
+# second [[bin]] of the same crate), so watching crates/server rebuilds it too.
+AUDIOCPP_SIDECAR_BIN="$REPO_ROOT/target/debug/steno-stt-sidecar-audiocpp"
 
 # Pids matching a command-line pattern, one per line, and **always succeeding**.
 #
@@ -322,6 +352,73 @@ warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# `--model` may be typed as `~/models/…`, and the shell never expands a `~` that
+# arrives inside a variable. Doing it here keeps the remembered path absolute,
+# which matters because the wrapper is written and read from another directory.
+expand_home() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# The one `.gguf` a directory stands for, or a refusal. Mirrors
+# `audiocpp::config::resolve_model` so a bad path fails here — where a human is
+# reading — instead of after the sidecar has reported `ready`.
+resolve_model_path() { # path -> prints the file, or dies
+  local path="$1" found count
+  if [ -f "$path" ]; then
+    case "$path" in
+      *.gguf) printf '%s\n' "$path" ;;
+      *) die "--model $path is a file but not a .gguf" ;;
+    esac
+    return
+  fi
+  [ -d "$path" ] || die "--model $path is neither a .gguf file nor a directory"
+  found="$(find "$path" -maxdepth 1 -name '*.gguf' -type f | sort)"
+  count="$(printf '%s\n' "$found" | grep -c . || true)"
+  case "$count" in
+    1) printf '%s\n' "$found" ;;
+    0) die "--model $path holds no .gguf file" ;;
+    *) die "--model $path holds $count .gguf files — pass one of them:
+$(printf '%s\n' "$found" | sed 's/^/  /')" ;;
+  esac
+}
+
+# Remembers where the weights are, so `--backend audiocpp` alone works next time.
+# Not sourced: this file is state, not a script, and reading one line cannot run
+# anything. `%q` quoting is stripped for the same reason it is used.
+remembered_model() {
+  [ -f "$MODEL_FILE" ] || return 0
+  sed -n 's/^STT_MODEL=//p' "$MODEL_FILE" | tail -1 | tr -d "'"
+}
+
+remember_model() { # path
+  mkdir -p "$RUNTIME_DIR"
+  {
+    printf '# Written by tools/dev.sh --model. Read when --backend audiocpp runs\n'
+    printf '# without a model of its own; delete it to make dev.sh ask again.\n'
+    printf 'STT_MODEL=%q\n' "$1"
+  } >"$MODEL_FILE"
+}
+
+# The package `install.sh` recorded for the installed audiocpp wrapper, if any.
+# That file exists precisely because "which GGUF is on this machine" outlives a
+# shell, so a deployment that already answered the question does not have to
+# answer it again here. Read, never rewritten.
+installed_audiocpp_model() {
+  local conf
+  for conf in "${STENO_STT_PREFIX:-$HOME/.local}/lib/steno-stt-sidecar-audiocpp.conf" \
+              "/usr/local/lib/steno-stt-sidecar-audiocpp.conf"; do
+    [ -f "$conf" ] || continue
+    # `install.sh` quotes the value; strip the quotes rather than match them, so a
+    # hand-edited line (quoted or not) reads the same as a generated one.
+    sed -n 's/^AUDIOCPP_MODEL=//p' "$conf" | tail -1 | tr -d "'"
+    return 0
+  done
+}
+
 usage() {
   local last
   last="$(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | head -1 | cut -d: -f1)"
@@ -332,6 +429,10 @@ Options:
   --port N            server HTTP port (default 8080; Vite proxies to it)
   --only a,b          run only these roles (web,server,sidecar,node)
   --with-node         also run a local capture node over UDP
+  --backend NAME      which recogniser the dev sidecar runs: apple (default) or
+                      audiocpp. audiocpp needs --model once, then remembers it
+  --model PATH        the .gguf for audiocpp (implies --backend audiocpp)
+  --chunk N           audiocpp window length in seconds (default 5, 1..30)
   --stt on|off        set [stt] enabled in the runtime config
   --control on|off    set [control] enabled
   --sidecar build|installed|off
@@ -369,6 +470,9 @@ else
       --port) PORT="$2"; HTTP_BASE="http://127.0.0.1:$PORT"; shift 2 ;;
       --only) ONLY="$2"; shift 2 ;;
       --with-node) WANT_NODE=1; shift ;;
+      --backend) STT_BACKEND="${2:-}"; shift 2 ;;
+      --model) STT_MODEL="${2:-}"; MODEL_GIVEN=1; shift 2 ;;
+      --chunk) STT_CHUNK="${2:-}"; shift 2 ;;
       --stt) STT_MODE="${2:-}"; shift 2 ;;
       --control) CONTROL_MODE="${2:-}"; shift 2 ;;
       --sidecar) SIDECAR_MODE="${2:-}"; shift 2 ;;
@@ -387,6 +491,52 @@ case "$STT_MODE" in ""|on|off) ;; *) die "--stt takes on|off" ;; esac
 case "$CONTROL_MODE" in ""|on|off) ;; *) die "--control takes on|off" ;; esac
 if [ "$SIDECAR_MODE" = "off" ]; then WANT_SIDECAR=0; fi
 
+# --- recogniser selection ---------------------------------------------------
+#
+# One line of intent, resolved into what the wrapper exports:
+#
+#   --backend audiocpp            audio.cpp's Qwen3-ASR, weights from the cache
+#   --backend audiocpp --model X  …weights at X, remembered for next time
+#   --model X                     the same thing; naming weights implies the engine
+#   --backend apple | (nothing)   Apple's SpeechAnalyzer, the sidecar's default
+#
+# A model path is remembered in `$MODEL_FILE` rather than required every run: the
+# weights do not move, and re-typing a 60-character path is how a flag stops being
+# used. `--backend audiocpp` with nothing remembered is a hard error — the engine
+# starts without weights, prints `ready`, and then hears nothing all night, which
+# in the database is indistinguishable from a quiet room.
+if [ "$MODEL_GIVEN" = 1 ] && [ -z "$STT_BACKEND" ]; then
+  STT_BACKEND=audiocpp
+fi
+case "$STT_BACKEND" in
+  ""|"apple") STT_BACKEND="" ;;
+  audiocpp) ;;
+  *) die "--backend takes apple or audiocpp (got $STT_BACKEND)" ;;
+esac
+# Saying both is a contradiction, and silently dropping one of them is how a dev
+# run ends up in the wrong engine with nothing in the log to say so.
+if [ "$STT_BACKEND" != audiocpp ]; then
+  if [ "$MODEL_GIVEN" = 1 ]; then
+    die "--model belongs to --backend audiocpp; the Apple recogniser loads no weights"
+  fi
+  if [ -n "$STT_CHUNK" ]; then
+    die "--chunk belongs to --backend audiocpp; Apple decodes whole phrases, not windows"
+  fi
+else
+  if [ -n "$STT_CHUNK" ]; then
+    case "$STT_CHUNK" in
+      *[!0-9.]*|*.|"") die "--chunk takes seconds (got '$STT_CHUNK')" ;;
+    esac
+    awk -v c="$STT_CHUNK" 'BEGIN { exit !(c + 0 >= 1 && c + 0 <= 30) }' \
+      || die "--chunk is outside 1..30 (got $STT_CHUNK)"
+  fi
+fi
+
+# Everything above is argument checking; finding the weights waits for the boot
+# section, because it reads and writes state and must not run for `dev.sh stop`
+# (a client command never starts a recogniser, and a missing model must not stop
+# someone from shutting the pipeline down).
+
 if [ -n "$ONLY" ]; then
   WANT_WEB=0; WANT_SERVER=0; WANT_SIDECAR=0
   IFS=',' read -r -a roles <<<"$ONLY"
@@ -399,6 +549,24 @@ if [ -n "$ONLY" ]; then
       *) die "--only takes web,server,sidecar,node (got $role)" ;;
     esac
   done
+fi
+
+# `--backend` names a recogniser, so it needs the lane that runs one. Saying both
+# is a contradiction, and silently dropping the backend is how a dev run ends up
+# in the wrong engine with nothing in the log to say so.
+if [ "$STT_BACKEND" = audiocpp ]; then
+  if [ "$STT_MODE" = off ]; then
+    die "--backend audiocpp with --stt off: the recogniser would never run"
+  fi
+  if [ "$WANT_SIDECAR" = 0 ]; then
+    die "--backend audiocpp needs the sidecar lane (drop --no-sidecar/--sidecar off)"
+  fi
+  if [ "$SIDECAR_MODE" = installed ]; then
+    # The installed wrapper is Apple's. audio.cpp's sidecar has its own
+    # (`steno-stt-sidecar-audiocpp`), which takes no dev flags — a deployment
+    # switch, not something this script can flip.
+    die "--backend audiocpp runs the build in this repo; --sidecar installed names the Apple wrapper"
+  fi
 fi
 
 # --- state files ------------------------------------------------------------
@@ -672,10 +840,15 @@ patch_stt_command() { # file value
 # can show it and `kill` can reach it.
 write_sidecar_wrapper() {
   mkdir -p "$DEV_DIR"
+  # A missing model cannot reach this point — `--backend audiocpp` resolves one
+  # before anything starts — so this is a backstop, not a code path.
+  if [ "$STT_BACKEND" = audiocpp ] && [ -z "$STT_MODEL" ]; then
+    say "--backend audiocpp without a model; pass --model <path to the .gguf>" >&2
+    exit 2
+  fi
   # Quoted delimiter on purpose: an unquoted heredoc expands backticks and `$(…)`
   # inside these comments, and a comment that mentions `--log-text` would be run as
-  # a command (it was: "line 441: --log-text: command not found"). The two paths
-  # are substituted afterwards instead, so nothing else is interpreted.
+  # a command (it was: "line 441: --log-text: command not found").
   cat >"$SIDECAR_WRAPPER" <<'WRAPPER'
 #!/bin/sh
 # Generated by tools/dev.sh — launches the sidecar built in this repo, detached,
@@ -685,16 +858,55 @@ write_sidecar_wrapper() {
 # convenience: production keeps transcripts out of logs (see apple-stt-sidecar
 # Sources/Log.swift). `tools/dev.sh logs sidecar` then answers "what did it hear"
 # without a browser.
-exec </dev/null
-nohup "@SIDECAR_BIN@" --socket "$1" --log-text >>"@SIDECAR_LOG@" 2>&1 &
 WRAPPER
-  sed -i '' -e "s|@SIDECAR_BIN@|$SIDECAR_BIN|g" \
-            -e "s|@SIDECAR_LOG@|$SIDECAR_LOG|g" "$SIDECAR_WRAPPER"
+  # The command line is printed with `%q` rather than substituted into the heredoc:
+  # a model path may contain spaces, and `sed s|…|…|` would either break on them
+  # or quietly mangle the arguments.
+  {
+    printf 'exec </dev/null\n'
+    if [ "$STT_BACKEND" = audiocpp ]; then
+      # The audio.cpp engine is a Rust sidecar built from crates/server, so it takes
+      # its model from the environment instead of flags. `exec` before `nohup` is
+      # deliberate: the wrapper has to exit immediately (the server's launcher
+      # waits for it) while the sidecar keeps running.
+      printf 'export STENO_STT_MODEL=%q\n' "$STT_MODEL"
+      if [ -n "$STT_CHUNK" ]; then printf 'export STENO_STT_CHUNK=%q\n' "$STT_CHUNK"; fi
+      # Window-level lines without any text in them (chars, not content), which is
+      # what `--log-text` gave the Swift wrapper without putting a transcript in
+      # a log file.
+      printf 'export STENO_LOG=%q\n' "info,steno_server::audiocpp=debug"
+      printf 'nohup %q --socket "$1" >>%q 2>&1 &\n' "$AUDIOCPP_SIDECAR_BIN" "$SIDECAR_LOG"
+    else
+      printf 'nohup %q --socket "$1" --log-text' "$SIDECAR_BIN"
+      printf ' >>%q 2>&1 &\n' "$SIDECAR_LOG"
+    fi
+  } >>"$SIDECAR_WRAPPER"
   chmod +x "$SIDECAR_WRAPPER"
+}
+
+# Finds the GGUF `--backend audiocpp` will load, and remembers it. Three places,
+# in the order a human would look: this run's `--model`, this checkout's last run
+# (so `--backend audiocpp` alone works tomorrow), then whatever `install.sh`
+# recorded for the installed sidecar.
+resolve_audiocpp_model() {
+  [ "$STT_BACKEND" = audiocpp ] || return 0
+  if [ -z "$STT_MODEL" ]; then STT_MODEL="$(remembered_model)"; fi
+  if [ -z "$STT_MODEL" ]; then
+    STT_MODEL="$(installed_audiocpp_model)"
+    [ -z "$STT_MODEL" ] || say "using the model recorded for the installed sidecar"
+  fi
+  [ -n "$STT_MODEL" ] || die "--backend audiocpp needs the weights once:
+  tools/dev.sh --backend audiocpp --model <file.gguf | dir>
+It is remembered in $MODEL_FILE afterwards, and the short form is then enough."
+  STT_MODEL="$(expand_home "$STT_MODEL")"
+  STT_MODEL="$(resolve_model_path "$STT_MODEL")"
+  remember_model "$STT_MODEL"
+  dev "recogniser audiocpp · model $STT_MODEL${STT_CHUNK:+ · ${STT_CHUNK}s windows}"
 }
 
 prepare_config() {
   mkdir -p "$RUNTIME_DIR"
+  resolve_audiocpp_model
   # The point of this script is the whole pipeline, so the sidecar lane is on
   # unless it was explicitly asked to stay off. Asking for `--only server` is a
   # request for a backend-only run, so it turns the lane off rather than leaving
@@ -794,6 +1006,23 @@ start_web() {
 build_sidecar() {
   [ "$WANT_SIDECAR" = 1 ] || return 0
   state_set sidecar starting - "building"
+  # Two different builds, one role. Apple's recogniser is the Swift bundle;
+  # audio.cpp's is a second [[bin]] of the server crate, so the same `cargo build`
+  # that makes the server makes it — and building the bundle as well would be a
+  # minute spent on a binary the server is not going to launch.
+  if [ "$STT_BACKEND" = audiocpp ]; then
+    if ! cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p steno-server \
+        >"$DEV_DIR/sidecar-build.log" 2>&1; then
+      warn "audiocpp sidecar build failed; see $DEV_DIR/sidecar-build.log"
+      tail -12 "$DEV_DIR/sidecar-build.log" >&2 || true
+      state_set sidecar down - "build failed"
+      return 1
+    fi
+    write_sidecar_wrapper
+    SIDECAR_BUILDS=$((SIDECAR_BUILDS + 1))
+    state_set sidecar down - "built, waiting for the server"
+    return 0
+  fi
   if ! "$REPO_ROOT/apple-stt-sidecar/build.sh" >"$DEV_DIR/sidecar-build.log" 2>&1; then
     warn "sidecar build failed; see $DEV_DIR/sidecar-build.log"
     tail -12 "$DEV_DIR/sidecar-build.log" >&2 || true
@@ -1146,7 +1375,7 @@ while :; do
       note_event "crates/ changed"
       reload_server
     fi
-    if [ "$WANT_SIDECAR" = 1 ] && watch_sidecar; then
+    if [ "$WANT_SIDECAR" = 1 ] && [ "$STT_BACKEND" != audiocpp ] && watch_sidecar; then
       note_event "apple-stt-sidecar/ changed"
       reload_sidecar || true
     fi

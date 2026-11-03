@@ -12,7 +12,6 @@ import {
   api,
   bytes,
   duration,
-  localDateTime,
   share,
   sttStateLabel,
   unitStateLabel,
@@ -316,7 +315,7 @@ function TranscriptionCard({ status }: { status: Status | null }) {
 
 function StoragePoolCard({ status }: { status: Status | null }) {
   const storage = status?.storage
-  const used = storage?.used_bytes ?? null
+  const used = storage?.bytes ?? null
   const max = storage?.max_bytes ?? 0
   const usedShare = share(used, max)
   const targetShare = share(storage?.cleanup_target_bytes, max)
@@ -357,16 +356,8 @@ function StoragePoolCard({ status }: { status: Status | null }) {
           <dd>{bytes(storage?.reserve_bytes)}</dd>
         </div>
         <div>
-          <dt>段数</dt>
-          <dd>{count(storage?.segment_count)}</dd>
-        </div>
-        <div>
-          <dt>最早</dt>
-          <dd>{localDateTime(storage?.oldest_started_at_utc ?? null)}</dd>
-        </div>
-        <div>
-          <dt>最新</dt>
-          <dd>{localDateTime(storage?.newest_ended_at_utc ?? null)}</dd>
+          <dt>录音数</dt>
+          <dd>{count(storage?.recordings)}</dd>
         </div>
         <div>
           <dt>目录</dt>

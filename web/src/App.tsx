@@ -18,7 +18,7 @@ import { serviceLabel, serviceTone, toneClass } from './ui'
 type Page = 'console' | 'recordings'
 
 const PAGES: { id: Page; label: string; hint: string }[] = [
-  { id: 'recordings', label: '录音', hint: '时间轴 · 片段 · 语句' },
+  { id: 'recordings', label: '录音', hint: '时间轴 · 鼾声 · 语句' },
   { id: 'console', label: '控制台', hint: '服务端 · 采集端 · 存储' },
 ]
 

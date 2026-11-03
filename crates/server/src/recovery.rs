@@ -1,25 +1,26 @@
 //! Startup recovery scan (TECH_SPEC §4.2, task T3.6).
 //!
 //! Runs before the capture pipeline starts, so it is the one place where a
-//! `.partial` file and a segment row are known not to be receiving writes.
-//! Three reconciliations happen here:
+//! `.partial` file is known not to be receiving writes. Two things happen:
 //!
-//! 1. `.partial` files left by a crash or a shutdown timeout are truncated to a
-//!    whole `block_align` frame, their header is patched to the real size, and
-//!    they are renamed to `.wav` and recorded as `interrupted`.
-//! 2. A `.partial` whose header cannot be validated is left exactly as it is:
-//!    it is never published and an alert is raised, rather than guessing that
-//!    its tail is complete.
-//! 3. Files and rows are reconciled: a WAV with no DB row is an orphan, and a
-//!    row whose file is gone is marked `missing` (T0.1).
+//! 1. Every `.partial` left by a crash or a shutdown timeout is truncated to a
+//!    whole frame, its header is patched to the real length, renamed to `.wav`,
+//!    and described by one `recordings` row. There is no status column to mark:
+//!    a file that made it to disk is simply a recording, and its own header says
+//!    how much of it is real.
+//! 2. A `.partial` whose header cannot be validated is left exactly as it is —
+//!    it is never published — and reported for a human to look at.
+//!
+//! A light reconciliation follows: a recording row whose file is gone, and a WAV
+//! file no row mentions, are both reported. Nothing is deleted here; deleting
+//! audio is retention's job, and it only deletes rows it can identify.
 //!
 //! Capacity is checked by the caller afterwards (T3.6), once the scan has made
 //! the on-disk inventory accurate.
 
 use steno_lib::error::{Error, Result};
-use crate::recorder::{read_header, recover_partial, validate_relative_path};
-use crate::storage::{Database, SegmentStarted, SegmentStatus};
-use steno_lib::timeline::TimeQuality;
+use crate::recorder::{recover_partial, validate_relative_path};
+use crate::storage::{Database, RecordingDraft};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use std::collections::HashSet;
 use std::fs;
@@ -35,21 +36,14 @@ pub struct UnverifiablePartial {
 /// Summary of one startup scan, suitable for logging and for the status page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
-    /// `.partial` files repaired into `interrupted` segments.
+    /// `.partial` files repaired and published as recordings.
     pub recovered: Vec<String>,
     /// `.partial` files left untouched because they could not be validated.
     pub unverifiable: Vec<UnverifiablePartial>,
-    /// WAV files with no matching row. They are reported, never deleted here:
-    /// deleting audio is retention's job, and only for rows it can identify.
+    /// WAV files with no matching row. They are reported, never deleted here.
     pub orphans: Vec<PathBuf>,
-    /// Segment ids whose row promised audio that is no longer on disk.
+    /// Recording ids whose row promises audio that is no longer on disk.
     pub missing: Vec<String>,
-    /// Rows still marked `recording` from a previous run. They cannot be
-    /// resumed; they are either reclassified by step 1/3 or set `interrupted`.
-    pub stale_recording: Vec<String>,
-    /// Rows marked `missing` whose file was found again, re-derived from the
-    /// file's own header.
-    pub restored: Vec<String>,
 }
 
 impl RecoveryReport {
@@ -102,36 +96,40 @@ fn repair_partials(
             continue;
         }
         match recover_partial(&partial) {
+            // `recover_partial` reads the 44-byte header, cuts a half-written
+            // frame, patches both RIFF lengths and renames to `.wav`, so the row
+            // below describes the file that is actually on disk.
             Ok((final_path, frames, size_bytes, format)) => {
-                let started_at = match segment_start_from_path(&partial) {
+                let started_at = match started_at_from_path(&partial) {
                     Some(started) => started,
                     None => {
-                        // The file itself is now repaired and publishable, but we
-                        // cannot name its start time, so we cannot describe it in
-                        // the DB without inventing a timestamp.
-                        let id = segment_id_from_path(&partial);
+                        // The file is now publishable, but we cannot name its
+                        // start time without inventing one.
+                        let id = recording_id_from_path(&partial);
                         report.orphans.push(final_path);
                         tracing::warn!(file = %partial.display(), %id, "recovered WAV has no parseable start timestamp; left for manual review");
                         continue;
                     }
                 };
-                let id = segment_id_from_path(&partial);
+                let id = recording_id_from_path(&partial);
                 let relative = relative_to(recordings_root, &final_path)?;
                 let ended_at = started_at
                     + chrono::Duration::from_std(frame_duration(frames, format.sample_rate_hz))
                         .unwrap_or_else(|_| chrono::Duration::zero());
-                let segment = SegmentStarted {
+                db.insert_recording(&RecordingDraft {
                     id: id.clone(),
                     relative_path: relative,
                     started_at_utc: started_at,
+                    ended_at_utc: ended_at,
                     capture_rate_hz: format.sample_rate_hz,
                     channels: format.channels,
-                    sample_format: "S16_LE".into(),
-                    channel_mapping: default_channel_mapping(format.channels),
-                    time_quality: TimeQuality::Unsynced,
-                    boot_id: String::new(),
-                };
-                db.insert_interrupted_recovery(&segment, frames, size_bytes, ended_at)?;
+                    frame_count: frames,
+                    size_bytes,
+                    // Nothing is known to have been dropped: the only bytes that
+                    // never made it are the half frame just cut, and that is not
+                    // a frame the timeline ever promised.
+                    lost_frames: 0,
+                })?;
                 report.recovered.push(id);
             }
             Err(error) => {
@@ -145,7 +143,7 @@ fn repair_partials(
     Ok(())
 }
 
-/// Step 3: reconcile rows and files, including rows a crash left `recording`.
+/// Step 3: report rows without files and files without rows.
 fn reconcile(recordings_root: &Path, db: &Database, report: &mut RecoveryReport) -> Result<()> {
     // Keep both identities of each file: the absolute path (for reporting) and
     // the DB-relative path (for matching against rows).
@@ -154,82 +152,20 @@ fn reconcile(recordings_root: &Path, db: &Database, report: &mut RecoveryReport)
         let relative = relative_to(recordings_root, &path)?;
         files.push((path, relative));
     }
-    let rows = db.all_segments()?;
     let mut claimed: HashSet<PathBuf> = HashSet::new();
-
-    for row in rows {
-        let relative = PathBuf::from(&row.relative_path);
-        let on_disk = files
-            .iter()
-            .find(|(_, stored)| *stored == relative)
-            .map(|(path, _)| path.clone());
-        match row.status.as_str() {
-            // A row still marked `recording` cannot be resumed: the writer that
-            // owned it is gone. Its data is whatever reached the disk, so the
-            // honest classification is `interrupted` (complete would claim the
-            // tail was flushed, deleted would hide audio that still exists).
-            "recording" => {
-                report.stale_recording.push(row.id.clone());
-                db.mark_segment_status(&row.id, SegmentStatus::Interrupted)?;
-                if on_disk.is_none() {
-                    report.missing.push(row.id.clone());
-                } else {
-                    claimed.insert(relative);
-                }
-            }
-            "complete" | "interrupted" => {
-                if on_disk.is_some() {
-                    claimed.insert(relative);
-                } else {
-                    // The row promises audio that is gone. `missing` is the one
-                    // status the API and Portal both understand as "cannot play
-                    // this, and it is not a retention deletion".
-                    db.mark_segment_status(&row.id, SegmentStatus::Missing)?;
-                    report.missing.push(row.id.clone());
-                }
-            }
-            // A `missing` row whose file is back was misclassified (an older
-            // scan resolved paths differently) or the file was restored. Its
-            // status cannot be read out of the database — it was overwritten —
-            // so it is re-derived from the file itself: a header whose declared
-            // data length accounts for the whole file is a finished recording,
-            // anything else is `interrupted`. No guessing, and the audio is
-            // reclaimable by retention again instead of looking like a hole.
-            "missing" => {
-                if let Some(path) = on_disk {
-                    let status = status_from_file(&path);
-                    db.mark_segment_status(&row.id, status)?;
-                    report.restored.push(row.id.clone());
-                    claimed.insert(relative);
-                }
-            }
-            // `deleted` rows are expected to have no file.
-            _ => {}
+    for row in db.recordings_oldest_first()? {
+        if files.iter().any(|(_, stored)| *stored == row.relative_path) {
+            claimed.insert(row.relative_path);
+        } else {
+            report.missing.push(row.id);
         }
     }
-
     for (path, stored) in files {
         if !claimed.contains(&stored) {
             report.orphans.push(path);
         }
     }
     Ok(())
-}
-
-/// Re-derives a segment status from a finished WAV on disk.
-///
-/// `complete` only when the header's declared data length plus the 44-byte
-/// header is the whole file: that is what "the writer finalised this file"
-/// means. Everything else is `interrupted`, which is the conservative answer.
-fn status_from_file(path: &Path) -> SegmentStatus {
-    let declared_ok = read_header(path).is_ok_and(|(_, declared)| {
-        fs::metadata(path).is_ok_and(|meta| meta.len() == 44 + declared)
-    });
-    if declared_ok {
-        SegmentStatus::Complete
-    } else {
-        SegmentStatus::Interrupted
-    }
 }
 
 /// Collects every file below `root` with the given extension.
@@ -259,26 +195,12 @@ fn collect_with_extension(root: &Path, extension: &str) -> Result<Vec<PathBuf>> 
     Ok(found)
 }
 
-/// Builds the DB-stored relative path for a file below the recordings root.
-///
-/// `recorder::segment_relative_path` writes `recordings/YYYY/MM/DD/<name>.wav`,
-/// so the stored path is relative to the *parent* of the recordings root, and the
-/// root's own directory name is the leading component. When the root is not named
-/// `recordings`, the directory name is used as-is, which keeps the stored path a
-/// faithful, traversable relative path either way.
 /// The DB-relative path of a file found under `recordings_root`.
 ///
-/// `relative_path` in `recording_segments` is exactly `recording_dir`-relative —
-/// the recorder writes `recording_dir.join(relative_path)`, and both playback
+/// `relative_path` in `recordings` is exactly `recording_dir`-relative — the
+/// recorder writes `recording_dir.join(relative_path)`, and both playback
 /// (`http_server::get_audio`) and retention do the same. This function must
 /// mirror that one join, nothing more.
-///
-/// It used to prepend `root.file_name()` on the assumption that rows were stored
-/// relative to the *parent* of the recordings directory. The recorder has never
-/// stored them that way, so after any restart every row failed to match its own
-/// file: the rows were marked `missing` and the files reported as orphans, which
-/// also made the pool read 0 bytes because `pool_summary` only counts
-/// `complete`/`interrupted`.
 fn relative_to(root: &Path, path: &Path) -> Result<PathBuf> {
     let relative = path.strip_prefix(root).map_err(|_| {
         Error::Storage(format!(
@@ -293,18 +215,18 @@ fn relative_to(root: &Path, path: &Path) -> Result<PathBuf> {
 }
 
 /// Parses the UTC start time embedded in `<YYYYMMDDTHHMMSS.mmmZ>_<id>.wav`.
-fn segment_start_from_path(path: &Path) -> Option<DateTime<Utc>> {
+fn started_at_from_path(path: &Path) -> Option<DateTime<Utc>> {
     let name = path.file_stem()?.to_str()?;
     let (timestamp, _) = name.split_once('_')?;
     let naive = NaiveDateTime::parse_from_str(timestamp, "%Y%m%dT%H%M%S%.3fZ").ok()?;
     Some(naive.and_utc())
 }
 
-/// Recovers the segment id embedded in the file name. The file name is
+/// Recovers the recording id embedded in the file name. The file name is
 /// `<UTC-start>_<id>.wav.partial`, so the id is everything after the first
 /// underscore with the WAV extensions stripped. Falls back to the bare stem so a
 /// repaired file still gets a stable identity.
-fn segment_id_from_path(path: &Path) -> String {
+fn recording_id_from_path(path: &Path) -> String {
     let stem = path
         .file_stem()
         .and_then(|s| Path::new(s).file_stem())
@@ -323,18 +245,11 @@ fn frame_duration(frames: u64, rate_hz: u32) -> std::time::Duration {
     std::time::Duration::from_secs_f64(frames as f64 / f64::from(rate_hz))
 }
 
-fn default_channel_mapping(channels: u16) -> String {
-    match channels {
-        1 => "mono".into(),
-        _ => "stereo".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recorder::{WavFormat, read_header, write_header};
-    use chrono::{NaiveDate, NaiveTime};
+    use chrono::{NaiveDate, NaiveTime, TimeZone};
     use tempfile::tempdir;
 
     /// Writes a `.partial` holding `frames` whole mono S16 frames followed by a
@@ -357,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_partial_is_repaired_and_recorded_as_interrupted() {
+    fn truncated_partial_is_repaired_and_published_as_a_recording() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("recordings");
         fs::create_dir_all(&root).unwrap();
@@ -368,32 +283,45 @@ mod tests {
         // deeper than the directory name suggests.
         write_partial(
             &root,
-            Path::new("recordings/2025/01/02/20250102T010203.000Z_seg1.wav.partial"),
+            Path::new("recordings/2025/01/02/20250102T010203.000Z_rec1.wav.partial"),
             2,
             1,
         );
 
         let report = scan(&root, &db).unwrap();
 
-        assert_eq!(report.recovered, vec!["seg1".to_string()]);
+        assert_eq!(report.recovered, vec!["rec1".to_string()]);
+        assert!(report.is_clean(), "a repaired file needs no human: {report:?}");
         assert!(
             !root
-                .join("recordings/2025/01/02/20250102T010203.000Z_seg1.wav.partial")
+                .join("recordings/2025/01/02/20250102T010203.000Z_rec1.wav.partial")
                 .exists()
         );
-        let recovered = root.join("recordings/2025/01/02/20250102T010203.000Z_seg1.wav");
+        let recovered = root.join("recordings/2025/01/02/20250102T010203.000Z_rec1.wav");
         assert!(recovered.exists());
         // The partial frame was cut, so the header now declares exactly 2 frames.
         let (format, declared) = read_header(&recovered).unwrap();
         assert_eq!(format.sample_rate_hz, 16_000);
         assert_eq!(declared, 4);
-        let row = db.segment("seg1").unwrap().unwrap();
-        assert_eq!(row.status, "interrupted");
+        let row = db.recording("rec1").unwrap().unwrap();
         assert_eq!(row.frame_count, 2);
+        assert_eq!(row.size_bytes, 48);
+        assert_eq!(row.capture_rate_hz, 16_000);
+        assert_eq!(row.channels, 1);
+        assert_eq!(row.lost_frames, 0);
+        assert_eq!(
+            row.started_at_utc,
+            Utc.with_ymd_and_hms(2025, 1, 2, 1, 2, 3).unwrap()
+        );
+        // 2 frames at 16 kHz is 125 µs.
+        assert_eq!(
+            (row.ended_at_utc - row.started_at_utc).num_microseconds(),
+            Some(125)
+        );
         // The stored path stays relative and keeps the recordings-root prefix.
         assert_eq!(
             row.relative_path,
-            "recordings/2025/01/02/20250102T010203.000Z_seg1.wav"
+            PathBuf::from("recordings/2025/01/02/20250102T010203.000Z_rec1.wav")
         );
     }
 
@@ -403,7 +331,7 @@ mod tests {
         let root = dir.path().join("recordings");
         fs::create_dir_all(root.join("recordings/2025/01/02")).unwrap();
         let db = Database::in_memory().unwrap();
-        let partial = root.join("recordings/2025/01/02/20250102T010203.000Z_seg2.wav.partial");
+        let partial = root.join("recordings/2025/01/02/20250102T010203.000Z_rec2.wav.partial");
         fs::write(
             &partial,
             b"not a wav header at all, but long enough to read 44 bytes!!",
@@ -420,9 +348,10 @@ mod tests {
             "an unverifiable partial must never be renamed away"
         );
         assert!(
-            db.segment("seg2").unwrap().is_none(),
+            db.recording("rec2").unwrap().is_none(),
             "nothing may be published for it"
         );
+        assert!(!report.is_clean(), "an unverifiable partial needs a human");
     }
 
     #[test]
@@ -439,29 +368,16 @@ mod tests {
             ),
             Utc,
         );
-        let segment = SegmentStarted {
+        db.insert_recording(&RecordingDraft {
             id: "gone".into(),
             relative_path: PathBuf::from("recordings/2025/01/02/20250102T010203.000Z_gone.wav"),
             started_at_utc: started,
+            ended_at_utc: started,
             capture_rate_hz: 16_000,
             channels: 1,
-            sample_format: "S16_LE".into(),
-            channel_mapping: "mono".into(),
-            time_quality: TimeQuality::Synced,
-            boot_id: "boot".into(),
-        };
-        db.insert_segment_started(&segment).unwrap();
-        db.complete_segment(&crate::storage::SegmentCompleted {
-            id: "gone".into(),
-            ended_at_utc: started,
             frame_count: 10,
             size_bytes: 64,
-            end_reason: "duration".into(),
-            clock_drift_ppm: None,
-            xrun_count: 0,
-            gap_count: 0,
-            lost_frames_total: 0,
-            status: SegmentStatus::Complete,
+            lost_frames: 0,
         })
         .unwrap();
         // A file no row mentions.
@@ -471,50 +387,8 @@ mod tests {
         let report = scan(&root, &db).unwrap();
 
         assert_eq!(report.missing, vec!["gone".to_string()]);
-        assert_eq!(db.segment("gone").unwrap().unwrap().status, "missing");
         assert_eq!(report.orphans, vec![orphan]);
-    }
-
-    #[test]
-    fn stale_recording_row_becomes_interrupted_and_is_not_deleted() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("recordings");
-        fs::create_dir_all(root.join("recordings/2025/01/02")).unwrap();
-        let db = Database::in_memory().unwrap();
-        let started = DateTime::from_naive_utc_and_offset(
-            NaiveDateTime::new(
-                NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
-                NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
-            ),
-            Utc,
-        );
-        let relative = PathBuf::from("recordings/2025/01/02/20250102T090000.000Z_live.wav");
-        let segment = SegmentStarted {
-            id: "live".into(),
-            relative_path: relative.clone(),
-            started_at_utc: started,
-            capture_rate_hz: 48_000,
-            channels: 2,
-            sample_format: "S16_LE".into(),
-            channel_mapping: "stereo".into(),
-            time_quality: TimeQuality::Synced,
-            boot_id: "boot".into(),
-        };
-        db.insert_segment_started(&segment).unwrap();
-        // The stored path is `recording_dir`-relative and already begins with
-        // `recordings/`, so the file on disk is that path joined onto the root —
-        // exactly what `WavRecorder` and `get_audio` do.
-        let on_disk = root.join(&relative);
-        fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
-        let mut file = fs::File::create(&on_disk).unwrap();
-        write_header(&mut file, &WavFormat::new(48_000, 2).unwrap(), 0).unwrap();
-        drop(file);
-
-        let report = scan(&root, &db).unwrap();
-
-        assert_eq!(report.stale_recording, vec!["live".to_string()]);
-        assert_eq!(db.segment("live").unwrap().unwrap().status, "interrupted");
-        assert!(report.orphans.is_empty(), "a live row still owns its file");
+        assert!(!report.is_clean());
     }
 
     /// Writes a finished WAV at `root.join(relative)`: a 44-byte header that
@@ -532,49 +406,9 @@ mod tests {
         path
     }
 
-    fn started_at(hour: u32, minute: u32) -> DateTime<Utc> {
-        DateTime::from_naive_utc_and_offset(
-            NaiveDateTime::new(
-                NaiveDate::from_ymd_opt(2025, 1, 2).unwrap(),
-                NaiveTime::from_hms_opt(hour, minute, 0).unwrap(),
-            ),
-            Utc,
-        )
-    }
-
-    fn insert_row(db: &Database, id: &str, started: DateTime<Utc>, relative: &Path) {
-        db.insert_segment_started(&SegmentStarted {
-            id: id.into(),
-            relative_path: relative.to_path_buf(),
-            started_at_utc: started,
-            capture_rate_hz: 16_000,
-            channels: 1,
-            sample_format: "S16_LE".into(),
-            channel_mapping: "mono".into(),
-            time_quality: TimeQuality::Synced,
-            boot_id: "boot".into(),
-        })
-        .unwrap();
-        db.complete_segment(&crate::storage::SegmentCompleted {
-            id: id.into(),
-            ended_at_utc: started,
-            frame_count: 4,
-            size_bytes: 52,
-            end_reason: "duration".into(),
-            clock_drift_ppm: None,
-            xrun_count: 0,
-            gap_count: 0,
-            lost_frames_total: 0,
-            status: SegmentStatus::Complete,
-        })
-        .unwrap();
-    }
-
     /// The regression that matters: recovery and the recorder must agree on what
-    /// `recording_dir` means. When they did not, every row failed to match its
-    /// own file after a restart — rows went `missing`, files went `orphan`, and
-    /// the storage pool read 0 bytes because only `complete`/`interrupted` rows
-    /// are counted.
+    /// `recording_dir` means. When they did not, every row failed to match its own
+    /// file after a restart — rows looked missing and files looked orphaned.
     #[test]
     fn a_file_the_recorder_wrote_is_matched_to_its_row() {
         let dir = tempdir().unwrap();
@@ -582,10 +416,21 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let db = Database::in_memory().unwrap();
 
-        let started = started_at(3, 4);
-        let relative = crate::recorder::segment_relative_path(started, "seg-recorder");
+        let started = Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 0).unwrap();
+        let relative = crate::recorder::recording_relative_path(started, "rec-recorder");
         write_finished(&root, &relative, 8);
-        insert_row(&db, "seg-recorder", started, &relative);
+        db.insert_recording(&RecordingDraft {
+            id: "rec-recorder".into(),
+            relative_path: relative,
+            started_at_utc: started,
+            ended_at_utc: started + chrono::Duration::milliseconds(2),
+            capture_rate_hz: 16_000,
+            channels: 1,
+            frame_count: 4,
+            size_bytes: 52,
+            lost_frames: 0,
+        })
+        .unwrap();
 
         let report = scan(&root, &db).unwrap();
 
@@ -596,45 +441,6 @@ mod tests {
         );
         assert!(report.missing.is_empty(), "the row still owns its file");
         assert!(report.is_clean());
-        assert_eq!(
-            db.segment("seg-recorder").unwrap().unwrap().status,
-            "complete"
-        );
-    }
-
-    #[test]
-    fn a_row_marked_missing_is_restored_from_the_file_it_still_has() {
-        let dir = tempdir().unwrap();
-        let root = dir.path().join("recordings");
-        fs::create_dir_all(&root).unwrap();
-        let db = Database::in_memory().unwrap();
-
-        // Finalised file: the header accounts for the whole file.
-        let whole = started_at(5, 0);
-        let whole_relative = crate::recorder::segment_relative_path(whole, "seg-whole");
-        write_finished(&root, &whole_relative, 8);
-        insert_row(&db, "seg-whole", whole, &whole_relative);
-        db.mark_segment_status("seg-whole", SegmentStatus::Missing).unwrap();
-
-        // Same row, but the file was cut short after its header was patched: the
-        // tail is not there, so the honest answer is `interrupted`, not
-        // `complete`.
-        let cut = started_at(6, 0);
-        let cut_relative = crate::recorder::segment_relative_path(cut, "seg-cut");
-        let cut_path = write_finished(&root, &cut_relative, 8);
-        fs::write(&cut_path, vec![0u8; 44 + 4]).unwrap();
-        insert_row(&db, "seg-cut", cut, &cut_relative);
-        db.mark_segment_status("seg-cut", SegmentStatus::Missing).unwrap();
-
-        let report = scan(&root, &db).unwrap();
-
-        assert_eq!(
-            report.restored,
-            vec!["seg-whole".to_string(), "seg-cut".to_string()]
-        );
-        assert_eq!(db.segment("seg-whole").unwrap().unwrap().status, "complete");
-        assert_eq!(db.segment("seg-cut").unwrap().unwrap().status, "interrupted");
-        assert!(report.orphans.is_empty());
     }
 
     #[test]

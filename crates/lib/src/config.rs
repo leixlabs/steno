@@ -141,9 +141,10 @@ pub struct ServerConfig {
 pub struct SttConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// `"stream"` keeps one recogniser alive and feeds it audio continuously;
-    /// `"segment"` shells out per finished WAV. Streaming gives text while the
-    /// person is still talking and avoids one process launch per segment.
+    /// `"stream"` keeps one recogniser alive and feeds it audio continuously.
+    /// This is the only supported mode: `"segment"` (shelling out per finished
+    /// WAV) was removed, and validation refuses it by name rather than silently
+    /// transcribing nothing.
     #[serde(default = "default_stt_mode")]
     pub mode: SttMode,
     /// Launcher for the streaming sidecar. It is started once at boot and talks
@@ -163,23 +164,6 @@ pub struct SttConfig {
     /// default would silently transcribe the night in the wrong language.
     #[serde(default = "default_stt_locale")]
     pub locale: String,
-    /// Executable to run. It receives the WAV path as its last argument and
-    /// must print one JSON object on stdout (see `stt::Transcript`).
-    #[serde(default = "default_stt_command")]
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    /// Segments shorter than this are skipped: a 2-second clip rarely carries
-    /// speech and costs a full recogniser round trip.
-    #[serde(default = "default_stt_min_segment_seconds")]
-    pub min_segment_seconds: u64,
-    /// How often the worker looks for un-transcribed segments. The queue is the
-    /// database itself, so a crash simply resumes on the next pass.
-    #[serde(default = "default_stt_poll_interval_seconds")]
-    pub poll_interval_seconds: u64,
-    /// Give up on a single segment after this long.
-    #[serde(default = "default_stt_timeout_seconds")]
-    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -187,6 +171,8 @@ pub struct SttConfig {
 pub enum SttMode {
     #[default]
     Stream,
+    /// Removed. Kept in the enum so an old config file is refused with an
+    /// explanation instead of an "unknown variant" parse error.
     Segment,
 }
 
@@ -524,25 +510,27 @@ impl Default for SttConfig {
             stream_command: default_stt_stream_command(),
             socket_path: String::new(),
             engine: default_stt_engine(),
-            command: default_stt_command(),
-            args: Vec::new(),
             locale: default_stt_locale(),
-            min_segment_seconds: default_stt_min_segment_seconds(),
-            poll_interval_seconds: default_stt_poll_interval_seconds(),
-            timeout_seconds: default_stt_timeout_seconds(),
         }
     }
 }
 
 impl SttConfig {
     fn validate(&self, errors: &mut Vec<String>) {
+        // Refused whatever `enabled` says: a config that still names the old
+        // mode is describing a pipeline this binary does not have, and starting
+        // with it would record a silent night.
+        if self.mode == SttMode::Segment {
+            errors.push(
+                "stt.mode = \"segment\" 已移除：每条录音存在的理由就是它产生了文本或事件，没有\"事后补给\"的对象"
+                    .to_string(),
+            );
+            return;
+        }
         if !self.enabled {
             return;
         }
-        if self.mode == SttMode::Segment && self.command.trim().is_empty() {
-            errors.push("stt.command: must name an executable when stt.enabled is true".to_string());
-        }
-        if self.mode == SttMode::Stream && self.stream_command.trim().is_empty() {
+        if self.stream_command.trim().is_empty() {
             errors.push(
                 "stt.stream_command: must name a launcher when stt.mode = \"stream\"".to_string(),
             );
@@ -550,16 +538,10 @@ impl SttConfig {
         if self.engine.trim().is_empty() {
             errors.push("stt.engine: must be non-empty when stt.enabled is true".to_string());
         }
-        if self.mode == SttMode::Stream && self.locale.trim().is_empty() {
+        if self.locale.trim().is_empty() {
             errors.push(
                 "stt.locale: must name the recogniser language when stt.mode = \"stream\"".to_string(),
             );
-        }
-        if self.poll_interval_seconds == 0 {
-            errors.push("stt.poll_interval_seconds: must be at least 1".to_string());
-        }
-        if self.timeout_seconds == 0 {
-            errors.push("stt.timeout_seconds: must be at least 1".to_string());
         }
     }
 }
@@ -654,18 +636,6 @@ fn default_stt_locale() -> String {
 
 fn default_stt_engine() -> String {
     "apple-speechanalyzer".to_string()
-}
-fn default_stt_command() -> String {
-    "steno-stt-sidecar-file".to_string()
-}
-fn default_stt_min_segment_seconds() -> u64 {
-    3
-}
-fn default_stt_poll_interval_seconds() -> u64 {
-    20
-}
-fn default_stt_timeout_seconds() -> u64 {
-    120
 }
 fn default_device_rate_hz() -> u32 {
     16_000
@@ -1231,5 +1201,38 @@ mod control_tests {
         ))
         .expect_err("a zero timeout must not validate");
         assert!(error.to_string().contains("control.timeout_seconds"));
+    }
+}
+
+#[cfg(test)]
+mod stt_tests {
+    use super::*;
+
+    fn document(stt: &str) -> String {
+        format!(
+            "[storage]\nrecording_dir = \"/tmp/steno-stt-test\"\ndatabase_path = \"/tmp/steno-stt-test/app.db\"\n{stt}"
+        )
+    }
+
+    #[test]
+    fn segment_mode_is_refused_by_name_even_when_disabled() {
+        let error = Config::from_toml_str(&document("[stt]\nmode = \"segment\"\n"))
+            .expect_err("the removed mode must not load");
+        let message = error.to_string();
+        assert!(
+            message.contains("stt.mode = \"segment\" 已移除"),
+            "the refusal must say what happened, got: {message}"
+        );
+    }
+
+    #[test]
+    fn streaming_still_needs_a_launcher_and_a_locale() {
+        let error = Config::from_toml_str(&document(
+            "[stt]\nenabled = true\nstream_command = \"\"\nlocale = \"\"\n",
+        ))
+        .expect_err("an enabled recogniser with no launcher must not validate");
+        let message = error.to_string();
+        assert!(message.contains("stt.stream_command"), "got: {message}");
+        assert!(message.contains("stt.locale"), "got: {message}");
     }
 }

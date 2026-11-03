@@ -1,9 +1,15 @@
-// Transcriber: one `SpeechAnalyzer` session, driven by hand.
+// SpeechAnalyzerBackend: Apple's on-device recogniser, behind `TranscriptionBackend`.
 //
-// This is the whole of the speech conversion. Audio goes in, text comes out, and
-// nothing here decides *what* the audio means: no endpointing, no rotation, no
-// re-decoding. `SpeechAnalyzer` finalises its own results as audio flows — when
-// it says a phrase is final, that is the phrase, and it is forwarded unchanged.
+// This is the whole of the speech conversion for `--backend apple`. Audio goes
+// in, text comes out, and nothing here decides *what* the audio means: no
+// endpointing, no rotation, no re-decoding. `SpeechAnalyzer` finalises its own
+// results as audio flows — when it says a phrase is final, that is the phrase,
+// and it is forwarded unchanged.
+//
+// Everything this file knows that a backend must not know — the clock, the
+// socket, the snore lane — is above it: `AudioHub` feeds it, `TranscriptBridge`
+// places its results. What is left is the Apple-specific part: locale
+// resolution, the audio format the model wants, presets, assets.
 //
 // ## Why there is no stop condition
 //
@@ -32,6 +38,9 @@ import CoreMedia
 import Foundation
 import Speech
 
+/// Apple's knob, and only Apple's: `--preset` means nothing to another engine,
+/// which is why `Options` refuses it for any other backend instead of ignoring
+/// it.
 enum TranscriptionPreset: String, CaseIterable {
     /// Live: volatile results as the phrase forms. The streaming default.
     case progressiveTranscription
@@ -45,6 +54,15 @@ enum TranscriptionPreset: String, CaseIterable {
         }
     }
 
+    /// `.transcription` reports no volatile results, so the session should not
+    /// promise partials it will never see.
+    var emitsPartials: Bool {
+        switch self {
+        case .progressiveTranscription: return true
+        case .transcription: return false
+        }
+    }
+
     static func parse(_ raw: String) -> TranscriptionPreset? {
         TranscriptionPreset(rawValue: raw)
     }
@@ -54,7 +72,7 @@ enum TranscriptionPreset: String, CaseIterable {
     }
 }
 
-enum StudioError: Error, CustomStringConvertible {
+enum SpeechAnalyzerError: Error, CustomStringConvertible {
     case localeUnsupported(String, [String])
     case unavailable
     case audioFormat(String)
@@ -71,10 +89,10 @@ enum StudioError: Error, CustomStringConvertible {
     }
 }
 
-/// `@unchecked Sendable`: mutable state sits behind `stateLock`, `submit` is
-/// called from the hub's one queue and `handle` from the one results task, and
-/// `AsyncStream.Continuation` is itself thread-safe.
-final class Transcriber: AudioConsumer, @unchecked Sendable {
+/// `@unchecked Sendable`: `submit` is called from the hub's one queue and
+/// `handle` from the one results task, and the only state that crosses them is
+/// an `AsyncStream.Continuation`, which is itself thread-safe.
+final class SpeechAnalyzerBackend: TranscriptionBackend, @unchecked Sendable {
     let engine: String
     let language: String
 
@@ -83,30 +101,25 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
     private let input: AsyncStream<AnalyzerInput>
     private let continuation: AsyncStream<AnalyzerInput>.Continuation
     private let expectedFormat: AVAudioFormat
-    private let timeline: Timeline
-    private let sink: EventSink
-    /// Named in `ready` so the server can record which lane produced a snore
-    /// annotation, or that none did. Set by `Pipeline.make` before `start()`.
-    private var snoreLane: String?
+    private let target: TranscriptTarget
+    private let preset: TranscriptionPreset
 
     private var resultsTask: Task<Void, Never>?
-    private let stateLock = NSLock()
-    private var lastPartialText = ""
-    private var lastPartialAt = Date.distantPast
 
     var name: String { "transcriber(\(engine))" }
 
-    /// The format the recogniser asked for. The hub adopts it, so the two
-    /// consumers share one buffer layout instead of resampling independently.
-    var analysisFormat: AVAudioFormat { expectedFormat }
+    /// The format the recogniser asked for. The hub adopts it, so every consumer
+    /// shares one buffer layout instead of resampling independently.
+    var audioFormat: AVAudioFormat { expectedFormat }
 
-    /// Set before `start()`; travels on the `ready` frame so a stored
-    /// annotation can always name the lane that produced it.
-    func describeSnoreLane(_ name: String?) {
-        stateLock.lock()
-        snoreLane = name
-        stateLock.unlock()
+    /// Per phrase, always: `.audioTimeRange` is why the preset is time-indexed
+    /// (see the header), so a result that arrives without a placeable range
+    /// would be a contradiction, not a limitation.
+    static func capabilities(preset: TranscriptionPreset) -> BackendCapabilities {
+        BackendCapabilities(partials: preset.emitsPartials, timing: .phrase)
     }
+
+    var capabilities: BackendCapabilities { Self.capabilities(preset: preset) }
 
     private init(
         transcriber: SpeechTranscriber,
@@ -114,8 +127,8 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
         input: AsyncStream<AnalyzerInput>,
         continuation: AsyncStream<AnalyzerInput>.Continuation,
         expectedFormat: AVAudioFormat,
-        timeline: Timeline,
-        sink: EventSink,
+        preset: TranscriptionPreset,
+        target: TranscriptTarget,
         engine: String,
         language: String
     ) {
@@ -124,8 +137,8 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
         self.input = input
         self.continuation = continuation
         self.expectedFormat = expectedFormat
-        self.timeline = timeline
-        self.sink = sink
+        self.preset = preset
+        self.target = target
         self.engine = engine
         self.language = language
     }
@@ -136,28 +149,27 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
         localeIdentifier: String,
         engine: String,
         preset: TranscriptionPreset,
-        timeline: Timeline,
-        sink: EventSink
-    ) async throws -> Transcriber {
-        guard SpeechTranscriber.isAvailable else { throw StudioError.unavailable }
+        target: TranscriptTarget
+    ) async throws -> SpeechAnalyzerBackend {
+        guard SpeechTranscriber.isAvailable else { throw SpeechAnalyzerError.unavailable }
         let asked = Locale(identifier: localeIdentifier)
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: asked) else {
             let supported = await SpeechTranscriber.supportedLocales.prefix(12).map(\.identifier)
-            throw StudioError.localeUnsupported(localeIdentifier, Array(supported))
+            throw SpeechAnalyzerError.localeUnsupported(localeIdentifier, Array(supported))
         }
         let transcriber = SpeechTranscriber(locale: locale, preset: preset.speechPreset)
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
-            throw StudioError.audioFormat("no compatible format")
+            throw SpeechAnalyzerError.audioFormat("no compatible format")
         }
         // The hub is 16 kHz mono Int16 by construction. Anything else means the
         // model wants audio the recorder never produces, and resampling twice
         // (once to the hub, once to the model) is a second opinion about the
         // audio that nothing here is entitled to.
         guard format.sampleRate == 16_000, format.channelCount == 1 else {
-            throw StudioError.audioFormat("\(format.sampleRate) Hz \(format.channelCount) ch")
+            throw SpeechAnalyzerError.audioFormat("\(format.sampleRate) Hz \(format.channelCount) ch")
         }
         guard format.commonFormat == .pcmFormatInt16 else {
-            throw StudioError.audioFormat("sample format \(format.commonFormat.rawValue), not int16")
+            throw SpeechAnalyzerError.audioFormat("sample format \(format.commonFormat.rawValue), not int16")
         }
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         // Unbounded on purpose: dropping a block would break the frame↔clock map
@@ -165,14 +177,14 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
         // night, growing memory is the honest symptom; a hole in the timeline
         // would not be.
         let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
-        return Transcriber(
+        return SpeechAnalyzerBackend(
             transcriber: transcriber,
             analyzer: analyzer,
             input: stream,
             continuation: continuation,
             expectedFormat: format,
-            timeline: timeline,
-            sink: sink,
+            preset: preset,
+            target: target,
             engine: engine,
             language: locale.identifier
         )
@@ -185,7 +197,7 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
     /// loading, so nothing is lost to a slow start.
     func start(format: AVAudioFormat) throws {
         guard format == expectedFormat else {
-            throw StudioError.audioFormat("hub format \(format) but the model wants \(expectedFormat)")
+            throw SpeechAnalyzerError.audioFormat("hub format \(format) but the model wants \(expectedFormat)")
         }
         let analyzer = self.analyzer
         let input = self.input
@@ -193,22 +205,17 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
             do {
                 try await analyzer.start(inputSequence: input)
             } catch {
-                self?.sink.failed("analyser failed to start: \(error.localizedDescription)")
+                self?.target.failed("analyser failed to start: \(error.localizedDescription)")
                 return
             }
             guard let self else { return }
-            self.sink.ready(
-                engine: self.engine,
-                language: self.language,
-                locale: self.language,
-                snore: self.snoreLane
-            )
+            self.target.ready(engine: self.engine, language: self.language)
             do {
                 for try await result in self.transcriber.results {
                     self.handle(result)
                 }
             } catch {
-                self.sink.failed("results stream failed: \(error.localizedDescription)")
+                self.target.failed("results stream failed: \(error.localizedDescription)")
             }
         }
     }
@@ -236,40 +243,27 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
         do {
             try await analyzer.finalize(through: nil)
         } catch {
-            sink.failed("flush failed: \(error.localizedDescription)")
+            target.failed("flush failed: \(error.localizedDescription)")
         }
     }
 
     // MARK: - results
 
+    /// Frames, not milliseconds: `SpeechAnalyzer` timestamps run on its own
+    /// audio timeline, which starts at the first sample the hub fed it — the
+    /// same origin as the frame numbering `submit` was given. Turning that into
+    /// a wall clock is `TranscriptBridge`'s job.
     private func handle(_ result: SpeechTranscriber.Result) {
         let text = String(result.text.characters)
         logDebug("result final=\(result.isFinal) start=\(result.range.start.seconds) dur=\(result.range.duration.seconds) chars=\(text.count)")
-        let startFrame = frame(for: result.range.start)
-        let endFrame = frame(for: result.range.start) + Int64((result.range.duration.seconds * Double(Timeline.rate)).rounded())
-        let startMs = timeline.utcMs(forFrame: startFrame)
-        let endMs = timeline.utcMs(forFrame: max(endFrame, startFrame))
-
+        let start = frame(for: result.range.start)
+        let end = start + Int64((result.range.duration.seconds * Double(Timeline.rate)).rounded())
+        let frames = start..<max(end, start)
         if result.isFinal {
-            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            sink.final(text: text, startMs: startMs, endMs: max(endMs, startMs), engine: engine, language: language)
-            stateLock.lock()
-            lastPartialText = ""
-            stateLock.unlock()
-            return
+            target.final(text: text, frames: frames)
+        } else {
+            target.partial(text)
         }
-        guard !text.isEmpty else { return }
-        // Wire hygiene only: the portal fans every partial out over a broadcast
-        // channel, and a per-character rewording would fill it with duplicates.
-        stateLock.lock()
-        let now = Date()
-        let fresh = text != lastPartialText && now.timeIntervalSince(lastPartialAt) >= 0.2
-        if fresh {
-            lastPartialText = text
-            lastPartialAt = now
-        }
-        stateLock.unlock()
-        if fresh { sink.partial(text) }
     }
 
     private func frame(for time: CMTime) -> Int64 {
@@ -279,10 +273,14 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
     // MARK: - device questions
 
     /// Locale-independent report used by `--check`.
-    static func probe(localeIdentifier: String) async -> [String: Any] {
+    static func probe(localeIdentifier: String, preset: TranscriptionPreset) async -> [String: Any] {
         var report: [String: Any] = [
             "available": SpeechTranscriber.isAvailable,
             "locale_asked": localeIdentifier,
+            "preset": preset.rawValue,
+            // What a transcript from this configuration promises: phrase bounds,
+            // and partials only when the preset reports volatile results.
+            "capabilities": Self.capabilities(preset: preset).summary,
         ]
         let supported = await SpeechTranscriber.supportedLocales.map(\.identifier)
         report["supported_locales"] = supported.count
@@ -294,7 +292,7 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
             return report
         }
         report["locale_resolved"] = locale.identifier
-        let module = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
+        let module = SpeechTranscriber(locale: locale, preset: preset.speechPreset)
         switch await AssetInventory.status(forModules: [module]) {
         case .unsupported: report["assets"] = "unsupported"
         case .supported: report["assets"] = "supported"
@@ -309,11 +307,11 @@ final class Transcriber: AudioConsumer, @unchecked Sendable {
     /// Downloads the on-device model for a locale. Explicit, never implicit: a
     /// device with no asset must say so rather than quietly start a
     /// multi-hundred-megabyte download mid-night.
-    static func installAssets(localeIdentifier: String) async throws -> String {
+    static func installAssets(localeIdentifier: String, preset: TranscriptionPreset) async throws -> String {
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: localeIdentifier)) else {
-            throw StudioError.localeUnsupported(localeIdentifier, [])
+            throw SpeechAnalyzerError.localeUnsupported(localeIdentifier, [])
         }
-        let module = SpeechTranscriber(locale: locale, preset: .timeIndexedProgressiveTranscription)
+        let module = SpeechTranscriber(locale: locale, preset: preset.speechPreset)
         guard let request = try await AssetInventory.assetInstallationRequest(supporting: [module]) else {
             return "already installed: \(locale.identifier)"
         }

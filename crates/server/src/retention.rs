@@ -1,13 +1,14 @@
-//! Recording capacity accounting and safe oldest-complete deletion (TECH_SPEC §6,
+//! Recording capacity accounting and safe oldest-first deletion (TECH_SPEC §6,
 //! task T4.3).
 //!
-//! Only WAV files belonging to DB rows in `complete` state are candidates.
-//! `.partial` files and in-progress segments are never deleted. Every candidate
+//! Only WAV files belonging to `recordings` rows are candidates, oldest first.
+//! `.partial` files are never deleted — they are not rows yet. Every candidate
 //! path is normalized and checked to remain below the configured recordings root
-//! before unlinking; event rows and user review labels are intentionally retained.
+//! before unlinking; episodes and transcripts are intentionally retained (their
+//! `recording_id` is set to `NULL` by the schema).
 
 use steno_lib::error::{Error, Result};
-use crate::storage::{Database, SegmentRow, SegmentStatus};
+use crate::storage::{Database, RecordingRow};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -52,27 +53,30 @@ impl RetentionManager {
     }
 
     /// Checks configured quota and optionally actual filesystem free space. The
-    /// caller runs this at startup, after segment close and on the configured timer.
+    /// caller runs this at startup, after a recording closes and on the
+    /// configured timer.
     pub fn enforce(&self, db: &Database, free_bytes: Option<u64>) -> Result<RetentionReport> {
-        let mut measured = self.measure_recording_files()?;
+        let mut measured = self.bytes_of_recordings()?;
         let mut removed = 0u64;
         let mut deleted_ids = Vec::new();
         let mut failed_ids = Vec::new();
 
         if measured > self.config.max_bytes {
-            for segment in db.list_segments_for_retention()? {
+            // `recordings_oldest_first` is ordered by `started_at_utc`, so the
+            // oldest night is reclaimed first and the newest audio survives.
+            for recording in db.recordings_oldest_first()? {
                 if measured <= self.config.cleanup_target_bytes {
                     break;
                 }
-                match self.delete_complete_segment(db, &segment) {
+                match self.delete_recording(db, &recording) {
                     Ok(size) => {
                         removed = removed.saturating_add(size);
                         measured = measured.saturating_sub(size);
-                        deleted_ids.push(segment.id);
+                        deleted_ids.push(recording.id);
                     }
                     Err(error) => {
-                        tracing::warn!(segment_id = %segment.id, error = %error, "retention could not delete candidate; trying next complete segment");
-                        failed_ids.push(segment.id);
+                        tracing::warn!(recording_id = %recording.id, error = %error, "retention could not delete candidate; trying the next recording");
+                        failed_ids.push(recording.id);
                     }
                 }
             }
@@ -97,7 +101,7 @@ impl RetentionManager {
 
     /// Counts WAV and `.partial` files under the recordings tree; excludes DB and
     /// logs per TECH_SPEC §6. Symlinks are ignored instead of followed.
-    pub fn measure_recording_files(&self) -> Result<u64> {
+    pub fn bytes_of_recordings(&self) -> Result<u64> {
         if !self.root.exists() {
             return Ok(0);
         }
@@ -123,11 +127,8 @@ impl RetentionManager {
         Ok(total)
     }
 
-    fn delete_complete_segment(&self, db: &Database, segment: &SegmentRow) -> Result<u64> {
-        if segment.status != SegmentStatus::Complete.as_str() {
-            return Err(Error::Storage(format!("refusing to delete non-complete segment {}", segment.id)));
-        }
-        let relative = Path::new(&segment.relative_path);
+    fn delete_recording(&self, db: &Database, recording: &RecordingRow) -> Result<u64> {
+        let relative = recording.relative_path.as_path();
         validate_db_relative_path(relative)?;
         let canonical_root = self.root.canonicalize().map_err(|e| Error::io(&self.root, e))?;
         let candidate = self.root.join(relative);
@@ -135,12 +136,12 @@ impl RetentionManager {
         if !canonical_file.starts_with(&canonical_root) {
             return Err(Error::Storage(format!("recording path escapes configured root: {}", canonical_file.display())));
         }
-        let database_path_matches = db
-            .segment(&segment.id)?
-            .is_some_and(|current| current.relative_path == segment.relative_path);
-        if !database_path_matches {
+        let still_current = db
+            .recording(&recording.id)?
+            .is_some_and(|current| current.relative_path == recording.relative_path);
+        if !still_current {
             // DB state/path may have changed since the oldest-candidate query.
-            return Err(Error::Storage(format!("segment {} no longer has matching DB identity", segment.id)));
+            return Err(Error::Storage(format!("recording {} no longer has a matching DB identity", recording.id)));
         }
         let metadata = fs::metadata(&canonical_file).map_err(|e| Error::io(&canonical_file, e))?;
         if !metadata.is_file() || !is_recording_file(&canonical_file) {
@@ -148,7 +149,9 @@ impl RetentionManager {
         }
         let size = metadata.len();
         fs::remove_file(&canonical_file).map_err(|e| Error::io(&canonical_file, e))?;
-        db.mark_segment_status(&segment.id, SegmentStatus::Deleted)?;
+        // Episodes and transcripts keep their rows; the schema sets their
+        // `recording_id` to NULL, so the annotation outlives the audio.
+        db.delete_recording(&recording.id)?;
         Ok(size)
     }
 }
@@ -177,8 +180,7 @@ pub fn validate_db_relative_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Database, SegmentStarted, SegmentCompleted, SegmentStatus};
-    use steno_lib::timeline::TimeQuality;
+    use crate::storage::{Database, RecordingDraft};
     use chrono::{TimeZone, Utc};
     use std::io::Write;
     use tempfile::tempdir;
@@ -187,17 +189,12 @@ mod tests {
         RetentionConfig { max_bytes: 1_000, cleanup_target_bytes: 500, reserve_bytes: 100 }
     }
 
-    fn add_segment(db: &Database, id: &str, rel: &str, when: i64, size: u64) {
+    fn add_recording(db: &Database, id: &str, rel: &str, when: i64, size: u64) {
         let started = Utc.timestamp_opt(when, 0).single().unwrap();
-        db.insert_segment_started(&SegmentStarted {
+        db.insert_recording(&RecordingDraft {
             id: id.into(), relative_path: PathBuf::from(rel), started_at_utc: started,
-            capture_rate_hz: 16_000, channels: 1, sample_format: "S16_LE".into(),
-            channel_mapping: "mono:0".into(), time_quality: TimeQuality::Synced, boot_id: "boot".into(),
-        }).unwrap();
-        db.complete_segment(&SegmentCompleted {
-            id: id.into(), ended_at_utc: started + chrono::Duration::hours(1), frame_count: 0,
-            size_bytes: size, end_reason: "duration".into(), clock_drift_ppm: None,
-            xrun_count: 0, gap_count: 0, lost_frames_total: 0, status: SegmentStatus::Complete,
+            ended_at_utc: started + chrono::Duration::hours(1), capture_rate_hz: 16_000,
+            channels: 1, frame_count: 0, size_bytes: size, lost_frames: 0,
         }).unwrap();
     }
 
@@ -209,17 +206,27 @@ mod tests {
     }
 
     #[test]
-    fn deletes_oldest_complete_only_and_keeps_event_rows() {
+    fn deletes_oldest_recordings_only_and_keeps_episode_rows() {
         let dir = tempdir().unwrap();
         let root = dir.path().join("recordings");
         fs::create_dir_all(&root).unwrap();
         let db = Database::in_memory().unwrap();
-        add_segment(&db, "old", "2025/01/01/old.wav", 100, 300);
-        add_segment(&db, "new", "2025/01/01/new.wav", 200, 300);
-        add_segment(&db, "active", "2025/01/01/live.wav", 300, 500);
-        db.connection().execute("UPDATE recording_segments SET status='recording' WHERE id='active'", []).unwrap();
+        add_recording(&db, "old", "2025/01/01/old.wav", 100, 300);
+        add_recording(&db, "new", "2025/01/01/new.wav", 200, 300);
+        db.insert_episode(&crate::storage::EpisodeRow {
+            id: "ep".into(),
+            recording_id: Some("old".into()),
+            started_at_utc: Utc.timestamp_opt(150, 0).single().unwrap(),
+            ended_at_utc: Utc.timestamp_opt(160, 0).single().unwrap(),
+            source: "rule-v1".into(),
+            label: None,
+            confidence: Some(0.6),
+            review_status: crate::storage::ReviewStatus::Snore,
+            created_at_utc: Utc.timestamp_opt(150, 0).single().unwrap(),
+        }).unwrap();
         make_file(&root, "2025/01/01/old.wav", 300);
         make_file(&root, "2025/01/01/new.wav", 300);
+        // In flight: no row, so it counts toward quota but is never a candidate.
         make_file(&root, "2025/01/01/live.wav.partial", 500);
         let mut cfg = config();
         cfg.max_bytes = 900;
@@ -232,7 +239,11 @@ mod tests {
         assert!(!root.join("2025/01/01/old.wav").exists());
         assert!(!root.join("2025/01/01/new.wav").exists());
         assert!(root.join("2025/01/01/live.wav.partial").exists());
-        assert_eq!(db.segment("old").unwrap().unwrap().status, "deleted");
+        assert!(db.recording("old").unwrap().is_none());
+        // The annotation survives its audio; only the pointer is cleared.
+        let episode = db.episode("ep").unwrap().expect("episode stays");
+        assert_eq!(episode.recording_id, None);
+        assert_eq!(episode.review_status, crate::storage::ReviewStatus::Snore);
     }
 
     #[test]

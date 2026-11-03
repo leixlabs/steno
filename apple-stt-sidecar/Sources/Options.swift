@@ -9,6 +9,11 @@
 //   --mode stdin                         raw PCM, no framing (`--stream`)
 //   --mode check | install               what this machine can do
 //
+// And one choice that is not a mode, because it applies to all of them:
+// `--backend apple|audiocpp` picks the recogniser. Everything else here is an
+// obligation of the whole program, so it stays common; a flag only one backend
+// understands (`--preset`) is refused for the others rather than ignored.
+//
 // An unknown flag or an unknown value is an error, never a hint. A typo that
 // silently turns into a different night of recording is the one failure mode
 // this file exists to prevent.
@@ -29,8 +34,9 @@ struct Options {
     }
 
     var mode: Mode
+    var backend: BackendID = .apple
     var locale = "zh-CN"
-    var engine = "apple-speechanalyzer"
+    var engine = BackendID.apple.defaultEngine
     var preset: TranscriptionPreset = .progressiveTranscription
     var format: OutputFormat = .text
     var out: String?
@@ -53,7 +59,8 @@ struct Options {
            steno-stt-sidecar --stream [--sample-rate 16000] [--channels 1]
            steno-stt-sidecar --check | --install-assets
 
-           [--locale zh-CN] [--engine apple-speechanalyzer]
+           [--backend apple] [--engine apple-speechanalyzer]
+           [--locale zh-CN]
            [--preset progressiveTranscription|transcription]
            [--snore | --no-snore] [--snore-threshold 0.7] [--snore-window 3.0]
            [--snore-model <mlmodel|mlmodelc>] [--snore-label snoring]
@@ -64,9 +71,14 @@ struct Options {
 
     static func parse(_ arguments: [String]) -> Options? {
         var mode: Mode?
+        var backend: BackendID = .apple
         var locale = "zh-CN"
-        var engine = "apple-speechanalyzer"
+        // `nil` until the flag or the end of parsing decides: the default is the
+        // selected backend's own label, so `--backend` alone cannot leave the
+        // wire claiming Apple produced an audio.cpp transcript.
+        var engine: String?
         var preset: TranscriptionPreset = .progressiveTranscription
+        var presetGiven = false
         var format: OutputFormat?
         var out: String?
         var rate: Double = 16_000
@@ -136,6 +148,12 @@ struct Options {
             case "--locale", "-l":
                 guard let value = next("--locale") else { return nil }
                 locale = value
+            case "--backend":
+                guard let value = next("--backend") else { return nil }
+                guard let parsed = BackendID(rawValue: value) else {
+                    return fail("unknown --backend \(value); expected \(BackendID.known)")
+                }
+                backend = parsed
             case "--engine":
                 guard let value = next("--engine") else { return nil }
                 engine = value
@@ -145,6 +163,7 @@ struct Options {
                     return fail("unknown --preset \(value); expected \(TranscriptionPreset.known)")
                 }
                 preset = parsed
+                presetGiven = true
             case "--sample-rate":
                 guard let value = next("--sample-rate"), let parsed = Double(value), parsed > 0 else {
                     return fail("--sample-rate needs a positive number")
@@ -230,10 +249,18 @@ struct Options {
         var resolvedFormat = format ?? .text
         if case .file = resolved, format == nil { resolvedFormat = .json }
 
+        // A preset is `SpeechTranscriber`'s reporting style. No other backend has
+        // one, and accepting the flag would leave the operator believing it took
+        // effect on a transcript that is formatted by somebody else's engine.
+        if presetGiven, backend != .apple {
+            return fail("--preset only applies to --backend apple; \(backend.rawValue) has no presets")
+        }
+
         return Options(
             mode: resolved,
+            backend: backend,
             locale: locale,
-            engine: engine,
+            engine: engine ?? backend.defaultEngine,
             preset: preset,
             format: resolvedFormat,
             out: out,

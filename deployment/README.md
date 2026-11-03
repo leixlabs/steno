@@ -46,11 +46,19 @@ the service writes to the root filesystem and loses the night on reboot.
 ## Node (the bedside Pi)
 
 One command, which cross-builds, copies the binary and the unit, keeps the
-existing `[archive]` / `[gate]` sections of `node.toml`, then restarts:
+existing `[archive]` / `[gate]` sections of `node.toml`, enables the unit at boot,
+then restarts:
 
 ```sh
 tools/deploy-node.sh
+tools/deploy-node.sh --no-enable   # deploy only; leave the boot state alone
 ```
+
+Enable-at-boot is the default because a capture node that does not come back
+after a power cut records exactly one night. The deploy reads
+`systemctl is-enabled` back and fails if it is not `enabled`; it enables and
+restarts as two steps, since `enable --now` would leave an already-running node
+executing the binary it just replaced.
 
 `deployment/systemd/steno-node.service` is what it installs. The service account
 must be in the `audio` group, or ALSA only exposes the null device.

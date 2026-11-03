@@ -1,34 +1,31 @@
 //! Asynchronous single-owner SQLite writer (TECH_SPEC §4.3/§7, task T4.2).
 //!
-//! Capture and DSP workers send commands; only this thread owns `Database` and
-//! executes writes. Events that race ahead of `SegmentStarted` are retried rather
-//! than dropped or allowed to crash the detector.
+//! Capture, detection and transcription workers send commands; only this thread
+//! owns `Database` and executes writes. There is no foreign-key retry loop any
+//! more: an episode or a transcript may legitimately point at no recording (the
+//! audio may have been rotated away, or the file may not have closed yet), so the
+//! rows no longer depend on each other's arrival order.
 
-use steno_lib::detector::EventDraft;
-use steno_lib::error::Result;
-use crate::storage::{Database, SegmentCompleted, SegmentStarted};
-use steno_lib::timeline::GapRecord;
+use crate::storage::{Database, EpisodeRow, RecordingDraft};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const FK_RETRY_LIMIT: usize = 8;
-const FK_RETRY_PAUSE: Duration = Duration::from_millis(100);
-
 #[derive(Debug)]
 pub enum DbCommand {
-    SegmentStarted(SegmentStarted),
-    SegmentCompleted(SegmentCompleted),
-    Gap { segment_id: String, gap: GapRecord },
-    Event(EventDraft),
+    /// A finished file for the `recordings` table.
+    Recording(RecordingDraft),
+    /// A snore for the `episodes` table, from either detector.
+    Episode(EpisodeRow),
     Flush(Sender<()>),
+    /// How many annotations fall inside a window. Asked by the recorder when it
+    /// closes a file, to decide whether the file is worth keeping.
+    CountBetween {
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+        ack: Sender<u64>,
+    },
     Shutdown,
-}
-
-impl DbCommand {
-    pub fn is_control(&self) -> bool {
-        !matches!(self, DbCommand::Event(_) | DbCommand::Gap { .. })
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -41,20 +38,24 @@ impl DbWriterHandle {
         self.tx.send(command).map_err(|_| "database writer has stopped".to_string())
     }
 
-    pub fn segment_started(&self, segment: SegmentStarted) -> std::result::Result<(), String> {
-        self.send(DbCommand::SegmentStarted(segment))
+    pub fn recording(&self, recording: RecordingDraft) -> std::result::Result<(), String> {
+        self.send(DbCommand::Recording(recording))
     }
 
-    pub fn segment_completed(&self, segment: SegmentCompleted) -> std::result::Result<(), String> {
-        self.send(DbCommand::SegmentCompleted(segment))
+    pub fn episode(&self, episode: EpisodeRow) -> std::result::Result<(), String> {
+        self.send(DbCommand::Episode(episode))
     }
 
-    pub fn gap(&self, segment_id: impl Into<String>, gap: GapRecord) -> std::result::Result<(), String> {
-        self.send(DbCommand::Gap { segment_id: segment_id.into(), gap })
-    }
-
-    pub fn event(&self, event: EventDraft) -> std::result::Result<(), String> {
-        self.send(DbCommand::Event(event))
+    /// Counts the annotations inside a window, synchronously.
+    pub fn count_between(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+        timeout: Duration,
+    ) -> Option<u64> {
+        let (ack, rx) = mpsc::channel();
+        self.tx.send(DbCommand::CountBetween { from, to, ack }).ok()?;
+        rx.recv_timeout(timeout).ok()
     }
 
     /// Waits until all commands enqueued before this call have been applied.
@@ -101,159 +102,107 @@ impl DbWriter {
 }
 
 fn run_writer(database: Database, rx: Receiver<DbCommand>, on_error: impl Fn(String)) {
-    let mut retry_events: Vec<EventDraft> = Vec::new();
     while let Ok(command) = rx.recv() {
         match command {
-            DbCommand::SegmentStarted(segment) => {
-                if let Err(error) = database.insert_segment_started(&segment) {
-                    on_error(format!("segment start write failed: {error}"));
-                }
-                retry_fk_events(&database, &mut retry_events, &on_error);
-            }
-            DbCommand::SegmentCompleted(segment) => {
-                if let Err(error) = database.complete_segment(&segment) {
-                    on_error(format!("segment completion write failed: {error}"));
+            DbCommand::Recording(recording) => {
+                if let Err(error) = database.insert_recording(&recording) {
+                    on_error(format!(
+                        "recording write failed for {}: {error}",
+                        recording.id
+                    ));
                 }
             }
-            DbCommand::Gap { segment_id, gap } => {
-                if let Err(error) = database.insert_gap(&segment_id, &gap) {
-                    on_error(format!("gap write failed for segment {segment_id}: {error}"));
+            DbCommand::Episode(episode) => {
+                if let Err(error) = database.insert_episode(&episode) {
+                    on_error(format!("episode write failed for {}: {error}", episode.id));
                 }
             }
-            DbCommand::Event(event) => match database.insert_event(&event) {
-                Ok(()) => {}
-                Err(error) if is_foreign_key_error(&error) => {
-                    retry_events.push(event);
-                }
-                Err(error) => on_error(format!("event write failed: {error}")),
-            },
+            DbCommand::CountBetween { from, to, ack } => {
+                let count = database.count_annotations(from, to).unwrap_or(0);
+                let _ = ack.send(count);
+            }
             DbCommand::Flush(ack) => {
-                retry_fk_events(&database, &mut retry_events, &on_error);
                 let _ = ack.send(());
             }
-            DbCommand::Shutdown => {
-                retry_fk_events(&database, &mut retry_events, &on_error);
-                if !retry_events.is_empty() {
-                    on_error(format!("{} event(s) remain retryable at shutdown", retry_events.len()));
-                }
-                break;
-            }
+            DbCommand::Shutdown => break,
         }
-    }
-}
-
-fn retry_fk_events(database: &Database, pending: &mut Vec<EventDraft>, on_error: &impl Fn(String)) {
-    if pending.is_empty() {
-        return;
-    }
-    let mut remaining = Vec::with_capacity(pending.len());
-    for event in pending.drain(..) {
-        let mut inserted = false;
-        for attempt in 0..FK_RETRY_LIMIT {
-            match database.insert_event(&event) {
-                Ok(()) => {
-                    inserted = true;
-                    break;
-                }
-                Err(error) if is_foreign_key_error(&error) => {
-                    if attempt + 1 < FK_RETRY_LIMIT {
-                        thread::sleep(FK_RETRY_PAUSE);
-                    }
-                }
-                Err(error) => {
-                    on_error(format!("event {} retry failed: {error}", event.id));
-                    break;
-                }
-            }
-        }
-        if !inserted {
-            remaining.push(event);
-        }
-    }
-    *pending = remaining;
-}
-
-fn is_foreign_key_error(error: &steno_lib::error::Error) -> bool {
-    match error {
-        steno_lib::error::Error::Db(rusqlite::Error::SqliteFailure(code, _)) => {
-            code.code == rusqlite::ErrorCode::ConstraintViolation
-        }
-        _ => false,
-    }
-}
-
-/// Helper for synchronous setup paths that need to fail immediately.
-pub fn apply(database: &Database, command: DbCommand) -> Result<()> {
-    match command {
-        DbCommand::SegmentStarted(s) => database.insert_segment_started(&s),
-        DbCommand::SegmentCompleted(s) => database.complete_segment(&s),
-        DbCommand::Gap { segment_id, gap } => database.insert_gap(&segment_id, &gap),
-        DbCommand::Event(e) => database.insert_event(&e),
-        DbCommand::Flush(_) | DbCommand::Shutdown => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{SegmentStarted, SegmentStatus};
-    use steno_lib::timeline::TimeQuality;
+    use crate::storage::{EpisodeRow, ReviewStatus};
     use chrono::Utc;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    fn segment(id: &str) -> SegmentStarted {
-        SegmentStarted {
-            id: id.into(), relative_path: PathBuf::from(format!("{id}.wav")), started_at_utc: Utc::now(),
-            capture_rate_hz: 16_000, channels: 1, sample_format: "S16_LE".into(),
-            channel_mapping: "mono:0".into(), time_quality: TimeQuality::Synced, boot_id: "boot".into(),
+    fn recording(id: &str) -> RecordingDraft {
+        RecordingDraft {
+            id: id.into(),
+            relative_path: PathBuf::from(format!("2025/01/01/{id}.wav")),
+            started_at_utc: Utc::now(),
+            ended_at_utc: Utc::now(),
+            capture_rate_hz: 16_000,
+            channels: 1,
+            frame_count: 16_000,
+            size_bytes: 32_044,
+            lost_frames: 0,
         }
     }
 
-    fn event() -> EventDraft {
-        EventDraft {
-            id: "evt".into(), segment_id: "seg".into(), start_offset_frames: 0, end_offset_frames: 1_600,
-            started_at_utc: Utc::now(), ended_at_utc: Utc::now(), duration_ms: 100, rule_score: None,
-            detector_version: "rule-v1".into(), peak_dbfs: None, mean_level_dbfs: None,
-            mean_band_ratio: None, noise_floor_dbfs: None, end_reason: steno_lib::detector::EndReason::Normal,
-            continued: false,
+    fn episode(id: &str) -> EpisodeRow {
+        let now = Utc::now();
+        EpisodeRow {
+            id: id.into(),
+            recording_id: None,
+            started_at_utc: now,
+            ended_at_utc: now,
+            source: "rule-v1".into(),
+            label: None,
+            confidence: Some(0.8),
+            review_status: ReviewStatus::Unreviewed,
+            created_at_utc: now,
         }
     }
 
     #[test]
-    fn writer_orders_segment_before_event_and_flushes() {
-        let db = Database::in_memory().unwrap();
+    fn writer_applies_recordings_and_episodes_and_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        // Two connections to one file, exactly as `main.rs` wires the writer and
+        // the HTTP side.
+        let writer_db = Database::open(&path).unwrap();
+        let reader = Database::open(&path).unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errors_for_cb = Arc::clone(&errors);
-        let writer = DbWriter::spawn(db, move |error| errors_for_cb.lock().unwrap().push(error));
+        let writer = DbWriter::spawn(writer_db, move |error| errors_for_cb.lock().unwrap().push(error));
         let handle = writer.handle();
-        handle.event(event()).unwrap();
-        handle.segment_started(segment("seg")).unwrap();
+        // An episode may be written before the file that carries it closes.
+        handle.episode(episode("evt")).unwrap();
+        handle.recording(recording("rec")).unwrap();
         assert!(handle.flush(Duration::from_secs(2)));
+        assert!(reader.recording("rec").unwrap().is_some(), "the flush must cover the recording");
+        assert!(reader.episode("evt").unwrap().is_some(), "the flush must cover the episode");
         assert!(writer.shutdown(Duration::from_secs(2)));
         assert!(errors.lock().unwrap().is_empty(), "writer errors: {:?}", *errors.lock().unwrap());
     }
 
     #[test]
-    fn event_foreign_key_retry_is_visible_and_retained_until_segment_arrives() {
+    fn a_failed_write_is_reported_instead_of_being_dropped() {
         let db = Database::in_memory().unwrap();
         let errors = Arc::new(Mutex::new(Vec::new()));
         let errors_for_cb = Arc::clone(&errors);
         let writer = DbWriter::spawn(db, move |error| errors_for_cb.lock().unwrap().push(error));
         let handle = writer.handle();
-        handle.event(event()).unwrap();
-        // Command ordering guarantees the event attempt occurs first; the writer
-        // will retry after this SegmentStarted control message arrives.
-        handle.segment_started(segment("seg")).unwrap();
+        // The schema refuses an unknown source; the writer must say so.
+        let mut bad = episode("bad");
+        bad.source = "unknown".into();
+        handle.episode(bad).unwrap();
         assert!(handle.flush(Duration::from_secs(2)));
         assert!(writer.shutdown(Duration::from_secs(2)));
-        assert!(errors.lock().unwrap().is_empty(), "writer errors: {:?}", *errors.lock().unwrap());
-    }
-
-    #[test]
-    fn db_command_control_classification_is_explicit() {
-        assert!(!DbCommand::Event(event()).is_control());
-        assert!(DbCommand::SegmentStarted(segment("seg")).is_control());
-        let _ = SegmentStatus::Recording;
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 1, "one refusal, one report: {errors:?}");
+        assert!(errors[0].contains("episode write failed for bad"), "{errors:?}");
     }
 }

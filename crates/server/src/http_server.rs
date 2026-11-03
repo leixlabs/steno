@@ -33,7 +33,7 @@
 //!   an `Arc<Mutex<Database>>`. Every lock is taken and released inside a
 //!   synchronous helper; no guard is ever held across an `.await`.
 //! * Audio bytes are streamed from the file in [`AUDIO_CHUNK_BYTES`] chunks with
-//!   `tokio::fs`, so a long playback request never loads a whole segment into
+//!   `tokio::fs`, so a long playback request never loads a whole recording into
 //!   memory and never touches an audio thread.
 //! * The playback path comes only from the database `relative_path` joined to
 //!   `storage.recording_dir`. Request data never contributes path components.
@@ -49,14 +49,14 @@
 //! well-formed range that selects no byte (start past the end, `-0`, any range
 //! on an empty file) is answered with `416`.
 
-use steno_lib::config::{Config, ServerConfig, SourceKind, SttMode};
+use steno_lib::config::{Config, ServerConfig, SourceKind};
 use steno_lib::error::{Error, Result};
 use steno_lib::metrics::Metrics;
 use crate::control::{self, Action, Target};
 use crate::transcript_hub::{TranscriptEvent, TranscriptHub};
 use crate::recorder::validate_relative_path;
-use crate::storage::{TranscriptRow, local_day_range, parse_date, Database, EventRow, ReviewStatus, SegmentRow};
-use steno_lib::timeline::{GapRecord, TimeQuality};
+use crate::storage::{local_day_range, parse_date, Database, EpisodeRow, RecordingRow, ReviewStatus};
+use steno_lib::timeline::TimeQuality;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -67,7 +67,6 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -464,16 +463,14 @@ pub fn router(state: Arc<HttpState>) -> Router {
         .route("/{*path}", get(portal_asset))
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/days", get(get_days))
-        .route("/api/v1/segments", get(get_segments))
-        .route("/api/v1/segments/{id}/gaps", get(get_gaps))
-        .route("/api/v1/segments/{id}/audio", get(get_audio))
+        .route("/api/v1/recordings", get(get_recordings))
+        .route("/api/v1/recordings/{id}/audio", get(get_audio))
         .route("/api/v1/transcripts", get(get_transcripts))
         .route("/api/v1/utterances", get(get_utterances))
         // Live transcript. WebSocket rather than SSE because it is the same
         // origin, the same cookies, and one bidirectional socket is enough; the
         // client never sends anything after the upgrade (see `stream_transcript`).
         .route("/api/v1/transcript", get(stream_transcript))
-        .route("/api/v1/segments/{id}/transcript", get(get_segment_transcript))
         .route("/api/v1/events", get(get_events))
         .route("/api/v1/events/{id}", get(get_event).patch(patch_event))
         // The only endpoint that changes machine state; see the `control` module
@@ -597,7 +594,7 @@ fn required_date(
 #[derive(Debug, Serialize)]
 struct StatusView {
     service: ServiceView,
-    recording: RecordingView,
+    recording: RecordingStateView,
     microphone: MicrophoneView,
     detector: DetectorView,
     storage: StorageView,
@@ -615,14 +612,13 @@ struct StatusView {
 ///
 /// `enabled` / `mode` / `state` exist because `connected` alone cannot be read
 /// by a client: it is `false` when transcription was never switched on and also
-/// when it is switched on but the recogniser has not attached yet, and it stays
-/// `false` forever under `mode = "segment"` where there is no live channel at
-/// all. Those two cases must not look the same in the Portal.
+/// when it is switched on but the recogniser has not attached yet. Those two
+/// cases must not look the same in the Portal.
 #[derive(Debug, Serialize)]
 struct SttView {
     enabled: bool,
     mode: &'static str,
-    /// One of `off`, `starting`, `ready`, `segment`, `error`.
+    /// One of `off`, `starting`, `ready`, `error`.
     state: &'static str,
     connected: bool,
     engine: String,
@@ -662,11 +658,6 @@ fn stt_state(config: &Config, connected: bool, error: Option<&str>) -> &'static 
     if error.is_some() {
         return "error";
     }
-    // Per-segment transcription has no long-lived channel, so `connected` is
-    // meaningless there and must not be rendered as a fault.
-    if config.stt.mode == SttMode::Segment {
-        return "segment";
-    }
     if connected { "ready" } else { "starting" }
 }
 
@@ -698,7 +689,7 @@ impl From<LaunchInfo> for LaunchView {
 }
 
 #[derive(Debug, Serialize)]
-struct RecordingView {
+struct RecordingStateView {
     state: &'static str,
 }
 
@@ -728,9 +719,12 @@ struct DetectorView {
 
 #[derive(Debug, Serialize)]
 struct StorageView {
-    /// `None` when the database could not answer. Reporting `0` would read as
-    /// "this pool is empty", which is a different and more alarming claim.
-    used_bytes: Option<u64>,
+    /// Bytes in the `recordings` table. `None` when the database could not
+    /// answer. Reporting `0` would read as "this pool is empty", which is a
+    /// different and more alarming claim.
+    bytes: Option<u64>,
+    /// Rows the byte total is made of.
+    recordings: Option<u64>,
     max_bytes: u64,
     /// What retention deletes down to (must stay below `max_bytes`).
     cleanup_target_bytes: u64,
@@ -739,10 +733,6 @@ struct StorageView {
     free_bytes: Option<u64>,
     recording_dir: String,
     storage_pressure: bool,
-    /// Complete/interrupted segments the byte total is made of.
-    segment_count: Option<u64>,
-    oldest_started_at_utc: Option<DateTime<Utc>>,
-    newest_ended_at_utc: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -873,7 +863,7 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                 last_error: metrics.last_error(),
                 launch: state.runtime.launch().map(LaunchView::from),
             },
-            recording: RecordingView {
+            recording: RecordingStateView {
                 state: state.runtime.recording().as_str(),
             },
             microphone: MicrophoneView {
@@ -894,16 +884,14 @@ async fn get_status(State(state): State<Arc<HttpState>>) -> Response {
                 event_fk_retries: metrics.event_fk_retries.load(Ordering::Relaxed),
             },
             storage: StorageView {
-                used_bytes: pool.as_ref().map(|pool| pool.used_bytes),
+                bytes: pool.map(|pool| pool.bytes),
+                recordings: pool.map(|pool| pool.recordings),
                 max_bytes: state.config.storage.recording_max_bytes,
                 cleanup_target_bytes: state.config.storage.recording_cleanup_target_bytes,
                 reserve_bytes: state.config.storage.recording_reserve_bytes,
                 free_bytes: free_bytes(&state.config.storage.recording_dir),
                 recording_dir: state.config.storage.recording_dir.display().to_string(),
                 storage_pressure: metrics.storage_pressure.load(Ordering::Relaxed),
-                segment_count: pool.as_ref().map(|pool| pool.segment_count),
-                oldest_started_at_utc: pool.as_ref().and_then(|pool| pool.oldest_started_at_utc),
-                newest_ended_at_utc: pool.as_ref().and_then(|pool| pool.newest_ended_at_utc),
             },
             capture: CaptureView {
                 level_peak_dbfs: level.map(|(level, _)| level),
@@ -1022,58 +1010,37 @@ fn free_bytes(_path: &Path) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-struct SegmentView {
+struct RecordingView {
     id: String,
     started_at_utc: DateTime<Utc>,
-    ended_at_utc: Option<DateTime<Utc>>,
+    ended_at_utc: DateTime<Utc>,
     capture_rate_hz: u32,
     channels: u16,
-    sample_format: String,
     frame_count: u64,
     size_bytes: u64,
     duration_ms: u64,
-    status: String,
-    time_quality: String,
-    end_reason: Option<String>,
-    lost_frames_total: u64,
-    gap_count: u64,
-    xrun_count: u64,
-    clock_drift_ppm: Option<f64>,
+    lost_frames: u64,
     audio_url: String,
 }
 
 #[derive(Debug, Serialize)]
-struct EventView {
+struct EpisodeView {
     id: String,
-    segment_id: String,
-    capture_rate_hz: u32,
-    start_offset_frames: u64,
-    end_offset_frames: u64,
+    /// The recording that holds this episode's audio, when it is known. `null`
+    /// means "no file is attributable to this row", not "the file was deleted".
+    recording_id: Option<String>,
     started_at_utc: DateTime<Utc>,
     ended_at_utc: DateTime<Utc>,
-    duration_ms: u32,
-    rule_score: Option<f32>,
-    detector_version: String,
-    peak_dbfs: Option<f32>,
-    mean_level_dbfs: Option<f32>,
-    mean_band_ratio: Option<f32>,
-    noise_floor_dbfs: Option<f32>,
-    end_reason: String,
-    review_status: String,
-    continued: bool,
+    duration_ms: u64,
+    /// `rule-v1` or `apple-soundanalysis-v1`.
+    source: String,
+    label: Option<String>,
+    confidence: Option<f32>,
+    review_status: ReviewStatus,
 }
 
-#[derive(Debug, Serialize)]
-struct GapView {
-    offset_frames: u64,
-    lost_frames: u64,
-    kind: &'static str,
-    estimate_source: &'static str,
-    at_utc: DateTime<Utc>,
-}
-
-/// Audio duration of a segment from the authoritative stored frame count, so a
-/// segment containing gaps is not overstated by wall-clock differences.
+/// Audio duration of a recording from the authoritative stored frame count, so
+/// a recording containing gaps is not overstated by wall-clock differences.
 fn duration_ms(frame_count: u64, capture_rate_hz: u32) -> u64 {
     if capture_rate_hz == 0 {
         return 0;
@@ -1081,56 +1048,38 @@ fn duration_ms(frame_count: u64, capture_rate_hz: u32) -> u64 {
     frame_count.saturating_mul(1000) / u64::from(capture_rate_hz)
 }
 
-fn segment_view(segment: &SegmentRow) -> SegmentView {
-    SegmentView {
-        id: segment.id.clone(),
-        started_at_utc: segment.started_at_utc,
-        ended_at_utc: segment.ended_at_utc,
-        capture_rate_hz: segment.capture_rate_hz,
-        channels: segment.channels,
-        sample_format: segment.sample_format.clone(),
-        frame_count: segment.frame_count,
-        size_bytes: segment.size_bytes,
-        duration_ms: duration_ms(segment.frame_count, segment.capture_rate_hz),
-        status: segment.status.clone(),
-        time_quality: segment.time_quality.clone(),
-        end_reason: segment.end_reason.clone(),
-        lost_frames_total: segment.lost_frames_total,
-        gap_count: segment.gap_count,
-        xrun_count: segment.xrun_count,
-        clock_drift_ppm: segment.clock_drift_ppm,
-        audio_url: format!("{API_PREFIX}/segments/{}/audio", segment.id),
+/// Wall-clock length of an episode, which is what the terminal schema stores.
+fn elapsed_ms(started: DateTime<Utc>, ended: DateTime<Utc>) -> u64 {
+    u64::try_from((ended - started).num_milliseconds()).unwrap_or(0)
+}
+
+fn recording_view(recording: &RecordingRow) -> RecordingView {
+    RecordingView {
+        id: recording.id.clone(),
+        started_at_utc: recording.started_at_utc,
+        ended_at_utc: recording.ended_at_utc,
+        capture_rate_hz: recording.capture_rate_hz,
+        channels: recording.channels,
+        frame_count: recording.frame_count,
+        size_bytes: recording.size_bytes,
+        duration_ms: duration_ms(recording.frame_count, recording.capture_rate_hz),
+        lost_frames: recording.lost_frames,
+        audio_url: format!("{API_PREFIX}/recordings/{}/audio", recording.id),
     }
 }
 
-fn event_view(event: &EventRow, capture_rate_hz: u32) -> EventView {
-    EventView {
-        id: event.id.clone(),
-        segment_id: event.segment_id.clone(),
-        capture_rate_hz,
-        start_offset_frames: event.start_offset_frames,
-        end_offset_frames: event.end_offset_frames,
-        started_at_utc: event.started_at_utc,
-        ended_at_utc: event.ended_at_utc,
-        duration_ms: event.duration_ms,
-        rule_score: event.rule_score,
-        detector_version: event.detector_version.clone(),
-        peak_dbfs: event.peak_dbfs,
-        mean_level_dbfs: event.mean_level_dbfs,
-        mean_band_ratio: event.mean_band_ratio,
-        noise_floor_dbfs: event.noise_floor_dbfs,
-        end_reason: event.end_reason.clone(),
-        review_status: event.review_status.clone(),
-        continued: event.continued,
+fn episode_view(episode: &EpisodeRow) -> EpisodeView {
+    EpisodeView {
+        id: episode.id.clone(),
+        recording_id: episode.recording_id.clone(),
+        started_at_utc: episode.started_at_utc,
+        ended_at_utc: episode.ended_at_utc,
+        duration_ms: elapsed_ms(episode.started_at_utc, episode.ended_at_utc),
+        source: episode.source.clone(),
+        label: episode.label.clone(),
+        confidence: episode.confidence,
+        review_status: episode.review_status,
     }
-}
-
-/// Capture rate for an event: the rate of the segment it belongs to, falling
-/// back to the detection rate only if the segment row has disappeared.
-fn capture_rate_for(db: &Database, segment_id: &str, fallback: u32) -> Result<u32> {
-    Ok(db
-        .segment(segment_id)?
-        .map_or(fallback, |segment| segment.capture_rate_hz))
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,10 +1096,10 @@ struct DaysView {
 #[derive(Debug, Serialize)]
 struct DayView {
     date: String,
-    segment_count: usize,
-    event_count: usize,
+    recording_count: usize,
+    episode_count: usize,
     recorded_ms: u64,
-    lost_frames_total: u64,
+    lost_frames: u64,
 }
 
 async fn get_days(
@@ -1196,20 +1145,20 @@ async fn get_days(
         let mut date = from;
         loop {
             let (start, end) = local_day_range(date, timezone);
-            let segments = db.segments_between(start, end)?;
-            let events = db.events_between(start, end)?;
+            let recordings = db.recordings_between(start, end)?;
+            let episodes = db.episodes_between(start, end)?;
             // Only nights that actually hold data, per TECH_SPEC §8/§9: the date
             // list is a recording list, not a calendar.
-            if !segments.is_empty() || !events.is_empty() {
+            if !recordings.is_empty() || !episodes.is_empty() {
                 days.push(DayView {
                     date: date.format("%Y-%m-%d").to_string(),
-                    segment_count: segments.len(),
-                    event_count: events.len(),
-                    recorded_ms: segments
+                    recording_count: recordings.len(),
+                    episode_count: episodes.len(),
+                    recorded_ms: recordings
                         .iter()
-                        .map(|segment| duration_ms(segment.frame_count, segment.capture_rate_hz))
+                        .map(|recording| duration_ms(recording.frame_count, recording.capture_rate_hz))
                         .sum(),
-                    lost_frames_total: segments.iter().map(|s| s.lost_frames_total).sum(),
+                    lost_frames: recordings.iter().map(|recording| recording.lost_frames).sum(),
                 });
             }
             if date == to {
@@ -1237,16 +1186,16 @@ async fn get_days(
 }
 
 // ---------------------------------------------------------------------------
-// /segments
+// /recordings
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
-struct SegmentsView {
+struct RecordingsView {
     date: String,
-    segments: Vec<SegmentView>,
+    recordings: Vec<RecordingView>,
 }
 
-async fn get_segments(
+async fn get_recordings(
     State(state): State<Arc<HttpState>>,
     query: std::result::Result<Query<DateQuery>, QueryRejection>,
 ) -> Response {
@@ -1266,63 +1215,13 @@ async fn get_segments(
     };
     let (start, end) = local_day_range(date, state.config.server.timezone());
 
-    match state.with_database(|db| db.segments_between(start, end)) {
+    match state.with_database(|db| db.recordings_between(start, end)) {
         Ok(rows) => json_response(
             StatusCode::OK,
-            &SegmentsView {
+            &RecordingsView {
                 date: date.format("%Y-%m-%d").to_string(),
-                segments: rows.iter().map(segment_view).collect(),
+                recordings: rows.iter().map(recording_view).collect(),
             },
-        ),
-        Err(error) => internal_error(&error),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// /segments/{id}/gaps
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-struct GapsView {
-    segment_id: String,
-    capture_rate_hz: u32,
-    gaps: Vec<GapView>,
-}
-
-async fn get_gaps(
-    State(state): State<Arc<HttpState>>,
-    RoutePath(id): RoutePath<String>,
-) -> Response {
-    let found = state.with_database(|db| {
-        let Some(segment) = db.segment(&id)? else {
-            return Ok(None);
-        };
-        let gaps = db.gaps_for_segment(&id)?;
-        Ok(Some((segment.capture_rate_hz, gaps)))
-    });
-
-    match found {
-        Ok(Some((capture_rate_hz, gaps))) => json_response(
-            StatusCode::OK,
-            &GapsView {
-                segment_id: id,
-                capture_rate_hz,
-                gaps: gaps
-                    .iter()
-                    .map(|gap: &GapRecord| GapView {
-                        offset_frames: gap.offset_frames,
-                        lost_frames: gap.lost_frames,
-                        kind: gap.kind.as_str(),
-                        estimate_source: gap.estimate_source.as_str(),
-                        at_utc: gap.at_utc,
-                    })
-                    .collect(),
-            },
-        ),
-        Ok(None) => error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            format!("no segment with id {id}"),
         ),
         Err(error) => internal_error(&error),
     }
@@ -1335,11 +1234,7 @@ async fn get_gaps(
 #[derive(Debug, Serialize)]
 struct EventsView {
     date: String,
-    /// Nominal rate for the day (the detector's fixed 16 kHz in the MVP). Each
-    /// event also carries the capture rate of its own segment, which is what a
-    /// client must use to convert offsets to seconds.
-    capture_rate_hz: u32,
-    events: Vec<EventView>,
+    events: Vec<EpisodeView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1356,11 +1251,9 @@ struct UtteranceView {
     engine: String,
     language: Option<String>,
     text: String,
-    /// Phrase timings inside the utterance, already parsed for the UI.
-    segments: serde_json::Value,
 }
 
-fn utterance_view(row: &crate::storage::UtteranceRow) -> UtteranceView {
+fn utterance_view(row: &crate::storage::TranscriptRow) -> UtteranceView {
     UtteranceView {
         id: row.id.clone(),
         started_at_utc: row.started_at_utc,
@@ -1368,8 +1261,6 @@ fn utterance_view(row: &crate::storage::UtteranceRow) -> UtteranceView {
         engine: row.engine.clone(),
         language: row.language.clone(),
         text: row.text.clone(),
-        segments: serde_json::from_str(&row.segments_json)
-            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
     }
 }
 
@@ -1393,7 +1284,7 @@ async fn get_utterances(
     };
     let (start, end) = local_day_range(date, state.config.server.timezone());
 
-    match state.with_database(|db| db.utterances_between(start, end)) {
+    match state.with_database(|db| db.transcripts_between(start, end)) {
         Ok(rows) => json_response(
             StatusCode::OK,
             &UtterancesView {
@@ -1412,37 +1303,25 @@ struct TranscriptsView {
 }
 
 #[derive(Debug, Serialize)]
-struct SegmentTranscriptView {
-    segment_id: String,
-    transcript: Option<TranscriptView>,
-}
-
-#[derive(Debug, Serialize)]
 struct TranscriptView {
-    segment_id: String,
+    id: String,
+    recording_id: Option<String>,
+    started_at_utc: chrono::DateTime<chrono::Utc>,
+    ended_at_utc: chrono::DateTime<chrono::Utc>,
+    text: String,
     engine: String,
     language: Option<String>,
-    text: String,
-    /// Phrase timings, already parsed so the UI does not have to.
-    segments: serde_json::Value,
-    status: String,
-    error: Option<String>,
-    audio_seconds: Option<f64>,
-    created_at_utc: chrono::DateTime<chrono::Utc>,
 }
 
-fn transcript_view(row: &TranscriptRow) -> TranscriptView {
+fn transcript_view(row: &crate::storage::TranscriptRow) -> TranscriptView {
     TranscriptView {
-        segment_id: row.segment_id.clone(),
+        id: row.id.clone(),
+        recording_id: row.recording_id.clone(),
+        started_at_utc: row.started_at_utc,
+        ended_at_utc: row.ended_at_utc,
+        text: row.text.clone(),
         engine: row.engine.clone(),
         language: row.language.clone(),
-        text: row.text.clone(),
-        segments: serde_json::from_str(&row.segments_json)
-            .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
-        status: row.status.clone(),
-        error: row.error.clone(),
-        audio_seconds: row.audio_seconds,
-        created_at_utc: row.created_at_utc,
     }
 }
 
@@ -1478,22 +1357,6 @@ async fn get_transcripts(
     }
 }
 
-async fn get_segment_transcript(
-    State(state): State<Arc<HttpState>>,
-    RoutePath(id): RoutePath<String>,
-) -> Response {
-    match state.with_database(|db| db.transcript_for_segment(&id)) {
-        Ok(transcript) => json_response(
-            StatusCode::OK,
-            &SegmentTranscriptView {
-                segment_id: id,
-                transcript: transcript.as_ref().map(transcript_view),
-            },
-        ),
-        Err(error) => internal_error(&error),
-    }
-}
-
 async fn get_events(
     State(state): State<Arc<HttpState>>,
     query: std::result::Result<Query<DateQuery>, QueryRejection>,
@@ -1513,86 +1376,31 @@ async fn get_events(
         Err(error) => return error.into_response(),
     };
     let (start, end) = local_day_range(date, state.config.server.timezone());
-    let fallback_rate = state.config.detector.detection_rate_hz;
 
-    let collected = state.with_database(|db| {
-        let events = db.events_between(start, end)?;
-        let segments = db.segments_between(start, end)?;
-        let mut rates: HashMap<String, u32> = segments
-            .into_iter()
-            .map(|segment| (segment.id.clone(), segment.capture_rate_hz))
-            .collect();
-        let mut views = Vec::with_capacity(events.len());
-        for event in &events {
-            let rate = match rates.get(&event.segment_id) {
-                Some(rate) => *rate,
-                None => {
-                    // An in-progress segment that began before the day starts is
-                    // not returned by `segments_between`, so look it up directly.
-                    let rate = capture_rate_for(db, &event.segment_id, fallback_rate)?;
-                    rates.insert(event.segment_id.clone(), rate);
-                    rate
-                }
-            };
-            views.push(event_view(event, rate));
-        }
-        Ok(views)
-    });
-
-    match collected {
-        Ok(events) => json_response(
+    match state.with_database(|db| db.episodes_between(start, end)) {
+        Ok(rows) => json_response(
             StatusCode::OK,
             &EventsView {
                 date: date.format("%Y-%m-%d").to_string(),
-                capture_rate_hz: fallback_rate,
-                events,
+                events: rows.iter().map(episode_view).collect(),
             },
         ),
         Err(error) => internal_error(&error),
     }
 }
 
-#[derive(Debug, Serialize)]
-struct EventDetailView {
-    event: EventView,
-    segment: SegmentView,
-}
-
 async fn get_event(
     State(state): State<Arc<HttpState>>,
     RoutePath(id): RoutePath<String>,
 ) -> Response {
-    let fallback_rate = state.config.detector.detection_rate_hz;
-    let found = state.with_database(|db| match db.event_with_segment(&id)? {
-        Some((event, segment)) => Ok(Some((event, segment))),
-        None => Ok(None),
-    });
-
-    match found {
-        Ok(Some((event, segment))) => {
-            let rate = capture_rate_or(&segment, fallback_rate);
-            json_response(
-                StatusCode::OK,
-                &EventDetailView {
-                    event: event_view(&event, rate),
-                    segment: segment_view(&segment),
-                },
-            )
-        }
+    match state.with_database(|db| db.episode(&id)) {
+        Ok(Some(episode)) => json_response(StatusCode::OK, &episode_view(&episode)),
         Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             "not_found",
             format!("no event with id {id}"),
         ),
         Err(error) => internal_error(&error),
-    }
-}
-
-fn capture_rate_or(segment: &SegmentRow, fallback: u32) -> u32 {
-    if segment.capture_rate_hz > 0 {
-        segment.capture_rate_hz
-    } else {
-        fallback
     }
 }
 
@@ -1627,16 +1435,12 @@ async fn patch_event(
         }
     };
 
-    let fallback_rate = state.config.detector.detection_rate_hz;
     let updated = state.with_database(|db| {
-        if !db.set_review_status(&id, status)? {
+        if !db.set_episode_review(&id, status)? {
             return Ok(None);
         }
-        let Some(event) = db.event(&id)? else {
-            return Ok(None);
-        };
-        let rate = capture_rate_for(db, &event.segment_id, fallback_rate)?;
-        Ok(Some(event_view(&event, rate)))
+        let updated = db.episode(&id)?;
+        Ok(updated.map(|episode| episode_view(&episode)))
     });
 
     match updated {
@@ -1912,7 +1716,7 @@ async fn send_event(socket: &mut WebSocket, event: &TranscriptEvent) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// /segments/{id}/audio
+// /recordings/{id}/audio
 // ---------------------------------------------------------------------------
 
 /// Outcome of interpreting a `Range` header against a known file length.
@@ -1986,8 +1790,8 @@ fn parse_range_header(header_value: Option<&str>, total: u64) -> RangeSelection 
     }
 }
 
-fn etag_for(segment_id: &str, size_bytes: u64) -> String {
-    format!("\"{segment_id}-{size_bytes}\"")
+fn etag_for(recording_id: &str, size_bytes: u64) -> String {
+    format!("\"{recording_id}-{size_bytes}\"")
 }
 
 fn insert_header(response: &mut Response, name: header::HeaderName, value: &str) {
@@ -2055,54 +1859,23 @@ async fn get_audio(
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
-    let segment = match state.with_database(|db| db.segment(&id)) {
-        Ok(Some(segment)) => segment,
+    let recording = match state.with_database(|db| db.recording(&id)) {
+        Ok(Some(recording)) => recording,
         Ok(None) => {
             return error_response(
                 StatusCode::NOT_FOUND,
                 "not_found",
-                format!("no segment with id {id}"),
+                format!("no recording with id {id}"),
             );
         }
         Err(error) => return internal_error(&error),
     };
 
-    match segment.status.as_str() {
-        "deleted" => {
-            return audio_error(
-                StatusCode::GONE,
-                "audio_expired",
-                "the recording for this segment was deleted by retention",
-                None,
-                None,
-            );
-        }
-        "recording" => {
-            return audio_error(
-                StatusCode::CONFLICT,
-                "audio_not_ready",
-                "the segment is still being recorded",
-                None,
-                None,
-            );
-        }
-        "missing" => {
-            return audio_error(
-                StatusCode::NOT_FOUND,
-                "audio_missing",
-                "the recording file for this segment is missing",
-                None,
-                None,
-            );
-        }
-        _ => {}
-    }
-
     // The only source of a playback path: the DB `relative_path` joined to the
     // configured recordings root. Nothing from the request is used here.
-    let relative = Path::new(&segment.relative_path);
+    let relative = recording.relative_path.as_path();
     if let Err(error) = validate_relative_path(relative) {
-        tracing::error!(segment_id = %segment.id, %error, "stored recording path is not safe to serve");
+        tracing::error!(recording_id = %recording.id, %error, "stored recording path is not safe to serve");
         return internal_error(&error);
     }
     let path = state.config.storage.recording_dir.join(relative);
@@ -2111,14 +1884,14 @@ async fn get_audio(
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
-                segment_id = %segment.id,
+                recording_id = %recording.id,
                 path = %path.display(),
-                "segment row exists but its recording file is missing"
+                "recording row exists but its file is missing"
             );
             return audio_error(
                 StatusCode::NOT_FOUND,
                 "audio_missing",
-                "the recording file for this segment is missing",
+                "the recording file for this recording is missing",
                 None,
                 None,
             );
@@ -2130,15 +1903,15 @@ async fn get_audio(
         Ok(metadata) => metadata.len(),
         Err(error) => return internal_error(&Error::io(&path, error)),
     };
-    if file_len != segment.size_bytes {
+    if file_len != recording.size_bytes {
         tracing::warn!(
-            segment_id = %segment.id,
-            db_size_bytes = segment.size_bytes,
+            recording_id = %recording.id,
+            db_size_bytes = recording.size_bytes,
             file_size_bytes = file_len,
             "database size_bytes disagrees with the recording file; serving the real length"
         );
     }
-    let etag = etag_for(&segment.id, file_len);
+    let etag = etag_for(&recording.id, file_len);
 
     let (start, length, status) = match parse_range_header(
         headers.get(header::RANGE).and_then(|value| value.to_str().ok()),

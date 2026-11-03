@@ -11,15 +11,16 @@ use serde_json::Value;
 use steno_lib::config::{
     AudioConfig, Config, DetectorConfig, ServerConfig, SourceConfig, StorageConfig,
 };
-use steno_lib::detector::{EndReason, EventDraft};
 use futures_util::StreamExt;
 use steno_server::http_server::{
     HttpState, MicrophoneState, RecordingState, RuntimeStatus, router, serve,
 };
 use steno_lib::metrics::Metrics;
 use steno_server::recorder::{WavFormat, write_header};
-use steno_server::storage::{Database, ReviewStatus, SegmentCompleted, SegmentStarted, SegmentStatus};
-use steno_lib::timeline::{EstimateSource, GapKind, GapRecord, TimeQuality};
+use steno_server::storage::{
+    Database, EpisodeRow, RecordingDraft, ReviewStatus,
+};
+use steno_lib::timeline::TimeQuality;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -182,100 +183,75 @@ async fn patch(harness: &Harness, uri: &str, body: &str) -> Raw {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-struct SegmentSpec {
+struct RecordingSpec {
     id: &'static str,
     started: DateTime<Utc>,
-    ended: Option<DateTime<Utc>>,
+    ended: DateTime<Utc>,
     frames: u64,
     rate: u32,
     relative_path: String,
     size_bytes: u64,
-    status: SegmentStatus,
-    lost_frames_total: u64,
-    gap_count: u64,
-    xrun_count: u64,
+    lost_frames: u64,
 }
 
-impl SegmentSpec {
+impl RecordingSpec {
     fn new(id: &'static str, started: DateTime<Utc>, relative_path: &str) -> Self {
-        SegmentSpec {
+        RecordingSpec {
             id,
             started,
-            ended: Some(started + chrono::Duration::minutes(30)),
+            ended: started + chrono::Duration::minutes(30),
             frames: 16_000,
             rate: 16_000,
             relative_path: relative_path.to_string(),
             size_bytes: 44,
-            status: SegmentStatus::Complete,
-            lost_frames_total: 0,
-            gap_count: 0,
-            xrun_count: 0,
+            lost_frames: 0,
         }
     }
 }
 
-fn add_segment(harness: &Harness, spec: &SegmentSpec) {
+fn add_recording(harness: &Harness, spec: &RecordingSpec) {
     let db = harness.database.lock().unwrap();
-    db.insert_segment_started(&SegmentStarted {
+    db.insert_recording(&RecordingDraft {
         id: spec.id.to_string(),
         relative_path: PathBuf::from(&spec.relative_path),
         started_at_utc: spec.started,
+        ended_at_utc: spec.ended,
         capture_rate_hz: spec.rate,
         channels: 1,
-        sample_format: "S16_LE".to_string(),
-        channel_mapping: "mono:0".to_string(),
-        time_quality: TimeQuality::Synced,
-        boot_id: "boot-test".to_string(),
-    })
-    .unwrap();
-    if spec.status == SegmentStatus::Recording {
-        // An in-progress segment is only ever opened: no end time, no totals yet.
-        return;
-    }
-    db.complete_segment(&SegmentCompleted {
-        id: spec.id.to_string(),
-        ended_at_utc: spec.ended.unwrap_or(spec.started),
         frame_count: spec.frames,
         size_bytes: spec.size_bytes,
-        end_reason: "duration".to_string(),
-        clock_drift_ppm: None,
-        xrun_count: spec.xrun_count,
-        gap_count: spec.gap_count,
-        lost_frames_total: spec.lost_frames_total,
-        status: spec.status,
+        lost_frames: spec.lost_frames,
     })
     .unwrap();
 }
 
-fn add_event(
+fn add_episode(
     harness: &Harness,
     id: &str,
-    segment_id: &str,
+    recording_id: Option<&str>,
     started: DateTime<Utc>,
-    start_offset_frames: u64,
-    end_offset_frames: u64,
-    rate: u32,
+    duration_ms: i64,
+    source: &str,
+    label: Option<&str>,
+    confidence: Option<f32>,
 ) {
-    let duration_ms = ((end_offset_frames - start_offset_frames) * 1000 / u64::from(rate)) as u32;
     let db = harness.database.lock().unwrap();
-    db.insert_event(&EventDraft {
+    db.insert_episode(&EpisodeRow {
         id: id.to_string(),
-        segment_id: segment_id.to_string(),
-        start_offset_frames,
-        end_offset_frames,
+        recording_id: recording_id.map(str::to_string),
         started_at_utc: started,
-        ended_at_utc: started + chrono::Duration::milliseconds(i64::from(duration_ms)),
-        duration_ms,
-        rule_score: Some(0.75),
-        detector_version: "rule-v1".to_string(),
-        peak_dbfs: Some(-12.5),
-        mean_level_dbfs: Some(-31.0),
-        mean_band_ratio: Some(0.6),
-        noise_floor_dbfs: Some(-62.0),
-        end_reason: EndReason::Normal,
-        continued: false,
+        ended_at_utc: started + chrono::Duration::milliseconds(duration_ms),
+        source: source.to_string(),
+        label: label.map(str::to_string),
+        confidence,
+        review_status: ReviewStatus::Unreviewed,
+        created_at_utc: started,
     })
     .unwrap();
+}
+
+fn add_rule_episode(harness: &Harness, id: &str, recording_id: Option<&str>, started: DateTime<Utc>) {
+    add_episode(harness, id, recording_id, started, 200, "rule-v1", None, Some(0.75));
 }
 
 /// Writes a real 44-byte-header WAV with a deterministic payload and returns its
@@ -327,7 +303,8 @@ async fn status_reports_unknown_rather_than_inventing_health() {
     assert_eq!(body["detector"]["events_discarded_short"], 0);
     assert_eq!(body["detector"]["event_fk_retries"], 0);
 
-    assert_eq!(body["storage"]["used_bytes"], 0);
+    assert_eq!(body["storage"]["bytes"], 0);
+    assert_eq!(body["storage"]["recordings"], 0);
     assert_eq!(body["storage"]["max_bytes"], 1 << 30);
     assert_eq!(body["storage"]["recording_dir"], harness.recording_dir.display().to_string());
     assert_eq!(body["storage"]["storage_pressure"], false);
@@ -428,43 +405,39 @@ async fn status_reflects_metrics_and_supervisor_reports() {
 #[tokio::test]
 async fn status_counts_recorded_bytes_from_the_database() {
     let harness = harness();
-    let mut spec = SegmentSpec::new("seg-bytes", utc(1_735_689_600), "recordings/2025/01/01/a.wav");
+    let mut spec = RecordingSpec::new("rec-bytes", utc(1_735_689_600), "recordings/2025/01/01/a.wav");
     spec.size_bytes = 1_000;
-    add_segment(&harness, &spec);
+    add_recording(&harness, &spec);
     let body = get(&harness, "/api/v1/status").await.json();
-    assert_eq!(body["storage"]["used_bytes"], 1_000);
+    assert_eq!(body["storage"]["bytes"], 1_000);
 }
 
 #[tokio::test]
-async fn status_describes_the_recording_pool_not_just_its_size() {
+async fn status_counts_the_recordings_behind_the_byte_total() {
     let harness = harness();
-    let mut oldest = SegmentSpec::new("seg-old", utc(1_735_689_600), "recordings/2025/01/01/a.wav");
+    let mut oldest = RecordingSpec::new("rec-old", utc(1_735_689_600), "recordings/2025/01/01/a.wav");
     oldest.size_bytes = 400;
-    add_segment(&harness, &oldest);
-    let mut newest = SegmentSpec::new("seg-new", utc(1_735_693_200), "recordings/2025/01/01/b.wav");
+    add_recording(&harness, &oldest);
+    let mut newest = RecordingSpec::new("rec-new", utc(1_735_693_200), "recordings/2025/01/01/b.wav");
     newest.size_bytes = 600;
-    add_segment(&harness, &newest);
+    add_recording(&harness, &newest);
 
     let body = get(&harness, "/api/v1/status").await.json();
     let storage = &body["storage"];
-    assert_eq!(storage["used_bytes"], 1_000);
-    assert_eq!(storage["segment_count"], 2);
+    assert_eq!(storage["bytes"], 1_000);
+    assert_eq!(storage["recordings"], 2);
     // Retention's target and the OS reserve are part of the pool's definition,
     // not something a client should have to read the config file for.
     assert_eq!(storage["cleanup_target_bytes"], 1 << 29);
     assert_eq!(storage["reserve_bytes"], 1 << 20);
-    assert_eq!(storage["oldest_started_at_utc"], "2025-01-01T00:00:00Z");
-    assert_eq!(storage["newest_ended_at_utc"], "2025-01-01T01:30:00Z");
 }
 
 #[tokio::test]
-async fn an_empty_pool_reports_no_bounds_instead_of_the_epoch() {
+async fn an_empty_pool_reports_zero_bytes_instead_of_the_epoch() {
     let harness = harness();
     let body = get(&harness, "/api/v1/status").await.json();
-    assert_eq!(body["storage"]["used_bytes"], 0);
-    assert_eq!(body["storage"]["segment_count"], 0);
-    assert!(body["storage"]["oldest_started_at_utc"].is_null());
-    assert!(body["storage"]["newest_ended_at_utc"].is_null());
+    assert_eq!(body["storage"]["bytes"], 0);
+    assert_eq!(body["storage"]["recordings"], 0);
 }
 
 #[tokio::test]
@@ -568,21 +541,6 @@ async fn status_says_transcription_is_off_rather_than_disconnected() {
 }
 
 #[tokio::test]
-async fn segment_mode_is_not_reported_as_a_disconnected_recogniser() {
-    let harness = harness_build(tempfile::tempdir().unwrap(), "UTC", 0, |config| {
-        config.stt.enabled = true;
-        config.stt.mode = steno_lib::config::SttMode::Segment;
-    });
-    let body = get(&harness, "/api/v1/status").await.json();
-    let stt = &body["stt"];
-    assert_eq!(stt["enabled"], true);
-    assert_eq!(stt["mode"], "segment");
-    // `connected` is meaningless without a long-lived channel; the state must
-    // not turn that into a fault.
-    assert_eq!(stt["state"], "segment");
-}
-
-#[tokio::test]
 async fn control_reports_why_it_cannot_act() {
     let harness = harness();
     let body = get(&harness, "/api/v1/control").await.json();
@@ -661,20 +619,20 @@ async fn control_never_claims_success_it_could_not_verify() {
 }
 
 // ---------------------------------------------------------------------------
-// /days, /segments, /events
+// /days, /recordings, /events
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn days_lists_only_nights_that_hold_data() {
     let harness = harness();
     // 2025-01-01T12:00:00Z and 2025-01-01T20:00:00Z.
-    let mut first = SegmentSpec::new("seg-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav");
+    let mut first = RecordingSpec::new("rec-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav");
     first.frames = 16_000;
-    add_segment(&harness, &first);
-    let mut second = SegmentSpec::new("seg-2", utc(1_735_761_600), "recordings/2025/01/01/b.wav");
+    add_recording(&harness, &first);
+    let mut second = RecordingSpec::new("rec-2", utc(1_735_761_600), "recordings/2025/01/01/b.wav");
     second.frames = 32_000;
-    add_segment(&harness, &second);
-    add_event(&harness, "evt-1", "seg-1", utc(1_735_732_810), 0, 3_200, 16_000);
+    add_recording(&harness, &second);
+    add_rule_episode(&harness, "evt-1", Some("rec-1"), utc(1_735_732_810));
 
     let body = get(&harness, "/api/v1/days?from=2025-01-01&to=2025-01-03")
         .await
@@ -684,140 +642,136 @@ async fn days_lists_only_nights_that_hold_data() {
     let days = body["days"].as_array().unwrap();
     assert_eq!(days.len(), 1, "only the night with data is listed: {days:?}");
     assert_eq!(days[0]["date"], "2025-01-01");
-    assert_eq!(days[0]["segment_count"], 2);
-    assert_eq!(days[0]["event_count"], 1);
+    assert_eq!(days[0]["recording_count"], 2);
+    assert_eq!(days[0]["episode_count"], 1);
     assert_eq!(days[0]["recorded_ms"], 3_000);
-    assert_eq!(days[0]["lost_frames_total"], 0);
+    assert_eq!(days[0]["lost_frames"], 0);
 }
 
 #[tokio::test]
-async fn segments_include_a_segment_that_crosses_local_midnight() {
+async fn recordings_list_the_file_a_client_can_play() {
     let harness = harness();
     // 2025-01-01T23:30Z -> 2025-01-02T00:30Z.
-    let mut crossing = SegmentSpec::new(
-        "seg-cross",
+    let mut crossing = RecordingSpec::new(
+        "rec-cross",
         utc(1_735_774_200),
         "recordings/2025/01/01/cross.wav",
     );
-    crossing.ended = Some(utc(1_735_777_800));
-    crossing.gap_count = 1;
-    crossing.lost_frames_total = 80;
-    crossing.xrun_count = 1;
-    add_segment(&harness, &crossing);
+    crossing.ended = utc(1_735_777_800);
+    crossing.lost_frames = 80;
+    add_recording(&harness, &crossing);
     // 2025-01-02T10:00Z -> 2025-01-02T10:30Z.
-    add_segment(
+    add_recording(
         &harness,
-        &SegmentSpec::new("seg-morning", utc(1_735_812_000), "recordings/2025/01/02/m.wav"),
+        &RecordingSpec::new("rec-morning", utc(1_735_812_000), "recordings/2025/01/02/m.wav"),
     );
 
-    let first = get(&harness, "/api/v1/segments?date=2025-01-01").await.json();
+    // A recording belongs to the day it started on; the schema has no status to
+    // reconcile, so a file is either there or it is not.
+    let first = get(&harness, "/api/v1/recordings?date=2025-01-01").await.json();
     assert_eq!(first["date"], "2025-01-01");
-    let segments = first["segments"].as_array().unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0]["id"], "seg-cross");
+    let recordings = first["recordings"].as_array().unwrap();
+    assert_eq!(recordings.len(), 1);
+    assert_eq!(recordings[0]["id"], "rec-cross");
 
-    let second = get(&harness, "/api/v1/segments?date=2025-01-02").await.json();
-    let segments = second["segments"].as_array().unwrap();
-    assert_eq!(segments.len(), 2, "the crossing segment belongs to both days");
+    let second = get(&harness, "/api/v1/recordings?date=2025-01-02").await.json();
+    assert_eq!(second["recordings"].as_array().unwrap().len(), 1);
+    assert_eq!(second["recordings"][0]["id"], "rec-morning");
 
-    let crossing = &second["segments"][0];
-    assert_eq!(crossing["id"], "seg-cross");
-    assert_eq!(crossing["capture_rate_hz"], 16_000);
-    assert_eq!(crossing["channels"], 1);
-    assert_eq!(crossing["sample_format"], "S16_LE");
-    assert_eq!(crossing["frame_count"], 16_000);
-    assert_eq!(crossing["size_bytes"], 44);
-    assert_eq!(crossing["duration_ms"], 1_000);
-    assert_eq!(crossing["status"], "complete");
-    assert_eq!(crossing["time_quality"], "synced");
-    assert_eq!(crossing["end_reason"], "duration");
-    assert_eq!(crossing["lost_frames_total"], 80);
-    assert_eq!(crossing["gap_count"], 1);
-    assert_eq!(crossing["xrun_count"], 1);
-    assert!(crossing["clock_drift_ppm"].is_null());
-    assert!(crossing["ended_at_utc"].is_string());
-    assert_eq!(crossing["audio_url"], "/api/v1/segments/seg-cross/audio");
+    let recording = &first["recordings"][0];
+    assert_eq!(recording["capture_rate_hz"], 16_000);
+    assert_eq!(recording["channels"], 1);
+    assert_eq!(recording["frame_count"], 16_000);
+    assert_eq!(recording["size_bytes"], 44);
+    assert_eq!(recording["duration_ms"], 1_000);
+    assert_eq!(recording["lost_frames"], 80);
+    assert!(recording["started_at_utc"].is_string());
+    assert!(recording["ended_at_utc"].is_string());
+    assert_eq!(recording["audio_url"], "/api/v1/recordings/rec-cross/audio");
 }
 
 #[tokio::test]
 async fn date_boundaries_follow_the_configured_timezone() {
     let harness = harness_with_timezone("America/New_York");
     // 2025-01-01T03:00Z is 2024-12-31 22:00 in New York.
-    let mut spec = SegmentSpec::new(
-        "seg-evening",
+    let mut spec = RecordingSpec::new(
+        "rec-evening",
         utc(1_735_700_400),
         "recordings/2025/01/01/evening.wav",
     );
-    spec.ended = Some(utc(1_735_700_700));
-    add_segment(&harness, &spec);
+    spec.ended = utc(1_735_700_700);
+    add_recording(&harness, &spec);
 
-    let previous = get(&harness, "/api/v1/segments?date=2024-12-31").await.json();
-    assert_eq!(previous["segments"].as_array().unwrap().len(), 1);
-    let next = get(&harness, "/api/v1/segments?date=2025-01-01").await.json();
-    assert_eq!(next["segments"].as_array().unwrap().len(), 0);
+    let previous = get(&harness, "/api/v1/recordings?date=2024-12-31").await.json();
+    assert_eq!(previous["recordings"].as_array().unwrap().len(), 1);
+    let next = get(&harness, "/api/v1/recordings?date=2025-01-01").await.json();
+    assert_eq!(next["recordings"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
-async fn an_in_progress_segment_reports_a_null_end() {
+async fn episodes_carry_their_source_and_label() {
     let harness = harness();
-    let mut spec = SegmentSpec::new("seg-live", utc(1_735_732_800), "recordings/2025/01/01/live.wav");
-    spec.ended = None;
-    spec.status = SegmentStatus::Recording;
-    add_segment(&harness, &spec);
-    let body = get(&harness, "/api/v1/segments?date=2025-01-01").await.json();
-    assert_eq!(body["segments"][0]["status"], "recording");
-    assert!(body["segments"][0]["ended_at_utc"].is_null());
-}
-
-#[tokio::test]
-async fn events_carry_offsets_and_the_segment_capture_rate() {
-    let harness = harness();
-    let mut spec = SegmentSpec::new("seg-48k", utc(1_735_732_800), "recordings/2025/01/01/a.wav");
-    spec.rate = 48_000;
-    add_segment(&harness, &spec);
-    add_event(&harness, "evt-48k", "seg-48k", utc(1_735_732_812), 4_800, 9_600, 48_000);
+    add_recording(
+        &harness,
+        &RecordingSpec::new("rec-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
+    );
+    add_rule_episode(&harness, "evt-rule", Some("rec-1"), utc(1_735_732_812));
+    add_episode(
+        &harness,
+        "evt-classifier",
+        None,
+        utc(1_735_732_900),
+        4_000,
+        "apple-soundanalysis-v1",
+        Some("snoring"),
+        Some(0.81),
+    );
 
     let body = get(&harness, "/api/v1/events?date=2025-01-01").await.json();
     assert_eq!(body["date"], "2025-01-01");
-    assert_eq!(body["capture_rate_hz"], 16_000);
     let events = body["events"].as_array().unwrap();
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
-    assert_eq!(event["id"], "evt-48k");
-    assert_eq!(event["segment_id"], "seg-48k");
-    assert_eq!(event["capture_rate_hz"], 48_000);
-    assert_eq!(event["start_offset_frames"], 4_800);
-    assert_eq!(event["end_offset_frames"], 9_600);
-    assert_eq!(event["duration_ms"], 100);
-    assert_eq!(event["rule_score"], 0.75);
-    assert_eq!(event["detector_version"], "rule-v1");
-    assert_eq!(event["peak_dbfs"], -12.5);
-    assert_eq!(event["mean_level_dbfs"], -31.0);
-    assert_eq!(event["mean_band_ratio"], 0.6);
-    assert_eq!(event["noise_floor_dbfs"], -62.0);
-    assert_eq!(event["end_reason"], "normal");
-    assert_eq!(event["review_status"], "unreviewed");
-    assert_eq!(event["continued"], false);
-    assert!(event["started_at_utc"].is_string());
-    assert!(event["ended_at_utc"].is_string());
+    assert_eq!(events.len(), 2);
+
+    let rule = &events[0];
+    assert_eq!(rule["id"], "evt-rule");
+    assert_eq!(rule["recording_id"], "rec-1");
+    assert_eq!(rule["source"], "rule-v1");
+    assert!(rule["label"].is_null());
+    assert_eq!(rule["confidence"], 0.75);
+    assert_eq!(rule["duration_ms"], 200);
+    assert_eq!(rule["review_status"], "unreviewed");
+    assert!(rule["started_at_utc"].is_string());
+    assert!(rule["ended_at_utc"].is_string());
+
+    let classifier = &events[1];
+    assert_eq!(classifier["recording_id"], serde_json::Value::Null);
+    assert_eq!(classifier["source"], "apple-soundanalysis-v1");
+    assert_eq!(classifier["label"], "snoring");
+    assert_eq!(classifier["confidence"], 0.81);
+    assert_eq!(classifier["duration_ms"], 4_000);
+
+    // The old epoch vocabulary must be gone, not merely unused.
+    for gone in ["segment_id", "capture_rate_hz", "start_offset_frames", "rule_score"] {
+        assert!(events[0].get(gone).is_none(), "{gone} is not part of an episode: {rule}");
+    }
 }
 
 #[tokio::test]
-async fn event_detail_returns_the_event_and_its_segment() {
+async fn episode_detail_returns_the_episode() {
     let harness = harness();
-    add_segment(
+    add_recording(
         &harness,
-        &SegmentSpec::new("seg-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
+        &RecordingSpec::new("rec-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
     );
-    add_event(&harness, "evt-1", "seg-1", utc(1_735_732_812), 0, 3_200, 16_000);
+    add_rule_episode(&harness, "evt-1", Some("rec-1"), utc(1_735_732_812));
 
     let response = get(&harness, "/api/v1/events/evt-1").await;
     assert_eq!(response.status, StatusCode::OK);
     let body = response.json();
-    assert_eq!(body["event"]["id"], "evt-1");
-    assert_eq!(body["event"]["capture_rate_hz"], 16_000);
-    assert_eq!(body["segment"]["id"], "seg-1");
-    assert_eq!(body["segment"]["audio_url"], "/api/v1/segments/seg-1/audio");
+    assert_eq!(body["id"], "evt-1");
+    assert_eq!(body["recording_id"], "rec-1");
+    assert_eq!(body["source"], "rule-v1");
+    assert_eq!(body["review_status"], "unreviewed");
 
     let missing = get(&harness, "/api/v1/events/nope").await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
@@ -825,51 +779,11 @@ async fn event_detail_returns_the_event_and_its_segment() {
 }
 
 #[tokio::test]
-async fn gaps_are_listed_with_their_offset_and_estimate_source() {
-    let harness = harness();
-    let mut spec = SegmentSpec::new("seg-gap", utc(1_735_732_800), "recordings/2025/01/01/a.wav");
-    spec.gap_count = 1;
-    spec.lost_frames_total = 80;
-    add_segment(&harness, &spec);
-    {
-        let db = harness.database.lock().unwrap();
-        db.insert_gap(
-            "seg-gap",
-            &GapRecord {
-                offset_frames: 16_000,
-                lost_frames: 80,
-                kind: GapKind::Xrun,
-                estimate_source: EstimateSource::Timestamp,
-                at_utc: utc(1_735_732_801),
-            },
-        )
-        .unwrap();
-    }
-
-    let response = get(&harness, "/api/v1/segments/seg-gap/gaps").await;
-    assert_eq!(response.status, StatusCode::OK);
-    let body = response.json();
-    assert_eq!(body["segment_id"], "seg-gap");
-    assert_eq!(body["capture_rate_hz"], 16_000);
-    let gaps = body["gaps"].as_array().unwrap();
-    assert_eq!(gaps.len(), 1);
-    assert_eq!(gaps[0]["offset_frames"], 16_000);
-    assert_eq!(gaps[0]["lost_frames"], 80);
-    assert_eq!(gaps[0]["kind"], "xrun");
-    assert_eq!(gaps[0]["estimate_source"], "timestamp");
-    assert!(gaps[0]["at_utc"].is_string());
-
-    let missing = get(&harness, "/api/v1/segments/nope/gaps").await;
-    assert_eq!(missing.status, StatusCode::NOT_FOUND);
-    assert_eq!(missing.json()["error"]["code"], "not_found");
-}
-
-#[tokio::test]
 async fn dates_without_data_return_empty_arrays() {
     let harness = harness();
-    let segments = get(&harness, "/api/v1/segments?date=2030-05-05").await;
-    assert_eq!(segments.status, StatusCode::OK);
-    assert_eq!(segments.json()["segments"].as_array().unwrap().len(), 0);
+    let recordings = get(&harness, "/api/v1/recordings?date=2030-05-05").await;
+    assert_eq!(recordings.status, StatusCode::OK);
+    assert_eq!(recordings.json()["recordings"].as_array().unwrap().len(), 0);
 
     let events = get(&harness, "/api/v1/events?date=2030-05-05").await;
     assert_eq!(events.status, StatusCode::OK);
@@ -884,10 +798,10 @@ async fn dates_without_data_return_empty_arrays() {
 async fn invalid_parameters_use_the_error_envelope() {
     let harness = harness();
     for uri in [
-        "/api/v1/segments",
-        "/api/v1/segments?date=",
-        "/api/v1/segments?date=2025-13-01",
-        "/api/v1/segments?date=01-01-2025",
+        "/api/v1/recordings",
+        "/api/v1/recordings?date=",
+        "/api/v1/recordings?date=2025-13-01",
+        "/api/v1/recordings?date=01-01-2025",
         "/api/v1/events?date=not-a-date",
         "/api/v1/days?from=2025-01-01",
         "/api/v1/days?to=2025-01-01",
@@ -926,11 +840,11 @@ async fn unknown_routes_and_methods_use_the_error_envelope() {
 #[tokio::test]
 async fn patch_accepts_the_three_labels_and_returns_the_event() {
     let harness = harness();
-    add_segment(
+    add_recording(
         &harness,
-        &SegmentSpec::new("seg-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
+        &RecordingSpec::new("rec-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
     );
-    add_event(&harness, "evt-1", "seg-1", utc(1_735_732_812), 0, 3_200, 16_000);
+    add_rule_episode(&harness, "evt-1", Some("rec-1"), utc(1_735_732_812));
 
     for (label, expected) in [
         ("snore", ReviewStatus::Snore),
@@ -947,26 +861,26 @@ async fn patch_accepts_the_three_labels_and_returns_the_event() {
         let body = response.json();
         assert_eq!(body["id"], "evt-1");
         assert_eq!(body["review_status"], label);
-        assert_eq!(body["capture_rate_hz"], 16_000);
+        assert_eq!(body["recording_id"], "rec-1");
         let stored = harness
             .database
             .lock()
             .unwrap()
-            .event("evt-1")
+            .episode("evt-1")
             .unwrap()
             .unwrap();
-        assert_eq!(stored.review_status, expected.as_str());
+        assert_eq!(stored.review_status, expected);
     }
 }
 
 #[tokio::test]
 async fn patch_rejects_anything_else() {
     let harness = harness();
-    add_segment(
+    add_recording(
         &harness,
-        &SegmentSpec::new("seg-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
+        &RecordingSpec::new("rec-1", utc(1_735_732_800), "recordings/2025/01/01/a.wav"),
     );
-    add_event(&harness, "evt-1", "seg-1", utc(1_735_732_812), 0, 3_200, 16_000);
+    add_rule_episode(&harness, "evt-1", Some("rec-1"), utc(1_735_732_812));
 
     for body in [
         "{\"review_status\":\"maybe\"}",
@@ -987,10 +901,10 @@ async fn patch_rejects_anything_else() {
         .database
         .lock()
         .unwrap()
-        .event("evt-1")
+        .episode("evt-1")
         .unwrap()
         .unwrap();
-    assert_eq!(stored.review_status, "unreviewed");
+    assert_eq!(stored.review_status, ReviewStatus::Unreviewed);
 
     let missing = patch(
         &harness,
@@ -1008,21 +922,20 @@ async fn patch_rejects_anything_else() {
 
 const PAYLOAD: usize = 100;
 
-fn audio_segment(harness: &Harness, id: &'static str, status: SegmentStatus) -> Vec<u8> {
+fn audio_recording(harness: &Harness, id: &'static str) -> Vec<u8> {
     let relative = format!("recordings/2025/01/01/{id}.wav");
     let bytes = write_recording(harness, &relative, PAYLOAD);
-    let mut spec = SegmentSpec::new(id, utc(1_735_732_800), &relative);
+    let mut spec = RecordingSpec::new(id, utc(1_735_732_800), &relative);
     spec.size_bytes = bytes.len() as u64;
-    spec.status = status;
-    add_segment(harness, &spec);
+    add_recording(harness, &spec);
     bytes
 }
 
 #[tokio::test]
 async fn audio_returns_the_whole_file_with_range_metadata() {
     let harness = harness();
-    let bytes = audio_segment(&harness, "seg-audio", SegmentStatus::Complete);
-    let response = get(&harness, "/api/v1/segments/seg-audio/audio").await;
+    let bytes = audio_recording(&harness, "rec-audio");
+    let response = get(&harness, "/api/v1/recordings/rec-audio/audio").await;
 
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.header(header::CONTENT_TYPE).unwrap(), "audio/wav");
@@ -1033,7 +946,7 @@ async fn audio_returns_the_whole_file_with_range_metadata() {
     );
     assert_eq!(
         response.header(header::ETAG).unwrap(),
-        format!("\"seg-audio-{}\"", bytes.len())
+        format!("\"rec-audio-{}\"", bytes.len())
     );
     assert!(response.header(header::CONTENT_RANGE).is_none());
     assert_eq!(response.body, bytes);
@@ -1042,9 +955,9 @@ async fn audio_returns_the_whole_file_with_range_metadata() {
 #[tokio::test]
 async fn audio_honours_the_three_range_forms() {
     let harness = harness();
-    let bytes = audio_segment(&harness, "seg-range", SegmentStatus::Complete);
+    let bytes = audio_recording(&harness, "rec-range");
     let total = bytes.len();
-    let uri = "/api/v1/segments/seg-range/audio";
+    let uri = "/api/v1/recordings/rec-range/audio";
 
     for (range, expected_start, expected_end) in [
         ("bytes=0-9", 0usize, 9usize),
@@ -1071,7 +984,7 @@ async fn audio_honours_the_three_range_forms() {
         );
         assert_eq!(
             response.header(header::ETAG).unwrap(),
-            format!("\"seg-range-{total}\"")
+            format!("\"rec-range-{total}\"")
         );
     }
 }
@@ -1079,8 +992,8 @@ async fn audio_honours_the_three_range_forms() {
 #[tokio::test]
 async fn audio_ignores_multi_ranges_and_rejects_unsatisfiable_ones() {
     let harness = harness();
-    let bytes = audio_segment(&harness, "seg-multi", SegmentStatus::Complete);
-    let uri = "/api/v1/segments/seg-multi/audio";
+    let bytes = audio_recording(&harness, "rec-multi");
+    let uri = "/api/v1/recordings/rec-multi/audio";
 
     // Multiple ranges are not supported: RFC 9110 allows the full response.
     for range in ["bytes=0-1,5-6", "bytes=0-1, 5-6", "items=0-1", "bytes=5-1"] {
@@ -1103,8 +1016,8 @@ async fn audio_ignores_multi_ranges_and_rejects_unsatisfiable_ones() {
 #[tokio::test]
 async fn audio_supports_head_with_and_without_a_range() {
     let harness = harness();
-    let bytes = audio_segment(&harness, "seg-head", SegmentStatus::Complete);
-    let uri = "/api/v1/segments/seg-head/audio";
+    let bytes = audio_recording(&harness, "rec-head");
+    let uri = "/api/v1/recordings/rec-head/audio";
 
     let response = head(&harness, uri, None).await;
     assert_eq!(response.status, StatusCode::OK);
@@ -1127,32 +1040,24 @@ async fn audio_supports_head_with_and_without_a_range() {
 }
 
 #[tokio::test]
-async fn audio_reports_404_409_and_410() {
+async fn audio_reports_a_missing_row_and_a_missing_file() {
     let harness = harness();
-    audio_segment(&harness, "seg-live", SegmentStatus::Recording);
-    audio_segment(&harness, "seg-gone", SegmentStatus::Deleted);
+    audio_recording(&harness, "rec-present");
 
-    let missing = get(&harness, "/api/v1/segments/nope/audio").await;
+    let missing = get(&harness, "/api/v1/recordings/nope/audio").await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
     assert_eq!(missing.json()["error"]["code"], "not_found");
 
-    let recording = get(&harness, "/api/v1/segments/seg-live/audio").await;
-    assert_eq!(recording.status, StatusCode::CONFLICT);
-    assert_eq!(recording.json()["error"]["code"], "audio_not_ready");
-
-    let deleted = get(&harness, "/api/v1/segments/seg-gone/audio").await;
-    assert_eq!(deleted.status, StatusCode::GONE);
-    assert_eq!(deleted.json()["error"]["code"], "audio_expired");
-
-    // A `complete` row whose file vanished is a 404, never a fake stream.
-    let mut orphan = SegmentSpec::new(
-        "seg-orphan",
+    // A row whose file vanished is a 404, never a fake stream. There is no
+    // status column to turn this into a 409 or a 410.
+    let mut orphan = RecordingSpec::new(
+        "rec-orphan",
         utc(1_735_732_800),
         "recordings/2025/01/01/orphan.wav",
     );
     orphan.size_bytes = 144;
-    add_segment(&harness, &orphan);
-    let orphaned = get(&harness, "/api/v1/segments/seg-orphan/audio").await;
+    add_recording(&harness, &orphan);
+    let orphaned = get(&harness, "/api/v1/recordings/rec-orphan/audio").await;
     assert_eq!(orphaned.status, StatusCode::NOT_FOUND);
     assert_eq!(orphaned.json()["error"]["code"], "audio_missing");
 }
@@ -1160,18 +1065,18 @@ async fn audio_reports_404_409_and_410() {
 #[tokio::test]
 async fn audio_serves_a_file_whose_size_disagrees_with_the_database() {
     let harness = harness();
-    let bytes = audio_segment(&harness, "seg-drift", SegmentStatus::Complete);
+    let bytes = audio_recording(&harness, "rec-drift");
     // Corrupt the stored size the way a half-written completion could.
     {
         let db = harness.database.lock().unwrap();
         db.connection()
             .execute(
-                "UPDATE recording_segments SET size_bytes=1 WHERE id='seg-drift'",
+                "UPDATE recordings SET size_bytes=1 WHERE id='rec-drift'",
                 [],
             )
             .unwrap();
     }
-    let response = get(&harness, "/api/v1/segments/seg-drift/audio").await;
+    let response = get(&harness, "/api/v1/recordings/rec-drift/audio").await;
     assert_eq!(response.status, StatusCode::OK);
     // The real file length wins so ranges stay consistent with the bytes sent.
     assert_eq!(
@@ -1180,7 +1085,7 @@ async fn audio_serves_a_file_whose_size_disagrees_with_the_database() {
     );
     assert_eq!(
         response.header(header::ETAG).unwrap(),
-        format!("\"seg-drift-{}\"", bytes.len())
+        format!("\"rec-drift-{}\"", bytes.len())
     );
     assert_eq!(response.body, bytes);
 }
@@ -1267,12 +1172,12 @@ async fn a_partially_read_audio_response_does_not_block_other_requests() {
     let harness = harness();
     let relative = "recordings/2025/01/01/big.wav";
     let bytes = write_recording(&harness, relative, 4 * 1024 * 1024);
-    let mut spec = SegmentSpec::new("seg-big", utc(1_735_732_800), relative);
+    let mut spec = RecordingSpec::new("rec-big", utc(1_735_732_800), relative);
     spec.size_bytes = bytes.len() as u64;
-    add_segment(&harness, &spec);
+    add_recording(&harness, &spec);
 
     let request = Request::builder()
-        .uri("/api/v1/segments/seg-big/audio")
+        .uri("/api/v1/recordings/rec-big/audio")
         .body(Body::empty())
         .unwrap();
     let response = harness.router.clone().oneshot(request).await.unwrap();
@@ -1292,9 +1197,9 @@ async fn a_partially_read_audio_response_does_not_block_other_requests() {
     let status = get(&harness, "/api/v1/status").await;
     assert_eq!(status.status, StatusCode::OK);
     assert_eq!(status.json()["service"]["state"], "ok");
-    let segments = get(&harness, "/api/v1/segments?date=2025-01-01").await;
-    assert_eq!(segments.status, StatusCode::OK);
-    assert_eq!(segments.json()["segments"].as_array().unwrap().len(), 1);
+    let recordings = get(&harness, "/api/v1/recordings?date=2025-01-01").await;
+    assert_eq!(recordings.status, StatusCode::OK);
+    assert_eq!(recordings.json()["recordings"].as_array().unwrap().len(), 1);
 
     // Drain the remainder to prove the open range really was served in full.
     let mut received = first.len();

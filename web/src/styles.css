@@ -586,7 +586,7 @@ button.on {
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
   grid-template-areas:
     'timeline detail'
-    'candidates detail';
+    'snore snore';
   gap: 16px;
   margin-bottom: 16px;
 }
@@ -595,8 +595,10 @@ button.on {
   grid-area: timeline;
 }
 
-.candidates-panel {
-  grid-area: candidates;
+/* The episodes span the page: they are a table, and a table squeezed into the
+   half-width column wraps every column into a paragraph. */
+.snore-panel {
+  grid-area: snore;
 }
 
 .detail-panel {
@@ -664,6 +666,42 @@ button.on {
   color: #ffd08a;
   font-family: var(--mono);
   font-size: 10.5px;
+}
+
+/* The summary and the one control the snore panel has. Right-aligned so the
+   title keeps its left edge, and they wrap together rather than separately. */
+.head-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px 18px;
+  flex-wrap: wrap;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A lens, not a setting: it re-groups the same records and writes nothing. */
+.gap-control {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10.5px;
+  color: #5c6c7d;
+}
+
+.gap-control button {
+  padding: 2px 7px;
+  font-size: 10.5px;
+  border-radius: 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+
+.gap-control button:hover:not(:disabled) {
+  color: var(--text);
 }
 
 .empty {
@@ -828,12 +866,67 @@ button.on {
   opacity: 0.85;
 }
 
-.tick.not_snore {
-  background: #46586b;
+/* Both zones are on the track at once (see `zoneOf`). Snoring keeps the accent
+   and the height it always had; a row that only claims "there was sound" is
+   shorter and dimmer, so the night reads at a glance as "these are the snores,
+   those are the rest" rather than as one undifferentiated column of ticks.
+   Height matters as much as hue: at day zoom the ticks are 2 px apart and a
+   difference in colour alone would not be visible. */
+.tick.sound {
+  top: 11px;
+  height: 7px;
+  background: #5d7c99;
+  opacity: 0.55;
 }
 
-.tick.snore {
-  background: var(--ok);
+/* A row a reviewer excluded. Still stored, still shown — but it is the one
+   label that says "not snoring", so it is drawn as an outline, not a claim. */
+.tick.not_snore {
+  background: transparent;
+  border: 1px solid #46586b;
+  width: 3px;
+}
+
+.tick.not_snore.sound {
+  border-color: #3d4f60;
+}
+
+.timeline-legend {
+  display: flex;
+  gap: 14px;
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  color: #5c6c7d;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend-item i {
+  display: block;
+  width: 2px;
+  height: 10px;
+  border-radius: 1px;
+}
+
+.legend-item.snore i {
+  background: var(--accent);
+}
+
+.legend-item.sound i {
+  height: 7px;
+  background: #5d7c99;
+}
+
+.legend-item.excluded i {
+  width: 3px;
+  height: 9px;
+  background: transparent;
+  border: 1px solid #46586b;
 }
 
 /* --- window selection ---------------------------------------------------- */
@@ -889,70 +982,360 @@ button.on {
   right: 4px;
 }
 
-/* --- events ------------------------------------------------------------- */
+/* --- two zones: snoring, and everything else ----------------------------- */
 
-.event-list {
+/* The panel holds two lists rather than one filtered list, so the boundary has
+   to be structural, not just a caption. The snoring zone keeps the page's own
+   surface; the sound zone is a recessed block inside it, which reads as "this
+   is the rest" before any label is parsed. */
+.zone {
+  min-width: 0;
+}
+
+.zone + .zone {
+  margin-top: 18px;
+}
+
+.zone-sound {
+  padding: 12px 12px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #0d141b;
+}
+
+.zone-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.zone-head h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.zone-snore .zone-head h3 {
+  color: #ffd08a;
+}
+
+.zone-sound .zone-head h3 {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.zone-total {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The secondary zone is dimmer throughout: same numbers, less ink. Its rows are
+   still clickable and still playable, so this is emphasis, not disablement. */
+.zone-sound .episode-row {
+  opacity: 0.82;
+}
+
+.zone-sound .episode-row:hover,
+.zone-sound .episode-row.active {
+  opacity: 1;
+}
+
+.zone-sound .episode-density i {
+  background: rgba(93, 124, 153, 0.5);
+}
+
+.zone-sound .snore-block {
+  background: rgba(93, 124, 153, 0.6);
+}
+
+.zone-sound .snore-block:hover:not(:disabled) {
+  background: #7fa3c4;
+}
+
+.zone-sound .snore-block.active {
+  background: var(--ok);
+}
+
+/* --- snore episodes ------------------------------------------------------ */
+
+/* The day's snoring as one line of blocks. It is the aggregate view: the
+   timeline above shows what was recorded, this shows when it happened, and
+   every block is a jump target. */
+.snore-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.snore-strip-track {
+  position: relative;
+  height: 12px;
+  border-radius: 6px;
+  background: #0c1218;
+  border: 1px solid var(--line);
+}
+
+.snore-block {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  padding: 0;
+  /* A block is a bar, not a button: no radius, no border, no hover chrome. */
+  border: 0;
+  border-radius: 2px;
+  background: rgba(245, 165, 36, 0.55);
+  cursor: pointer;
+}
+
+.snore-block:hover:not(:disabled) {
+  background: var(--accent);
+}
+
+/* The episode being replayed, in the healthy colour: this one is sounding. */
+.snore-block.active {
+  background: var(--ok);
+}
+
+/* Reclaimed audio: still a snore, but not a thing you can hear. */
+.snore-block.gone {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(132, 148, 165, 0.5),
+    rgba(132, 148, 165, 0.5) 2px,
+    transparent 2px,
+    transparent 4px
+  );
+}
+
+.snore-strip-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: #5c6c7d;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The column header. Same template as a row, so the labels sit over the values
+   they name even when a value is empty. The last two columns are the zone's own:
+   a reason chip, and the play glyph. */
+.episode-cols {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr) 100px 56px 148px 18px;
+  gap: 12px;
+  padding: 0 8px 4px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: #5c6c7d;
+}
+
+.episode-cols .right {
+  text-align: right;
+}
+
+.episode-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 320px;
+  gap: 2px;
+  max-height: 336px;
   overflow-y: auto;
+  scrollbar-width: thin;
 }
 
-.event {
-  display: flex;
+.episode-row {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr) 100px 56px 148px 18px;
   gap: 12px;
   align-items: center;
-  padding: 8px 10px;
-  border-radius: 10px;
+  width: 100%;
+  padding: 5px 8px;
   border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
 }
 
-.event:hover {
+.episode-row:hover {
   background: rgba(255, 255, 255, 0.025);
 }
 
-.event.snore {
-  border-color: rgba(45, 212, 167, 0.28);
+.episode-row.active {
+  background: rgba(245, 165, 36, 0.09);
+  border-color: rgba(245, 165, 36, 0.35);
 }
 
-.event.not_snore {
-  opacity: 0.55;
+.episode-row.active .episode-span b,
+.episode-row.active .episode-stat b {
+  color: var(--accent);
 }
 
-.event-time {
+/* The recording behind every record in this episode is gone: the numbers are
+   still true, the row is no longer a play button. */
+.episode-row.no-audio {
+  opacity: 0.6;
+}
+
+.episode-span {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.episode-span b {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.episode-span em {
+  font-style: normal;
+  color: #4b5b6c;
+}
+
+/* The span length is a different quantity from the clock, so it is dimmer and
+   in the UI font rather than the mono one. */
+.episode-span i {
+  margin-left: 8px;
+  font-family: var(--font);
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* One bar per equal slice of the episode. Bars are bottom-aligned so the row
+   reads as a skyline: where the snoring was dense, the bars are tall. */
+.episode-density {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 24px;
+  min-width: 0;
+}
+
+/* A one-record episode has nothing to distribute over time: forty full bars
+   would shout "100%!" about a measurement that has no shape. A hairline says
+   "one thing happened, the numbers are beside it". */
+.episode-density.single::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(245, 165, 36, 0.3);
+}
+
+.episode-density i {
+  flex: 1;
+  min-width: 1px;
+  border-radius: 1px;
+  background: rgba(245, 165, 36, 0.42);
+}
+
+.episode-row.active .episode-density i {
+  background: var(--accent);
+}
+
+.episode-stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 6px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.episode-stat b {
+  font-weight: 500;
+}
+
+/* Share of the span that was sound. The number that distinguishes "snored for
+   half an hour" from "snored three times in half an hour". */
+.episode-stat i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--muted);
+  min-width: 26px;
+  text-align: right;
+}
+
+.episode-count {
+  text-align: right;
+  font-size: 11px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
-  min-width: 66px;
+  white-space: nowrap;
 }
 
-.event-body {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+.episode-count b {
+  color: var(--text);
+  font-weight: 600;
 }
 
-.event-meta {
-  font-size: 12px;
-  color: #c2ced9;
-  font-variant-numeric: tabular-nums;
+/* Why a row is in this zone: the annotator and the review label. The sound
+   zone leans on this column — "规则候选 · 未复核" is the fact that keeps it out
+   of the snoring list above. */
+.episode-reason {
+  font-size: 10px;
+  color: #6d8095;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* A label carried over from a previously reviewed night. There is no control
-   next to it any more: this page reports candidates, it does not grade them. */
-.event-tag {
-  flex: none;
-  padding: 1px 7px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  font-size: 10.5px;
+.zone-snore .episode-reason {
+  color: #8c9caf;
+}
+
+/* Play / stop. A glyph, not a button inside a button: the whole row is the
+   control, this only says what clicking it does. */
+.episode-play {
+  font-size: 9px;
+  line-height: 1;
+  text-align: center;
+  color: #5c6c7d;
+}
+
+.episode-row:hover .episode-play,
+.episode-row.active .episode-play {
+  color: var(--accent);
+}
+
+.snore-note {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #ffcf8a;
+}
+
+/* Shown whenever the panel is aggregating rule-v1 rows. Amber, not red: the
+   layer is useful, it is just answering a different question than the one the
+   panel's title asks. */
+.snore-caveat {
+  margin: 0 0 12px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(240, 182, 75, 0.28);
+  background: rgba(240, 182, 75, 0.07);
+  font-size: 11px;
+  line-height: 1.6;
+  color: #f6d9a2;
+}
+
+.snore-foot {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.65;
   color: var(--muted);
 }
 
@@ -1009,6 +1392,13 @@ button.on {
   font-weight: 600;
 }
 
+/* The annotation the panel is explaining: source, review, label, confidence.
+   It sits above the player because it is the *reason* the player is loaded with
+   this file, not a fact about the file. */
+.facts.annotation {
+  margin-bottom: 12px;
+}
+
 /* The one actionable sentence under a card whose state needs explaining. Not a
    banner: the card is still working, one input of it is not. */
 .signal-hint {
@@ -1027,7 +1417,7 @@ button.on {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       'timeline'
-      'candidates'
+      'snore'
       'detail';
   }
   .pool-facts {
@@ -1047,6 +1437,23 @@ button.on {
   }
   .day-filter {
     margin-left: auto;
+  }
+}
+
+/* The episode row is a table row, so it narrows by dropping the columns that
+   are context rather than measurement — the density glyph is a picture, and the
+   reason repeats what the zone's own heading already said. */
+@media (max-width: 760px) {
+  .episode-cols,
+  .episode-row {
+    grid-template-columns: minmax(0, 1fr) 92px 52px 18px;
+    gap: 8px;
+  }
+  .episode-cols span:nth-child(2),
+  .episode-cols span:nth-child(5),
+  .episode-density,
+  .episode-reason {
+    display: none;
   }
 }
 

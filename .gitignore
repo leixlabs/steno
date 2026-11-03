@@ -84,3 +84,9 @@ venv/
 # The steno-eval corpus is third-party audio, not source; it is fetched, not
 # committed. Deploys are fine without it.
 testdata/steno-eval/
+
+# --- audio.cpp models ------------------------------------------------------
+# `audiocpp_model_manager install <pkg>` writes packages under `$PWD/models`, so
+# running it from the repo root leaves 1–4 GB of GGUF weights here. Weights are
+# fetched per machine (`--backend audiocpp --model <dir>`), never committed.
+/models/

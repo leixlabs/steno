@@ -16,6 +16,7 @@
 //! The schema is not in this crate: the DDL lives in `migrations/*.sql`, and
 //! [`migrate`] applies it in the format `sqlx migrate` reads.
 
+pub mod audiocpp;
 pub mod control;
 pub mod db_writer;
 pub mod dispatcher;
@@ -27,6 +28,5 @@ pub mod recovery;
 pub mod retention;
 pub mod sidecar_wire;
 pub mod storage;
-pub mod stt;
 pub mod stt_stream;
 pub mod transcript_hub;

@@ -45,7 +45,10 @@ FOREGROUND=0
 ADOPT=1
 STT_MODE=""
 CONTROL_MODE=""
+# The Pi is a bedside device that has to come back by itself after a power cut,
+# so every refresh enables the node at boot (`--no-enable-node` opts out).
 PI_ARGS=()
+NODE_ENABLE=1
 FAILED=()
 
 usage() {
@@ -66,6 +69,7 @@ Options:
   --reset-config        regenerate the runtime config from the template
   --pi-host HOST        passed to tools/deploy-node.sh (default: $PI_HOST)
   --pi-user USER        passed to tools/deploy-node.sh (default: $PI_USER)
+  --no-enable-node      do not enable steno-node at boot on the Pi (default: enabled)
   --no-adopt            do not move a legacy $TMPDIR/steno-server into place
   --foreground          start the server in this shell instead of detaching
   --dry-run             print every action, change nothing
@@ -85,6 +89,7 @@ while [ $# -gt 0 ]; do
     --reset-config) RESET_CONFIG=1; shift ;;
     --pi-host) PI_ARGS+=(--host "$2"); shift 2 ;;
     --pi-user) PI_ARGS+=(--user "$2"); shift 2 ;;
+    --no-enable-node) NODE_ENABLE=0; shift ;;
     --foreground) FOREGROUND=1; shift ;;
     --no-adopt) ADOPT=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -304,6 +309,13 @@ fi
 if [ "$DRY_RUN" != 1 ] && [ ! -x "$BIN" ]; then
   die "no server binary at $BIN"
 fi
+# The audio.cpp recogniser is a second [[bin]] of the same crate, so it was built by
+# the command above. It is only needed when `[stt] stream_command` points at it, and
+# a missing one is a warning rather than a failure: the Apple sidecar does not use it.
+AUDIOCPP_BIN="$(dirname "$BIN")/steno-stt-sidecar-audiocpp"
+if [ "$DRY_RUN" != 1 ] && [ ! -x "$AUDIOCPP_BIN" ]; then
+  warn "no $AUDIOCPP_BIN; [stt] stream_command cannot select the audio.cpp engine"
+fi
 
 # --- 4. stop the server -----------------------------------------------------
 # Stopping before the sidecar and the node are touched means nothing is reading a
@@ -345,16 +357,28 @@ fi
 
 # --- 6. capture node --------------------------------------------------------
 step 6 "capture node (Pi)"
+# Boot state is passed explicitly rather than left to deploy-node.sh's default:
+# this script is what runs after every edit, and a Pi that silently drops back to
+# "starts only when someone logs in" is invisible until the first power cut.
+NODE_ARGS=()
+if [ "${#PI_ARGS[@]}" -gt 0 ]; then
+  NODE_ARGS=("${PI_ARGS[@]}")
+fi
+if [ "$NODE_ENABLE" = 1 ]; then
+  NODE_ARGS+=(--enable)
+else
+  NODE_ARGS+=(--no-enable)
+fi
 if [ "$DO_NODE" = 0 ]; then
   say "skipped (--no-node)"
 elif [ "$DRY_RUN" = 1 ]; then
   printf '  [dry-run] %s/deploy-node.sh' "$REPO_ROOT/tools"
-  [ "${#PI_ARGS[@]}" -gt 0 ] && printf ' %s' "${PI_ARGS[@]}"
+  printf ' %s' "${NODE_ARGS[@]}"
   printf '\n'
 else
   # A node that cannot be reached must not stop the local refresh: the server is
   # still worth restarting with the new Portal and sidecar.
-  if "$REPO_ROOT/tools/deploy-node.sh" "${PI_ARGS[@]+"${PI_ARGS[@]}"}"; then
+  if "$REPO_ROOT/tools/deploy-node.sh" "${NODE_ARGS[@]}"; then
     say "node deployed"
   else
     warn "node deploy failed; the local refresh continues"

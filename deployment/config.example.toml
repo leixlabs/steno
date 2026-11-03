@@ -160,47 +160,57 @@ max_event_seconds = 15
 
 [stt]
 # Speech-to-text is off unless asked for: it is the only stage that hands audio
-# to another program. The Apple backend lives in apple-stt-sidecar and runs
-# `SpeechAnalyzer` on-device; it needs no permission grant (macOS 26+).
+# to another program. Two engines ship in apple-stt-sidecar, and neither needs a
+# permission grant (macOS 26+): Apple's `SpeechAnalyzer` (`--backend apple`,
+# default) and audio.cpp running a Qwen3-ASR GGUF package (`--backend audiocpp`).
 enabled = false
 # How the recogniser is driven.
 #
-#   "stream"  — one long-lived sidecar fed over a Unix socket. Text appears while
-#               the person is still talking and no process is launched per
-#               segment. This is the default, and it needs `stream_command`.
-#   "segment" — the sidecar is run once per finished WAV. Simpler, restart-safe,
-#               but text only appears after the segment closes.
+#   "stream" — one long-lived sidecar fed over a Unix socket. Text appears while
+#              the person is still talking. This is the only supported mode.
 #
-# Under "stream" the API's `stt.connected` is meaningful; under "segment" there
-# is no live channel, so `/status` reports `stt.state = "segment"` instead of
-# pretending the recogniser is disconnected.
+# The old per-file mode ("segment") was removed: recording exists because it
+# produced text or an episode, so there is nothing left to transcribe after the
+# fact. A config that still says `mode = "segment"` is refused by name.
 mode = "stream"
 # Launcher that starts the streaming sidecar with the socket path as its only
 # argument. `steno-stt-sidecar` is installed by
 # apple-stt-sidecar/install.sh; it goes through LaunchServices (`open -a`)
 # because that is the only way to start it and return immediately.
+#
+# To run audio.cpp's Qwen3-ASR instead of Apple's recogniser, point this at the
+# Rust sidecar that is built and installed with this crate. It speaks the same
+# wire, takes the same single argument, and needs no app bundle and no wrapper:
+#
+#   stream_command = "/usr/local/bin/steno-stt-sidecar-audiocpp"
+#
+# The engine's own facts come from the server's environment (systemd
+# `Environment=`), and are validated before the engine is spawned:
+#
+#   STENO_STT_MODEL          the .gguf to load. A directory is accepted only while
+#                            it holds exactly one — the engine refuses to pick, and
+#                            so does this sidecar's startup check.
+#   STENO_STT_CHUNK          decode window in seconds, 1..30 (default 5)
+#   STENO_STT_AUDIOCPP_BIN   audiocpp_cli to run (default: the one on PATH)
+#
+# The choice is local — it means different weights on disk — so it is made here
+# and not on the wire. `steno-stt-sidecar-audiocpp --check` prints what the
+# machine actually has, and exits non-zero when it could not run.
 stream_command = "steno-stt-sidecar"
 # Unix socket the sidecar connects back to. Empty derives it from the process id
 # (`$TMPDIR/steno-stt-<pid>.sock`), which is right for a single instance.
 socket_path = ""
 # Stored with each transcript so a mixed history stays readable. Rows recorded
 # before the SpeechAnalyzer migration say `apple-sfspeech`; this is the label for
-# new ones.
+# new ones. It is the fallback: the sidecar reports its own label on `ready` and
+# that one wins, which is how `steno-stt-sidecar-audiocpp` writes
+# `audiocpp-qwen3-asr` without editing this file.
 engine = "apple-speechanalyzer"
 # Language the recogniser listens for. Sent to the sidecar in the `config` frame
 # that precedes the first audio block: the orchestrator decides the language, and
 # a sidecar guessing it from a built-in default would transcribe a night in the
 # wrong one. Must be a locale the sidecar reports in `--check`.
 locale = "zh-CN"
-# Executable that takes the WAV path and prints one JSON object on stdout. Only
-# used when `mode = "segment"`; it is ignored by the streaming lane.
-command = "steno-stt-sidecar-file"
-args = []
-# Clips shorter than this are skipped: a 2-second clip rarely carries speech.
-min_segment_seconds = 3
-# The queue is the database, so a crash just resumes on the next pass.
-poll_interval_seconds = 20
-timeout_seconds = 120
 
 [control]
 # Service lifecycle control, used by the Portal's control centre to start, stop

@@ -10,6 +10,9 @@
 
 ## 1. 产品目标
 
+> **2026-11-03 修正：** 本文的 §7 数据模型（五张表：`recording_segments` / `audio_gaps` / `snore_events` / `segment_transcripts` / `utterances`）已被三张表取代：`recordings` / `episodes` / `transcripts`。代码是准绳，见 `docs/decisions/2026-11-03-three-tables.md`。段、空洞、状态机、时钟质量、段级转写都没有了；空洞只剩 `recordings.lost_frames` 一个数。
+
+
 构建本地睡眠声音监测系统：树莓派持续保存 USB 麦克风的原始 PCM 录音；轻量规则产生疑似鼾声时间段；Portal 按日期显示录音覆盖、鼾声候选时间轴并可回放；录音超过配置上限时自动删除最旧完整录音片段。
 
 本系统用于个人观察和算法验证，不是医疗器械，不提供睡眠呼吸暂停或其他疾病诊断。

@@ -33,10 +33,9 @@ variables, and `/tmp/steno-stt-sidecar.log`. The rename from `snore-*` is done;
 do not reintroduce the old prefix.
 
 What is deliberately still spelled `snore` is the *signal*, not the product:
-`snore_events`, `ReviewStatus::Snore` / `NotSnore`, the `snore` / `not_snore`
-review values, and "snore band" in DSP prose. Keeping the table name avoids a
-schema migration that would buy nothing; the detector still marks snore
-candidates, the product is just not only about them.
+`episodes`, `ReviewStatus::Snore` / `NotSnore` and the `snore` / `not_snore`
+review values, plus "snore band" in DSP prose. The detector still marks snore
+candidates; the product is just not only about them.
 
 Consequence for an existing deployment: nothing migrates itself. The unit names,
 the service user, `/etc/snore-monitor` → `/etc/steno-monitor`, the SQLite path
@@ -97,12 +96,16 @@ crates/server         recording, detection, storage, transcription, HTTP + Porta
   db_writer           the single writer thread; one rusqlite connection
   net_capture         UDP receive half of the split deployment
   stt, stt_stream     per-segment and streaming transcription workers
+  audiocpp            the audio.cpp recogniser as a sidecar in Rust: config, engine
+                      driver, socket session (binary `steno-stt-sidecar-audiocpp`)
   control             `systemctl start/stop/restart` for the two units; off by default, loopback-only
   http_server         Axum REST API + static Portal
   main.rs             runtime assembly and shutdown order
 crates/node           capture-only binary (package `steno-node`): microphone → UDP. No disk, no DB, no listener
 web                   Vite + React 19 + TS control centre (build output `web/dist`, not committed)
-apple-stt-sidecar  audio hub .app: microphone/socket/file → SpeechAnalyzer + SoundAnalysis,
+apple-stt-sidecar  audio hub .app: microphone/socket/file → a replaceable recogniser
+                   (`--backend apple` SpeechAnalyzer | `--backend audiocpp` Qwen3-ASR,
+                   contract in Sources/Backend.swift) + SoundAnalysis snore lane,
                    binary framing both ways (see apple-stt-sidecar/README.md)
 tools/dev.sh          dev supervisor: web/server/sidecar/node, per-service reload, console panel
 tools/refresh-all.sh  rebuild + redeploy every runtime, then restart and verify
@@ -183,6 +186,7 @@ Two scripts cover the loop; both are the documented path, so keep them working.
 tools/dev.sh                     # web + server + sidecar, all watched
 tools/dev.sh --with-node         # ...plus a local capture node (real UDP path)
 tools/dev.sh --only server,sidecar
+tools/dev.sh --backend audiocpp  # audio.cpp's Qwen3-ASR instead of Apple
 tools/dev.sh status              # one-shot panel from any shell
 tools/dev.sh logs sidecar -f     # the sidecar's own log, live
 tools/dev.sh reload sidecar      # rebuild + relaunch one service
@@ -192,15 +196,18 @@ tools/dev.sh stop web | start web | logs server | schema | quit
 
 The supervisor owns `web` (Vite), `server`, `sidecar` and, optionally, `node`. The
 sidecar is still launched *by the server* — dev.sh only points `[stt]
-stream_command` at a generated wrapper that runs the bundle built in this repo,
-detached, so no `install.sh` is needed and no LaunchServices launch hides the
-process. `reload sidecar` rebuilds the bundle and kills the process; the stt
+stream_command` at a generated wrapper that runs the recogniser built in this repo
+(the Swift bundle, or `target/debug/steno-stt-sidecar-audiocpp` under `--backend
+audiocpp`), detached, so no `install.sh` is needed and no LaunchServices launch
+hides the process. `reload sidecar` rebuilds it and kills the process; the stt
 worker reconnects and starts the new build within its 5 s restart delay.
 
 Reload-on-change: `crates/**/*.rs` → build, then SIGTERM the old process and start
 the new one — but only after the build succeeds, so a syntax error leaves the
 running server alone instead of taking the page you were looking at off the air.
-`apple-stt-sidecar/Sources/**` rebuilds the bundle and restarts the sidecar;
+`apple-stt-sidecar/Sources/**` rebuilds the bundle and restarts the sidecar (not
+watched under `--backend audiocpp`: that sidecar is a `[[bin]]` of the server
+crate, so `crates/server/**` already covers it and no Swift is built);
 `crates/node/**` does the same for the node when that role is on. `web/src/**`
 needs nothing: Vite HMR.
 
@@ -262,7 +269,7 @@ the *parent*: files land in `var/recordings/recordings/YYYY/MM/DD/`.
 
 ```sh
 tools/deploy-node.sh --host 192.168.31.58        # defaults: user pi, server = this Mac's LAN IP
-tools/deploy-node.sh --host pi.local --enable    # also start at boot
+tools/deploy-node.sh --host pi.local --no-enable # deploy without touching the boot state
 tools/deploy-node.sh --no-build                  # reinstall the existing cross build
 ```
 
@@ -270,9 +277,11 @@ It cross-builds with `cargo-zigbuild` against `~/armhf-sysroot`, refuses an
 artifact whose newest `GLIBC_` symbol is above 2.28, then creates the
 `steno-node` account, **adds it to `audio`** (without that, ALSA exposes only the
 `null` device and the node looks healthy while recording nothing), installs the
-binary/config/unit, restarts, and prints the journal line that proves capture
-starts. `alsa_device` is preserved from the device unless `--alsa-device` is
-passed, because cpal matches the device *description* string.
+binary/config/unit, **enables it at boot**, restarts, and prints the journal line
+that proves capture starts. `alsa_device` is preserved from the device unless
+`--alsa-device` is passed, because cpal matches the device *description* string —
+swapping the microphone changes that string, and the old one then fails startup
+with `DeviceNotFound`.
 
 Permanent deployment stays `deployment/` + `docs/operations/2026-10-29-pi-deploy.md`; these
 scripts are for the edit → deploy → watch loop.
@@ -304,12 +313,12 @@ box-to-file map is at the end of the section.
                     audio up, events back         ├─ SpeechAnalyzer ──► text
                                                   └─ SoundAnalysis  ──► snore episodes
                                         │
-                                        ├─► utterances      (phrases, with wall-clock bounds)
-                                        └─► snore_events    (source='apple-soundanalysis-v1')
+                                        ├─► transcripts   (phrases, with wall-clock bounds)
+                                        └─► episodes      (source='apple-soundanalysis-v1')
 
  4  WHAT IS KEPT               (a side effect of the main line)
       disk   *.wav under storage.recording_dir
-      db     app.db (WAL, v4): segments, gaps, events, transcripts
+      db     app.db (WAL, v6): recordings, episodes, transcripts
                                         │
                                         ├─► HTTP :8080 ─► Portal ─► browser
                                         ├─► stt worker (mode="segment") ──► transcripts
@@ -352,11 +361,10 @@ all converted once to 16 kHz mono — and fans each block out to two lanes:
 finalises its own results as audio flows, so there is no rotation, no endpoint
 timer and no re-decode of audio Apple refused to finalise — that whole layer was
 deleted with `SFSpeechRecognizer`. The classifier lane is a second, independent
-annotator: its episodes land in `snore_events` with `source='apple-soundanalysis-v1'`
+annotator: its episodes land in `episodes` with `source='apple-soundanalysis-v1'`
 so they can never be confused with the server's own `rule-v1` rows. Both lanes
 run on-device and need no permission grant; only `--mode mic` needs the
-microphone prompt. Setting `mode = "segment"` swaps the socket for a one-shot
-`stt.command`.
+microphone prompt.
 
 The one-writer rule is about the audio path, not the file: `DbWriter` owns the
 connection used by recorder and detector, while HTTP, both STT workers and the
@@ -394,12 +402,13 @@ Ownership rules that must not drift:
 - **`CaptureRing::callback_push(&[i16], CaptureMeta)` is the one producer
   contract.** ALSA and UDP both use it; everything downstream is source-agnostic.
   A new source belongs at that seam, not inside the dispatcher.
-- **The dispatcher owns every segmentation decision.** Rotation is by stored
-  frame count (never wall clock), and each forced rotation carries one of
-  `duration | gap | time_step | format_change | size_limit | shutdown | error`,
-  mirrored into `recording_segments.end_reason`. Recorder and detector only react
-  to `DispatcherMessage`. Note the ordering bug already fixed once: check frames
-  first, bytes as a fallback, or every normal rotation gets labelled `size_limit`.
+- **The dispatcher owns every rotation decision.** Rotation is by stored frame
+  count (never wall clock), and each forced rotation carries one of
+  `duration | gap | time_step | format_change | size_limit | shutdown | error`
+  on `SegmentEnd`. Recorder and detector only react to `DispatcherMessage`; the
+  dispatcher writes no rows. Note the ordering bug already fixed once: check
+  frames first, bytes as a fallback, or every normal rotation gets labelled
+  `size_limit`.
 - **`segment_offset_frames` is annotated by the dispatcher**, together with
   `gap_before_frames`/`gap_kind`. Nothing downstream recomputes offsets.
 - **Queues split audio slots from control slots** (`BoundedQueue`): audio pushes
@@ -461,15 +470,14 @@ Tables:
 
 | Table | Holds |
 |---|---|
-| `recording_segments` | one row per WAV: start/end, frames, bytes, `status`, `end_reason`, gap/xrun counters, `time_quality` |
-| `audio_gaps` | every registered hole: offset, lost frames, kind, `estimate_source` |
-| `snore_events` | candidate events with feature columns, `review_status`, `continued`, `detector_version` |
-| `segment_transcripts` | one transcript per segment (primary key `segment_id`); `status` `ok`/`failed` |
-| `utterances` | streaming-recogniser phrases with absolute times (migration `0003`) |
+| `recordings` | one row per finished WAV: start/end, rate, channels, frames, bytes, `lost_frames` |
+| `episodes` | one snore from either detector: source, label, confidence, `review_status`, optional `recording_id` |
+| `transcripts` | one recognised phrase with wall-clock bounds and optional `recording_id` |
 
-Segment status vocabulary: `recording`, `complete`, `interrupted`, `missing`,
-`deleted`. `interrupted` comes from a repaired `.partial`; `missing` means the row
-promises audio that is gone (it does not auto-clear — that is intentional).
+`episodes.recording_id` / `transcripts.recording_id` are `ON DELETE SET NULL`:
+an annotation outlives the audio retention deleted, and a snore may be recorded
+before the file that carries it closes. There is no status column — a file on
+disk is either there or it is not, and a `.partial` is not a recording yet.
 
 On disk, below `storage.recording_dir`:
 
@@ -610,11 +618,9 @@ is always `{"error":{"code","message"}}`.
 |---|---|
 | `GET /api/v1/status` | service/recording/microphone/detector/storage/capture/source/queues/dsp/time/stt + `signal_state` |
 | `GET /api/v1/days?from=&to=` | both `YYYY-MM-DD`, required, span ≤ 366 days; only days that actually hold data |
-| `GET /api/v1/segments?date=` | `date` required, interpreted in `server.timezone` |
-| `GET /api/v1/segments/{id}/gaps` | |
-| `GET /api/v1/segments/{id}/audio` | supports `Range`; 200/206/416 |
-| `GET /api/v1/segments/{id}/transcript` | `null` when not transcribed yet |
-| `GET /api/v1/transcripts?date=`, `GET /api/v1/utterances?date=` | per-segment transcripts, streaming phrases |
+| `GET /api/v1/recordings?date=` | `date` required, interpreted in `server.timezone` |
+| `GET /api/v1/recordings/{id}/audio` | supports `Range`; 200/206/416 |
+| `GET /api/v1/transcripts?date=`, `GET /api/v1/utterances?date=` | both read `transcripts`; `utterances` keeps the older view shape |
 | `GET /api/v1/events?date=`, `GET /api/v1/events/{id}` | |
 | `PATCH /api/v1/events/{id}` | body `{"review_status": "snore"\|"not_snore"\|"unreviewed"}` |
 | `GET /api/v1/control` | both units' `systemctl is-active` plus why control cannot act; `spawn_blocking` |
@@ -646,8 +652,6 @@ another program. Where that program sits, and how it is launched, is in
   also speaks the same protocol over stdin/stdout (`--mode stdio`) for embedding
   and for the probe. `SpeechAnalyzer` needs no permission grant; rebuilding the
   bundle needs no re-authorisation.
-- `mode = "segment"`: runs `stt.command` per finished WAV and parses one JSON
-  object from stdout. Simpler, restart-safe, one process launch per segment.
 
 Watching it without the Portal: `tools/stt-watch.py` subscribes to
 `/api/v1/transcript` (the same WebSocket the page uses) and polls `/status` for

@@ -5,9 +5,14 @@
 #   PREFIX=$HOME/.local ./install.sh
 #
 # Produces:
-#   $PREFIX/lib/steno-stt-sidecar.app   the sidecar bundle
-#   $PREFIX/bin/steno-stt-sidecar       stream mode, what `[stt] stream_command` calls
+#   $PREFIX/lib/steno-stt-sidecar.app   the sidecar bundle (Apple's recogniser)
+#   $PREFIX/bin/steno-stt-sidecar       stream mode, Apple's recogniser
 #   $PREFIX/bin/steno-stt-sidecar-file  file mode,   what `[stt] command` calls
+#
+# audio.cpp's Qwen3-ASR is **not** installed here any more: it is a Rust sidecar
+# built from `crates/server` (`steno-stt-sidecar-audiocpp`), installed with the
+# server, configured by `STENO_STT_MODEL` / `STENO_STT_CHUNK` in its environment.
+# See `docs/decisions/2026-11-03-audiocpp-sidecar-rust.md`.
 #
 # The previous release installed `snore-stt-apple`, `snore-stt-stream` and
 # `snore-stt-gui`. Those are deliberately not replaced: a stale wrapper pointing

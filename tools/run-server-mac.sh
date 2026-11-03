@@ -153,9 +153,6 @@ mode = "stream"
 stream_command = "steno-stt-sidecar"
 engine = "apple-speechanalyzer"
 locale = "zh-CN"
-min_segment_seconds = 3
-poll_interval_seconds = 20
-timeout_seconds = 120
 
 [control]
 # Off by default. Only valid with a loopback bind, which is the default here.

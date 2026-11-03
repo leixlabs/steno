@@ -46,14 +46,6 @@ impl WavFormat {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct SegmentFile {
-    pub id: String,
-    pub relative_path: PathBuf,
-    pub started_at_utc: DateTime<Utc>,
-    pub format: WavFormat,
-}
-
 #[derive(Debug)]
 pub struct WavRecorder {
     partial_path: PathBuf,
@@ -78,7 +70,7 @@ impl WavRecorder {
     ) -> Result<Self> {
         validate_relative_path(relative_path)?;
         if max_segment_bytes + WAV_HEADER_BYTES >= RIFF_MAX_BYTES {
-            return Err(Error::Storage("configured segment limit does not fit classic RIFF".into()));
+            return Err(Error::Storage("configured recording limit does not fit classic RIFF".into()));
         }
         let final_path = recording_root.join(relative_path);
         let parent = final_path.parent().ok_or_else(|| Error::Storage("WAV path has no parent directory".into()))?;
@@ -130,7 +122,7 @@ impl WavRecorder {
     /// frame count; `Err` means the caller must rotate before writing more data.
     pub fn append_s16(&mut self, interleaved: &[i16]) -> Result<u64> {
         if self.closed {
-            return Err(Error::Storage("cannot append to a closed WAV segment".into()));
+            return Err(Error::Storage("cannot append to a closed WAV recording".into()));
         }
         if !interleaved.len().is_multiple_of(self.format.channels as usize) {
             return Err(Error::Storage(format!(
@@ -143,7 +135,7 @@ impl WavRecorder {
         if self.data_bytes.saturating_add(bytes) > self.max_segment_bytes
             || self.data_bytes.saturating_add(bytes) + WAV_HEADER_BYTES >= RIFF_MAX_BYTES
         {
-            return Err(Error::Storage("segment size limit reached; rotate before writing this block".into()));
+            return Err(Error::Storage("recording size limit reached; rotate before writing this block".into()));
         }
 
         let samples_per_batch = (WRITE_BATCH_BYTES / std::mem::size_of::<i16>()).max(1);
@@ -174,8 +166,9 @@ impl WavRecorder {
         Ok(())
     }
 
-    /// Finishes a segment: header -> fdatasync -> atomic rename. DB completion is
-    /// performed by the caller only after this returns successfully.
+    /// Finishes a recording: header -> fdatasync -> atomic rename. The
+    /// `recordings` row is published by the caller only after this returns
+    /// successfully.
     pub fn close(mut self) -> Result<(PathBuf, u64, u64)> {
         self.flush_header_and_sync()?;
         self.file.flush().map_err(|e| Error::io(&self.partial_path, e))?;
@@ -206,7 +199,7 @@ impl Drop for WavRecorder {
 
 /// Constructs `recordings/YYYY/MM/DD/<UTC-start>_<id>.wav` and the matching DB
 /// relative path.
-pub fn segment_relative_path(started_at: DateTime<Utc>, id: &str) -> PathBuf {
+pub fn recording_relative_path(started_at: DateTime<Utc>, id: &str) -> PathBuf {
     PathBuf::from(format!(
         "recordings/{:04}/{:02}/{:02}/{}_{}.wav",
         started_at.year(),
@@ -373,7 +366,7 @@ mod tests {
     #[test]
     fn generated_paths_are_utc_calendar_paths() {
         let start = DateTime::parse_from_rfc3339("2025-01-02T03:04:05.678Z").unwrap().to_utc();
-        let path = segment_relative_path(start, "seg-id");
+        let path = recording_relative_path(start, "seg-id");
         assert_eq!(path, PathBuf::from("recordings/2025/01/02/20250102T030405.678Z_seg-id.wav"));
     }
 }

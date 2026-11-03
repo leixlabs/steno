@@ -11,7 +11,7 @@
 //! stt queue ──► writer task ──► [ 8-byte header | payload ] ──► sidecar
 //!                                    ▲                        │
 //!                                    └── control / config ◄────┘
-//! reader task ──► store task (rusqlite) ──► utterance + snore_events
+//! reader task ──► store task (rusqlite) ──► transcripts + episodes
 //!             └─► metrics / TranscriptHub ──► Portal
 //! ```
 //!
@@ -41,8 +41,7 @@
 //! A session that ends for any reason is restarted after `restart_delay`, and the
 //! reason is kept in `Metrics::set_stt_error` until the next `ready`. The one
 //! thing never done here is pretending: a phrase that the database refused is not
-//! published, an episode with no recorded segment behind it is logged as
-//! unstored, and an unknown frame is a warning, not a shrug.
+//! published, and an unknown frame is a warning, not a shrug.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,10 +62,10 @@ use crate::sidecar_wire::{
     self as wire, Config, Control, Direction, MsgType, SessionEvent, SnoreEvent,
     TranscriptEvent as SidecarTranscript,
 };
-use crate::storage::{ClassifiedEvent, Database, UtteranceRow};
+use crate::storage::{ClassifiedEvent, Database, TranscriptRow};
 use crate::transcript_hub::{TranscriptEvent, TranscriptHub};
 
-/// `snore_events.source` for a row produced by the sidecar's classifier. The
+/// `episodes.source` for a row produced by the sidecar's classifier. The
 /// server's own detector writes `rule-v1`; the two can annotate the same second
 /// of audio and must never be conflated.
 pub const CLASSIFIER_SOURCE: &str = "apple-soundanalysis-v1";
@@ -116,7 +115,7 @@ enum Outbound {
 /// Work handed to the single thread that owns the database connection.
 #[derive(Debug)]
 enum Stored {
-    Utterance(Box<UtteranceRow>),
+    Phrase(Box<TranscriptRow>),
     Snore(Box<SnoreEvent>),
 }
 
@@ -270,26 +269,73 @@ async fn serve(
     result
 }
 
+/// How long a launcher may take before it is assumed to be the sidecar itself.
+///
+/// Three shapes have to work here:
+///
+/// * a wrapper that hands the bundle to LaunchServices and exits 0 immediately
+///   (`open -n -a …`) — the sidecar appears later, elsewhere;
+/// * a launcher that *is* the sidecar and never exits — `steno-stt-sidecar-audiocpp`
+///   runs until the session ends. Waiting for it, as this used to, would block
+///   before `accept()` and deadlock the pipeline;
+/// * a launcher that fails at startup and exits non-zero, whose reason must reach
+///   the log instead of becoming a bare "did not connect".
+///
+/// Waiting this long before deciding covers the third without costing the second.
+const LAUNCH_GRACE: Duration = Duration::from_millis(400);
+
 async fn launch_sidecar(options: &StreamOptions) -> Result<(), StreamError> {
     let program = options.launcher.clone();
     let socket = options.socket_path.clone();
-    // `open` returns as soon as the bundle is handed to LaunchServices, which is
-    // what keeps this from blocking until the night is over.
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&program).arg(&socket).status()
+    let child = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&program).arg(&socket).spawn()
     })
     .await
-    .map_err(|error| StreamError::Io(std::io::Error::other(error)))?;
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(StreamError::Launch {
-            program: options.launcher.clone(),
-            source: std::io::Error::other(format!("launcher exited with {status}")),
-        }),
-        Err(source) => Err(StreamError::Launch {
-            program: options.launcher.clone(),
-            source,
-        }),
+    .map_err(|error| StreamError::Io(std::io::Error::other(error)))?
+    .map_err(|source| StreamError::Launch {
+        program: options.launcher.clone(),
+        source,
+    })?;
+
+    let mut child = child;
+    let deadline = Instant::now() + LAUNCH_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(StreamError::Launch {
+                    program: options.launcher.clone(),
+                    source: std::io::Error::other(format!(
+                        "launcher exited with {status} (its reason is the last line it printed)"
+                    )),
+                });
+            }
+            // Still running: on this path the launcher *is* the sidecar, and it will
+            // run until the night is over. Hand it to a thread that reaps it so a
+            // restart does not leave a zombie behind, and get on with accepting.
+            Ok(None) if Instant::now() >= deadline => {
+                let provider = options.launcher.clone();
+                std::thread::Builder::new()
+                    .name("steno-stt-reaper".into())
+                    .spawn(move || {
+                        if let Ok(status) = child.wait() {
+                            tracing::info!(%provider, %status, "sidecar process exited");
+                        }
+                    })
+                    .map_err(|source| StreamError::Launch {
+                        program: options.launcher.clone(),
+                        source,
+                    })?;
+                return Ok(());
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(source) => {
+                return Err(StreamError::Launch {
+                    program: options.launcher.clone(),
+                    source,
+                });
+            }
+        }
     }
 }
 
@@ -422,9 +468,9 @@ async fn read_loop(
                             end_ms = ?event.end_ms,
                             "sidecar sent a final"
                         );
-                        match utterance_row(&event, &engine) {
+                        match phrase_row(&event, &engine) {
                             Some(row) => {
-                                if store.send(Stored::Utterance(Box::new(row))).is_err() {
+                                if store.send(Stored::Phrase(Box::new(row))).is_err() {
                                     return Ok(());
                                 }
                             }
@@ -519,26 +565,26 @@ fn store_loop(
 ) {
     for event in events {
         match event {
-            Stored::Utterance(row) => match database.save_utterance(&row) {
+            Stored::Phrase(row) => match database.insert_transcript(&row) {
                 Ok(()) => {
                     metrics.stt_finals.fetch_add(1, Ordering::Relaxed);
                     metrics.set_stt_partial(None);
+                    // Published only after the row exists: a client must never
+                    // show a phrase the database rejected.
                     hub.publish(TranscriptEvent::final_from_row(&row));
-                    tracing::debug!(text = %row.text, "utterance stored");
+                    tracing::debug!(text = %row.text, "phrase stored");
                 }
-                Err(error) => tracing::warn!(%error, "cannot store utterance"),
+                Err(error) => tracing::warn!(%error, "cannot store phrase"),
             },
             Stored::Snore(event) => {
                 let draft = classified_event(&event);
-                match database.insert_classified_event(&draft) {
-                    Ok(0) => tracing::warn!(
-                        start_ms = event.start_ms,
-                        end_ms = event.end_ms,
-                        "snore episode has no recorded segment behind it; not stored"
-                    ),
-                    Ok(rows) => {
+                // The recording is not known here — the file may not have closed
+                // yet, and the audio may already have been rotated away. The
+                // episode is still a true annotation about that stretch of time.
+                match database.insert_episode(&draft.episode_row(None)) {
+                    Ok(()) => {
                         metrics.stt_snores.fetch_add(1, Ordering::Relaxed);
-                        // Published after the rows exist, like a final: a client
+                        // Published after the row exists, like a final: a client
                         // must never show an episode the database rejected.
                         hub.publish(TranscriptEvent::Snore {
                             start_ms: event.start_ms,
@@ -549,10 +595,7 @@ fn store_loop(
                             windows: event.windows,
                             threshold: event.threshold,
                         });
-                        // The audio is already on disk: the row is a pointer into
-                        // the segment that holds this range, nothing is copied.
                         tracing::info!(
-                            rows,
                             start_ms = event.start_ms,
                             end_ms = event.end_ms,
                             peak = event.peak,
@@ -577,17 +620,10 @@ fn classified_event(event: &SnoreEvent) -> ClassifiedEvent {
         confidence: event.peak,
         threshold: event.threshold,
         source: CLASSIFIER_SOURCE.to_string(),
-        end_reason: match event.end_reason.as_str() {
-            // Anything the schema does not know is `normal`: an episode that
-            // ended because the session stopped is the only other case this
-            // sidecar produces, and it says so explicitly.
-            "shutdown" => "shutdown".to_string(),
-            _ => "normal".to_string(),
-        },
     }
 }
 
-fn utterance_row(event: &SidecarTranscript, engine: &str) -> Option<UtteranceRow> {
+fn phrase_row(event: &SidecarTranscript, engine: &str) -> Option<TranscriptRow> {
     let text = event.text.clone();
     let (Some(start_ms), Some(end_ms)) = (event.start_ms, event.end_ms) else {
         return None;
@@ -599,29 +635,25 @@ fn utterance_row(event: &SidecarTranscript, engine: &str) -> Option<UtteranceRow
     }
     let started = chrono::DateTime::from_timestamp_millis(start_ms)?;
     let ended = chrono::DateTime::from_timestamp_millis(end_ms.max(start_ms))?;
-    Some(UtteranceRow {
-        id: utterance_id(),
+    Some(TranscriptRow {
+        id: transcript_id(),
+        recording_id: None,
         started_at_utc: started,
         ended_at_utc: ended,
+        text,
         engine: event
             .engine
             .clone()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| engine.to_string()),
         language: event.language.clone(),
-        text,
-        segments_json: event
-            .segments
-            .as_ref()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "[]".to_string()),
         created_at_utc: Utc::now(),
     })
 }
 
-/// Utterance ids only need to be unique within one database; a time-ordered hex
+/// Transcript ids only need to be unique within one database; a time-ordered hex
 /// string is enough and avoids pulling in a UUID dependency here.
-fn utterance_id() -> String {
+fn transcript_id() -> String {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -725,15 +757,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_end_reason_is_recorded_as_normal_not_invented() {
-        let mut event = snore(0, 1000);
-        event.end_reason = "classifier_reset".to_string();
-        assert_eq!(classified_event(&event).end_reason, "normal");
-        event.end_reason = "shutdown".to_string();
-        assert_eq!(classified_event(&event).end_reason, "shutdown");
-    }
-
-    #[test]
     fn a_final_event_becomes_a_row_with_wall_clock_bounds() {
         let event = SidecarTranscript {
             kind: "final".to_string(),
@@ -744,7 +767,7 @@ mod tests {
             language: Some("zh-CN".to_string()),
             segments: Some(serde_json::json!([])),
         };
-        let row = utterance_row(&event, "fallback").expect("row");
+        let row = phrase_row(&event, "fallback").expect("row");
         assert_eq!(row.text, "打呼了");
         assert_eq!(row.engine, "apple-sfspeech");
         assert_eq!(
@@ -764,6 +787,60 @@ mod tests {
             language: None,
             segments: None,
         };
-        assert!(utterance_row(&event, "apple-speechanalyzer").is_none());
+        assert!(phrase_row(&event, "apple-speechanalyzer").is_none());
+    }
+
+    /// A sidecar that *is* the launcher (`steno-stt-sidecar-audiocpp`) runs until the
+    /// night is over. Waiting for it, as this used to, blocks before `accept()` and
+    /// the pipeline never carries a byte — the deadlock this test exists to prevent.
+    #[tokio::test]
+    async fn a_launcher_that_keeps_running_is_not_waited_for() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let script = directory.path().join("slow-launcher.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write");
+        make_executable(&script);
+
+        let options = launcher_options(script.clone());
+        let started = std::time::Instant::now();
+        launch_sidecar(&options).await.expect("a long-lived launcher is accepted");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "launch waited for the launcher to exit: {} ms",
+            started.elapsed().as_millis()
+        );
+    }
+
+    /// The other shape: a launcher that refuses to start. Its exit code has to reach
+    /// the caller, or a missing model becomes a bare "did not connect".
+    ///
+    /// `/usr/bin/false` rather than a generated script: resolving a shebang and a
+    /// temporary file adds enough startup latency that a loaded machine can look
+    /// like a long-lived launcher, which is the branch next door.
+    #[tokio::test]
+    async fn a_launcher_that_exits_nonzero_is_reported() {
+        let options = launcher_options(std::path::PathBuf::from("/usr/bin/false"));
+        match launch_sidecar(&options).await {
+            Err(StreamError::Launch { .. }) => {}
+            other => panic!("expected a launch error, got {other:?}"),
+        }
+    }
+
+    fn launcher_options(launcher: std::path::PathBuf) -> StreamOptions {
+        StreamOptions {
+            socket_path: std::env::temp_dir().join("steno-launch-test.sock"),
+            launcher: launcher.display().to_string(),
+            engine: "test".to_string(),
+            locale: "zh-CN".to_string(),
+            database_path: std::path::PathBuf::from(":memory:"),
+            ready_timeout: std::time::Duration::from_secs(1),
+            restart_delay: std::time::Duration::from_secs(1),
+        }
+    }
+
+    fn make_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod");
     }
 }

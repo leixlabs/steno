@@ -7,64 +7,12 @@
 //! Connections are opened per owning worker/thread. WAL and foreign keys are
 //! enabled for each connection; audio callbacks never touch this module.
 
-use steno_lib::detector::EventDraft;
 use steno_lib::error::{Error, Result};
-use crate::recorder::SegmentFile;
-use steno_lib::timeline::{EstimateSource, GapKind, GapRecord, TimeQuality};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-#[derive(Debug, Clone)]
-pub struct SegmentStarted {
-    pub id: String,
-    pub relative_path: PathBuf,
-    pub started_at_utc: DateTime<Utc>,
-    pub capture_rate_hz: u32,
-    pub channels: u16,
-    pub sample_format: String,
-    pub channel_mapping: String,
-    pub time_quality: TimeQuality,
-    pub boot_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SegmentCompleted {
-    pub id: String,
-    pub ended_at_utc: DateTime<Utc>,
-    pub frame_count: u64,
-    pub size_bytes: u64,
-    pub end_reason: String,
-    pub clock_drift_ppm: Option<f64>,
-    pub xrun_count: u64,
-    pub gap_count: u64,
-    pub lost_frames_total: u64,
-    pub status: SegmentStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SegmentStatus {
-    Recording,
-    Complete,
-    Interrupted,
-    Deleted,
-    Missing,
-}
-
-impl SegmentStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SegmentStatus::Recording => "recording",
-            SegmentStatus::Complete => "complete",
-            SegmentStatus::Interrupted => "interrupted",
-            SegmentStatus::Deleted => "deleted",
-            SegmentStatus::Missing => "missing",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,90 +44,11 @@ impl TryFrom<&str> for ReviewStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SegmentRow {
-    pub id: String,
-    pub relative_path: String,
-    pub started_at_utc: DateTime<Utc>,
-    pub ended_at_utc: Option<DateTime<Utc>>,
-    pub capture_rate_hz: u32,
-    pub channels: u16,
-    pub sample_format: String,
-    pub channel_mapping: String,
-    pub frame_count: u64,
-    pub size_bytes: u64,
-    pub xrun_count: u64,
-    pub gap_count: u64,
-    pub lost_frames_total: u64,
-    pub time_quality: String,
-    pub boot_id: String,
-    pub clock_drift_ppm: Option<f64>,
-    pub end_reason: Option<String>,
-    pub status: String,
-    pub created_at_utc: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct EventRow {
-    pub id: String,
-    pub segment_id: String,
-    pub start_offset_frames: u64,
-    pub end_offset_frames: u64,
-    pub started_at_utc: DateTime<Utc>,
-    pub ended_at_utc: DateTime<Utc>,
-    pub duration_ms: u32,
-    /// Which detector wrote this row: `rule-v1` for the server's own DSP, or
-    /// `apple-soundanalysis-v1` for the sidecar's classifier. Without it the two
-    /// annotations of the same second are indistinguishable after the fact.
-    pub source: String,
-    pub rule_score: Option<f32>,
-    pub detector_version: String,
-    /// Classifier label and confidence. `None` on rule-based rows: the DSP has
-    /// no label, and inventing one would make a filter look meaningful.
-    pub classifier_label: Option<String>,
-    pub classifier_confidence: Option<f32>,
-    /// The confidence the episode had to reach to be opened. Stored because a
-    /// row is only meaningful next to the bar it cleared.
-    pub classifier_threshold: Option<f32>,
-    pub peak_dbfs: Option<f32>,
-    pub mean_level_dbfs: Option<f32>,
-    pub mean_band_ratio: Option<f32>,
-    pub noise_floor_dbfs: Option<f32>,
-    pub end_reason: String,
-    pub review_status: String,
-    pub continued: bool,
-    pub created_at_utc: DateTime<Utc>,
-}
-
-/// One segment that still needs a transcript.
-#[derive(Debug, Clone)]
-pub struct PendingTranscription {
-    pub segment_id: String,
-    pub relative_path: PathBuf,
-    pub audio_seconds: f64,
-}
-
-/// The stored result of transcribing one segment.
-#[derive(Debug, Clone, Serialize)]
-pub struct TranscriptRow {
-    pub segment_id: String,
-    pub engine: String,
-    pub language: Option<String>,
-    pub text: String,
-    /// The phrase timings as produced by the recogniser, kept verbatim so the
-    /// UI can highlight a phrase without re-parsing the text.
-    pub segments_json: String,
-    pub status: String,
-    pub error: Option<String>,
-    pub audio_seconds: Option<f64>,
-    pub created_at_utc: DateTime<Utc>,
-}
-
 /// An annotation produced outside the server's own detector — today, the
 /// sidecar's `SoundAnalysis` snore lane.
 ///
-/// The range is wall-clock and the offsets are derived, which is the whole point:
-/// the analyser knows what it heard and when, not which file and which frame.
+/// The range is wall-clock, which is the whole point: the analyser knows what it
+/// heard and when, not which file and which frame.
 #[derive(Debug, Clone)]
 pub struct ClassifiedEvent {
     pub started_at_utc: DateTime<Utc>,
@@ -190,17 +59,45 @@ pub struct ClassifiedEvent {
     pub confidence: f32,
     /// The confidence needed to open the episode.
     pub threshold: f32,
-    /// Written into both `source` and `detector_version`: for a classifier row
-    /// they name the same thing, and a reader looking for either must find it.
+    /// Written into `source`: for a classifier row it names the thing that
+    /// judged the audio.
     pub source: String,
-    /// `normal` or `shutdown`.
-    pub end_reason: String,
+}
+
+impl ClassifiedEvent {
+    /// The same annotation in the stored shape: a classifier label with its peak
+    /// confidence, and no rule score to invent.
+    ///
+    /// `recording_id` is supplied by the caller because the file is written when
+    /// the recording closes, which can be after the analyser reported.
+    pub fn episode_row(&self, recording_id: Option<String>) -> EpisodeRow {
+        EpisodeRow {
+            id: external_episode_id(),
+            recording_id,
+            started_at_utc: self.started_at_utc,
+            ended_at_utc: self.ended_at_utc,
+            source: self.source.clone(),
+            label: Some(self.label.clone()),
+            confidence: Some(self.confidence),
+            review_status: ReviewStatus::Unreviewed,
+            created_at_utc: Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
 }
+
+/// Pool-level totals for the control centre: what is on disk and how many
+/// recordings it is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSummary {
+    pub recordings: u64,
+    pub bytes: u64,
+}
+
 impl Database {
     /// Opens a connection, enables foreign keys/WAL/busy timeout and migrates.
     pub fn open(path: &Path) -> Result<Self> {
@@ -243,637 +140,348 @@ impl Database {
         &self.conn
     }
 
-    pub fn insert_segment_started(&self, segment: &SegmentStarted) -> Result<()> {
+    pub fn insert_recording(&self, recording: &RecordingDraft) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO recording_segments (
-                id, relative_path, started_at_utc, capture_rate_hz, channels,
-                sample_format, channel_mapping, time_quality, boot_id, status,
-                created_at_utc
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'recording',?3)",
+            "INSERT INTO recordings (
+                id, relative_path, started_at_utc, ended_at_utc, capture_rate_hz,
+                channels, frame_count, size_bytes, lost_frames, created_at_utc
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                segment.id,
-                segment.relative_path.to_string_lossy(),
-                segment.started_at_utc.to_rfc3339(),
-                segment.capture_rate_hz,
-                segment.channels,
-                segment.sample_format,
-                segment.channel_mapping,
-                segment.time_quality.as_str(),
-                segment.boot_id,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn complete_segment(&self, completed: &SegmentCompleted) -> Result<()> {
-        self.conn.execute(
-            "UPDATE recording_segments SET ended_at_utc=?2, frame_count=?3,
-                size_bytes=?4, end_reason=?5, clock_drift_ppm=?6, xrun_count=?7,
-                gap_count=?8, lost_frames_total=?9, status=?10 WHERE id=?1",
-            params![
-                completed.id,
-                completed.ended_at_utc.to_rfc3339(),
-                i64::try_from(completed.frame_count).unwrap_or(i64::MAX),
-                i64::try_from(completed.size_bytes).unwrap_or(i64::MAX),
-                completed.end_reason,
-                completed.clock_drift_ppm,
-                i64::try_from(completed.xrun_count).unwrap_or(i64::MAX),
-                i64::try_from(completed.gap_count).unwrap_or(i64::MAX),
-                i64::try_from(completed.lost_frames_total).unwrap_or(i64::MAX),
-                completed.status.as_str(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_gap(&self, segment_id: &str, gap: &GapRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO audio_gaps (segment_id,offset_frames,lost_frames,kind,estimate_source,at_utc)
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                segment_id,
-                i64::try_from(gap.offset_frames).unwrap_or(i64::MAX),
-                i64::try_from(gap.lost_frames).unwrap_or(i64::MAX),
-                gap.kind.as_str(),
-                gap.estimate_source.as_str(),
-                gap.at_utc.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_event(&self, event: &EventDraft) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO snore_events (
-                id,segment_id,start_offset_frames,end_offset_frames,started_at_utc,
-                ended_at_utc,duration_ms,source,rule_score,detector_version,peak_dbfs,
-                mean_level_dbfs,mean_band_ratio,noise_floor_dbfs,end_reason,
-                review_status,continued,created_at_utc
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,'rule-v1',?8,?9,?10,?11,?12,?13,?14,'unreviewed',?15,?16)",
-            params![
-                event.id,
-                event.segment_id,
-                i64::try_from(event.start_offset_frames).unwrap_or(i64::MAX),
-                i64::try_from(event.end_offset_frames).unwrap_or(i64::MAX),
-                event.started_at_utc.to_rfc3339(),
-                event.ended_at_utc.to_rfc3339(),
-                event.duration_ms,
-                event.rule_score,
-                event.detector_version,
-                event.peak_dbfs,
-                event.mean_level_dbfs,
-                event.mean_band_ratio,
-                event.noise_floor_dbfs,
-                event.end_reason.as_str(),
-                event.continued,
+                recording.id,
+                recording.relative_path.to_string_lossy(),
+                recording.started_at_utc.to_rfc3339(),
+                recording.ended_at_utc.to_rfc3339(),
+                recording.capture_rate_hz,
+                recording.channels,
+                i64::try_from(recording.frame_count).unwrap_or(i64::MAX),
+                i64::try_from(recording.size_bytes).unwrap_or(i64::MAX),
+                i64::try_from(recording.lost_frames).unwrap_or(i64::MAX),
                 Utc::now().to_rfc3339(),
             ],
         )?;
+        // Annotations are written the moment they are produced, which is before
+        // the file they belong to closes; this is the only place that attaches
+        // them. It runs inside the same call as the insert so a recording row can
+        // never exist while its annotations still point at nothing.
+        self.link_annotations(
+            &recording.id,
+            recording.started_at_utc,
+            recording.ended_at_utc,
+        )?;
         Ok(())
     }
 
-    /// An annotation whose only coordinates are wall-clock ones — today, the
-    /// sidecar's classifier.
+    /// Attaches unlinked annotations to a recording by wall clock.
     ///
-    /// It deliberately carries no offsets: the range is what the analyser
-    /// reported, and the frame offsets are derived here from the segment that
-    /// owns that range and the rate it was recorded at. That is the only honest
-    /// way to turn a clock into a frame index, and it is why the conversion lives
-    /// next to the schema rather than in the caller.
-    ///
-    /// An episode that spans a segment boundary becomes one row per segment, with
-    /// `continued` set on the continuation rows: the audio is split across files,
-    /// so a single row could not point at it.
-    ///
-    /// Returns the number of rows written. Zero means no recorded segment covers
-    /// the range — the caller must report that, not pretend it was stored.
-    pub fn insert_classified_event(&self, event: &ClassifiedEvent) -> Result<usize> {
-        if event.ended_at_utc <= event.started_at_utc {
-            return Ok(0);
-        }
-        let segments = self.segments_between(event.started_at_utc, event.ended_at_utc)?;
-        let base_id = external_event_id();
-        let mut written = 0usize;
-        for segment in segments {
-            let rate = f64::from(segment.capture_rate_hz.max(1));
-            let segment_start = segment.started_at_utc;
-            let overlap_start = event.started_at_utc.max(segment_start);
-            let overlap_end = match segment.ended_at_utc {
-                Some(end) => event.ended_at_utc.min(end),
-                // Still recording: the audio up to `ended_at` exists on disk, so
-                // the episode's own end is the bound.
-                None => event.ended_at_utc,
-            };
-            if overlap_end <= overlap_start {
-                continue;
-            }
-            let start_offset = offset_frames(overlap_start, segment_start, rate);
-            let end_offset = offset_frames(overlap_end, segment_start, rate).max(start_offset + 1);
-            let duration_ms = (overlap_end - overlap_start).num_milliseconds().max(1);
-            let id = if written == 0 {
-                base_id.clone()
-            } else {
-                format!("{base_id}-{written}")
-            };
-            self.conn.execute(
-                "INSERT INTO snore_events (
-                    id,segment_id,start_offset_frames,end_offset_frames,started_at_utc,
-                    ended_at_utc,duration_ms,source,detector_version,classifier_label,
-                    classifier_confidence,classifier_threshold,end_reason,review_status,
-                    continued,created_at_utc
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'unreviewed',?14,?15)",
-                params![
-                    id,
-                    segment.id,
-                    start_offset,
-                    end_offset,
-                    overlap_start.to_rfc3339(),
-                    overlap_end.to_rfc3339(),
-                    duration_ms,
-                    event.source,
-                    event.source,
-                    event.label,
-                    f64::from(event.confidence),
-                    f64::from(event.threshold),
-                    event.end_reason,
-                    i64::from(written > 0),
-                    Utc::now().to_rfc3339(),
-                ],
-            )?;
-            written += 1;
-        }
-        Ok(written)
-    }
-
-    pub fn set_review_status(&self, event_id: &str, status: ReviewStatus) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE snore_events SET review_status=?2 WHERE id=?1",
-            params![event_id, status.as_str()],
+    /// Only rows whose *start* falls inside the file: an episode that straddles the
+    /// boundary belongs to the file it began in, which is the one a reader will
+    /// play.
+    fn link_annotations(
+        &self,
+        recording_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> Result<usize> {
+        let mut linked = self.conn.execute(
+            "UPDATE episodes SET recording_id = ?1
+              WHERE recording_id IS NULL AND started_at_utc >= ?2 AND started_at_utc < ?3",
+            params![recording_id, from.to_rfc3339(), to.to_rfc3339()],
         )?;
-        Ok(changed > 0)
-    }
-
-    pub fn event(&self, id: &str) -> Result<Option<EventRow>> {
-        self.conn
-            .query_row("SELECT * FROM snore_events WHERE id=?1", [id], map_event)
-            .optional()
-            .map_err(Error::from)
-    }
-
-    pub fn segment(&self, id: &str) -> Result<Option<SegmentRow>> {
-        self.conn
-            .query_row("SELECT * FROM recording_segments WHERE id=?1", [id], map_segment)
-            .optional()
-            .map_err(Error::from)
-    }
-
-    pub fn event_with_segment(&self, event_id: &str) -> Result<Option<(EventRow, SegmentRow)>> {
-        let Some(event) = self.event(event_id)? else { return Ok(None); };
-        let Some(segment) = self.segment(&event.segment_id)? else { return Ok(None); };
-        Ok(Some((event, segment)))
-    }
-
-    pub fn gaps_for_segment(&self, segment_id: &str) -> Result<Vec<GapRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT offset_frames,lost_frames,kind,estimate_source,at_utc FROM audio_gaps
-             WHERE segment_id=?1 ORDER BY offset_frames,id",
+        linked += self.conn.execute(
+            "UPDATE transcripts SET recording_id = ?1
+              WHERE recording_id IS NULL AND started_at_utc >= ?2 AND started_at_utc < ?3",
+            params![recording_id, from.to_rfc3339(), to.to_rfc3339()],
         )?;
-        let rows = stmt.query_map([segment_id], |row| {
-            Ok(GapRecord {
-                offset_frames: u64::try_from(row.get::<_, i64>(0)?.max(0)).unwrap_or(0),
-                lost_frames: u64::try_from(row.get::<_, i64>(1)?.max(0)).unwrap_or(0),
-                kind: parse_gap_kind(&row.get::<_, String>(2)?),
-                estimate_source: parse_estimate_source(&row.get::<_, String>(3)?),
-                at_utc: parse_utc(&row.get::<_, String>(4)?),
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
+        Ok(linked)
     }
 
-    pub fn segments_between(&self, start_utc: DateTime<Utc>, end_utc: DateTime<Utc>) -> Result<Vec<SegmentRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM recording_segments
-             WHERE started_at_utc < ?2 AND COALESCE(ended_at_utc,started_at_utc) >= ?1
-             ORDER BY started_at_utc,id",
-        )?;
-        let rows = stmt.query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], map_segment)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
-    }
-
-    pub fn events_between(&self, start_utc: DateTime<Utc>, end_utc: DateTime<Utc>) -> Result<Vec<EventRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM snore_events WHERE started_at_utc >= ?1 AND started_at_utc < ?2
-             ORDER BY started_at_utc,id",
-        )?;
-        let rows = stmt.query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], map_event)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
-    }
-
-    pub fn days_between(&self, start_utc: DateTime<Utc>, end_utc: DateTime<Utc>) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT substr(started_at_utc,1,10) FROM recording_segments
-             WHERE started_at_utc < ?2 AND COALESCE(ended_at_utc,started_at_utc) >= ?1
-             ORDER BY 1",
-        )?;
-        let rows = stmt.query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], |row| row.get(0))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
-    }
-
-    pub fn list_segments_for_retention(&self) -> Result<Vec<SegmentRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM recording_segments WHERE status='complete' ORDER BY started_at_utc,id",
-        )?;
-        let rows = stmt.query_map([], map_segment)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
-    }
-
-    /// Every segment row, in start order. Used by the startup recovery scan to
-    /// reconcile the database against the files actually on disk; it deliberately
-    /// is not filtered by status, since a crashed run can leave any status behind.
-    pub fn all_segments(&self) -> Result<Vec<SegmentRow>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM recording_segments ORDER BY started_at_utc,id")?;
-        let rows = stmt.query_map([], map_segment)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
-    }
-
-    pub fn mark_segment_status(&self, id: &str, status: SegmentStatus) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE recording_segments SET status=?2 WHERE id=?1",
-            params![id, status.as_str()],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn update_segment_path_and_time(&self, id: &str, path: &Path, start: DateTime<Utc>, end: DateTime<Utc>, status: SegmentStatus) -> Result<()> {
+    pub fn insert_episode(&self, episode: &EpisodeRow) -> Result<()> {
         self.conn.execute(
-            "UPDATE recording_segments SET relative_path=?2,started_at_utc=?3,ended_at_utc=?4,status=?5 WHERE id=?1",
-            params![id, path.to_string_lossy(), start.to_rfc3339(), end.to_rfc3339(), status.as_str()],
-        )?;
-        Ok(())
-    }
-
-    pub fn insert_interrupted_recovery(&self, segment: &SegmentStarted, frame_count: u64, size_bytes: u64, ended_at: DateTime<Utc>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT OR IGNORE INTO recording_segments (
-                id,relative_path,started_at_utc,ended_at_utc,capture_rate_hz,channels,
-                sample_format,channel_mapping,frame_count,size_bytes,time_quality,
-                boot_id,end_reason,status,created_at_utc
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'error','interrupted',?3)",
+            "INSERT INTO episodes (
+                id, recording_id, started_at_utc, ended_at_utc, source, label,
+                confidence, review_status, created_at_utc
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![
-                segment.id, segment.relative_path.to_string_lossy(), segment.started_at_utc.to_rfc3339(),
-                ended_at.to_rfc3339(), segment.capture_rate_hz, segment.channels, segment.sample_format,
-                segment.channel_mapping, i64::try_from(frame_count).unwrap_or(i64::MAX), i64::try_from(size_bytes).unwrap_or(i64::MAX), segment.time_quality.as_str(), segment.boot_id,
+                episode.id,
+                episode.recording_id,
+                episode.started_at_utc.to_rfc3339(),
+                episode.ended_at_utc.to_rfc3339(),
+                episode.source,
+                episode.label,
+                episode.confidence.map(f64::from),
+                episode.review_status.as_str(),
+                episode.created_at_utc.to_rfc3339(),
             ],
         )?;
-        tx.commit()?;
         Ok(())
     }
 
-    pub fn database_path_is_recording(&self, id: &str, relative_path: &str) -> Result<bool> {
-        let status: Option<String> = self.conn.query_row(
-            "SELECT status FROM recording_segments WHERE id=?1 AND relative_path=?2",
-            params![id, relative_path],
-            |r| r.get(0),
-        ).optional()?;
-        Ok(status.as_deref() == Some("recording"))
-    }
-
-    pub fn bytes_of_recordings(&self) -> Result<u64> {
-        let total: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(size_bytes),0) FROM recording_segments WHERE status IN ('complete','interrupted')",
-            [], |row| row.get(0),
-        )?;
-        Ok(total.max(0) as u64)
-    }
-
-    /// Pool-level aggregates for the control centre: what is on disk, how many
-    /// segments it is made of, and how far back it reaches.
-    ///
-    /// One query, and the same `status IN (...)` filter as `bytes_of_recordings`
-    /// so the byte total here can never disagree with the one the retention pass
-    /// reclaims against.
-    pub fn pool_summary(&self) -> Result<PoolSummary> {
-        let mut statement = self.conn.prepare(
-            "SELECT COALESCE(SUM(size_bytes),0),
-                    COUNT(*),
-                    MIN(started_at_utc),
-                    MAX(COALESCE(ended_at_utc, started_at_utc))
-             FROM recording_segments
-             WHERE status IN ('complete','interrupted')",
-        )?;
-        let summary = statement.query_row([], |row| {
-            let used: i64 = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            let oldest: Option<String> = row.get(2)?;
-            let newest: Option<String> = row.get(3)?;
-            Ok((used, count, oldest, newest))
-        })?;
-        let (used, count, oldest, newest) = summary;
-        // Timestamps are stored as RFC 3339 in UTC. A row we cannot parse is
-        // reported as "no known bound" rather than as the epoch, which would
-        // read as a recording from 1970.
-        Ok(PoolSummary {
-            used_bytes: used.max(0) as u64,
-            segment_count: count.max(0) as u64,
-            oldest_started_at_utc: oldest
-                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| value.with_timezone(&Utc)),
-            newest_ended_at_utc: newest
-                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| value.with_timezone(&Utc)),
-        })
-    }
-
-    pub fn event_count(&self) -> Result<u64> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM snore_events", [], |r| r.get(0))?;
-        Ok(n.max(0) as u64)
-    }
-
-    /// Segments that finished recording but have no transcript row yet.
-    ///
-    /// The database is the transcription queue on purpose: there is no in-memory
-    /// queue to lose, a crash simply resumes on the next pass, and a segment can
-    /// never be transcribed twice because the insert is keyed by `segment_id`.
-    pub fn segments_awaiting_transcript(
-        &self,
-        min_seconds: f64,
-        limit: usize,
-    ) -> Result<Vec<PendingTranscription>> {
-        let mut statement = self.conn.prepare(
-            "SELECT s.id, s.relative_path,
-                    CAST(s.frame_count AS REAL) / s.capture_rate_hz
-             FROM recording_segments s
-             LEFT JOIN segment_transcripts t ON t.segment_id = s.id
-             WHERE s.status = 'complete'
-               AND t.segment_id IS NULL
-               AND s.capture_rate_hz > 0
-               AND CAST(s.frame_count AS REAL) / s.capture_rate_hz >= ?1
-             ORDER BY s.started_at_utc ASC
-             LIMIT ?2",
-        )?;
-        let rows = statement
-            .query_map(params![min_seconds, limit as i64], |row| {
-                Ok(PendingTranscription {
-                    segment_id: row.get(0)?,
-                    relative_path: PathBuf::from(row.get::<_, String>(1)?),
-                    audio_seconds: row.get(2)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Record the outcome for a segment. Replaces any previous row so a manual
-    /// re-run after fixing the recogniser is possible.
-    pub fn save_transcript(&self, transcript: &TranscriptRow) -> Result<()> {
+    pub fn insert_transcript(&self, transcript: &TranscriptRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO segment_transcripts
-                (segment_id, engine, language, text, segments_json, status, error, audio_seconds, created_at_utc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(segment_id) DO UPDATE SET
-                engine = excluded.engine,
-                language = excluded.language,
-                text = excluded.text,
-                segments_json = excluded.segments_json,
-                status = excluded.status,
-                error = excluded.error,
-                audio_seconds = excluded.audio_seconds,
-                created_at_utc = excluded.created_at_utc",
+            "INSERT INTO transcripts (
+                id, recording_id, started_at_utc, ended_at_utc, text, engine,
+                language, created_at_utc
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
-                transcript.segment_id,
+                transcript.id,
+                transcript.recording_id,
+                transcript.started_at_utc.to_rfc3339(),
+                transcript.ended_at_utc.to_rfc3339(),
+                transcript.text,
                 transcript.engine,
                 transcript.language,
-                transcript.text,
-                transcript.segments_json,
-                transcript.status,
-                transcript.error,
-                transcript.audio_seconds,
                 transcript.created_at_utc.to_rfc3339(),
             ],
         )?;
         Ok(())
     }
 
-    pub fn transcript_for_segment(&self, segment_id: &str) -> Result<Option<TranscriptRow>> {
-        let mut statement = self.conn.prepare(
-            "SELECT segment_id, engine, language, text, segments_json, status, error, audio_seconds, created_at_utc
-             FROM segment_transcripts WHERE segment_id = ?1",
-        )?;
-        let mut rows = statement.query_map(params![segment_id], transcript_from_row)?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn save_utterance(&self, utterance: &UtteranceRow) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO utterances
-                (id, started_at_utc, ended_at_utc, engine, language, text, segments_json, created_at_utc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                utterance.id,
-                utterance.started_at_utc.to_rfc3339(),
-                utterance.ended_at_utc.to_rfc3339(),
-                utterance.engine,
-                utterance.language,
-                utterance.text,
-                utterance.segments_json,
-                utterance.created_at_utc.to_rfc3339(),
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Utterances that start inside the window, oldest first: a transcript
-    /// reads forwards even though the event list reads backwards.
-    pub fn utterances_between(
+    /// Recordings that start inside the window, oldest first.
+    pub fn recordings_between(
         &self,
         start_utc: DateTime<Utc>,
         end_utc: DateTime<Utc>,
-    ) -> Result<Vec<UtteranceRow>> {
+    ) -> Result<Vec<RecordingRow>> {
         let mut statement = self.conn.prepare(
-            "SELECT id, started_at_utc, ended_at_utc, engine, language, text, segments_json, created_at_utc
-             FROM utterances
+            "SELECT id, relative_path, started_at_utc, ended_at_utc, capture_rate_hz,
+                    channels, frame_count, size_bytes, lost_frames, created_at_utc
+             FROM recordings
              WHERE started_at_utc >= ?1 AND started_at_utc < ?2
-             ORDER BY started_at_utc ASC",
+             ORDER BY started_at_utc, id",
         )?;
         let rows = statement
-            .query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], utterance_from_row)?
+            .query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], map_recording)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Transcripts whose segment started inside the window, newest first.
+    pub fn recording(&self, id: &str) -> Result<Option<RecordingRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, relative_path, started_at_utc, ended_at_utc, capture_rate_hz,
+                        channels, frame_count, size_bytes, lost_frames, created_at_utc
+                 FROM recordings WHERE id=?1",
+                [id],
+                map_recording,
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    /// Every recording in start order. Retention deletes from the front, so this
+    /// is its candidate list.
+    pub fn recordings_oldest_first(&self) -> Result<Vec<RecordingRow>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM recordings ORDER BY started_at_utc, id")?;
+        let rows = statement.query_map([], map_recording)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Removes the row. `episodes.recording_id` / `transcripts.recording_id` are
+    /// `ON DELETE SET NULL`, so an annotation outlives the audio it described.
+    pub fn delete_recording(&self, id: &str) -> Result<bool> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM recordings WHERE id=?1", [id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn episode(&self, id: &str) -> Result<Option<EpisodeRow>> {
+        self.conn
+            .query_row("SELECT * FROM episodes WHERE id=?1", [id], map_episode)
+            .optional()
+            .map_err(Error::from)
+    }
+
+    /// Episodes that start inside the window, oldest first.
+    pub fn episodes_between(
+        &self,
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Vec<EpisodeRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT * FROM episodes
+             WHERE started_at_utc >= ?1 AND started_at_utc < ?2
+             ORDER BY started_at_utc, id",
+        )?;
+        let rows = statement
+            .query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], map_episode)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_episode_review(&self, id: &str, status: ReviewStatus) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE episodes SET review_status=?2 WHERE id=?1",
+            params![id, status.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Phrases that start inside the window, oldest first.
+    /// How many annotations fall inside a window: episodes plus transcripts.
+    ///
+    /// The recorder asks this when it closes a file, to decide whether the file is
+    /// worth keeping. Zero means nothing was said and nothing sounded.
+    pub fn count_annotations(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<u64> {
+        let episodes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM episodes
+              WHERE started_at_utc >= ?1 AND started_at_utc < ?2",
+            params![from.to_rfc3339(), to.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        let transcripts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM transcripts
+              WHERE started_at_utc >= ?1 AND started_at_utc < ?2",
+            params![from.to_rfc3339(), to.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        Ok((episodes + transcripts) as u64)
+    }
+
     pub fn transcripts_between(
         &self,
         start_utc: DateTime<Utc>,
         end_utc: DateTime<Utc>,
     ) -> Result<Vec<TranscriptRow>> {
         let mut statement = self.conn.prepare(
-            "SELECT t.segment_id, t.engine, t.language, t.text, t.segments_json, t.status,
-                    t.error, t.audio_seconds, t.created_at_utc
-             FROM segment_transcripts t
-             JOIN recording_segments s ON s.id = t.segment_id
-             WHERE s.started_at_utc >= ?1 AND s.started_at_utc < ?2
-             ORDER BY s.started_at_utc DESC",
+            "SELECT id, recording_id, started_at_utc, ended_at_utc, text, engine,
+                    language, created_at_utc
+             FROM transcripts
+             WHERE started_at_utc >= ?1 AND started_at_utc < ?2
+             ORDER BY started_at_utc, id",
         )?;
         let rows = statement
-            .query_map(params![start_utc.to_rfc3339(), end_utc.to_rfc3339()], transcript_from_row)?
+            .query_map(
+                params![start_utc.to_rfc3339(), end_utc.to_rfc3339()],
+                map_transcript,
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
-}
 
-/// Everything the control centre needs to describe the recording pool.
-///
-/// `oldest_started_at_utc` / `newest_ended_at_utc` are `None` for an empty pool
-/// (and for a row whose timestamp cannot be parsed) rather than being filled in
-/// with "now" or the epoch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolSummary {
-    pub used_bytes: u64,
-    pub segment_count: u64,
-    pub oldest_started_at_utc: Option<DateTime<Utc>>,
-    pub newest_ended_at_utc: Option<DateTime<Utc>>,
-}
-
-/// One recognised phrase from the streaming recogniser.
-#[derive(Debug, Clone)]
-pub struct UtteranceRow {
-    pub id: String,
-    pub started_at_utc: DateTime<Utc>,
-    pub ended_at_utc: DateTime<Utc>,
-    pub engine: String,
-    pub language: Option<String>,
-    pub text: String,
-    pub segments_json: String,
-    pub created_at_utc: DateTime<Utc>,
-}
-
-fn utterance_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UtteranceRow> {
-    let started: String = row.get(1)?;
-    let ended: String = row.get(2)?;
-    let created: String = row.get(7)?;
-    Ok(UtteranceRow {
-        id: row.get(0)?,
-        started_at_utc: DateTime::parse_from_rfc3339(&started)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        ended_at_utc: DateTime::parse_from_rfc3339(&ended)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-        engine: row.get(3)?,
-        language: row.get(4)?,
-        text: row.get(5)?,
-        segments_json: row.get(6)?,
-        created_at_utc: DateTime::parse_from_rfc3339(&created)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-    })
-}
-
-fn transcript_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptRow> {
-    let created: String = row.get(8)?;
-    Ok(TranscriptRow {
-        segment_id: row.get(0)?,
-        engine: row.get(1)?,
-        language: row.get(2)?,
-        text: row.get(3)?,
-        segments_json: row.get(4)?,
-        status: row.get(5)?,
-        error: row.get(6)?,
-        audio_seconds: row.get(7)?,
-        created_at_utc: DateTime::parse_from_rfc3339(&created)
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
-    })
-}
-
-impl SegmentCompleted {
-    pub fn from_file(id: impl Into<String>, _file: &SegmentFile, ended_at_utc: DateTime<Utc>, frame_count: u64, size_bytes: u64, end_reason: impl Into<String>) -> Self {
-        SegmentCompleted {
-            id: id.into(), ended_at_utc, frame_count, size_bytes, end_reason: end_reason.into(),
-            clock_drift_ppm: None, xrun_count: 0, gap_count: 0, lost_frames_total: 0,
-            status: SegmentStatus::Complete,
-        }
+    /// One query for the control centre: how many recordings and how many bytes
+    /// they hold.
+    pub fn pool_summary(&self) -> Result<PoolSummary> {
+        let (recordings, bytes): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM recordings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(PoolSummary {
+            recordings: recordings.max(0) as u64,
+            bytes: bytes.max(0) as u64,
+        })
     }
 }
 
-fn map_segment(row: &Row<'_>) -> rusqlite::Result<SegmentRow> {
-    Ok(SegmentRow {
-        id: row.get("id")?,
-        relative_path: row.get("relative_path")?,
-        started_at_utc: parse_utc(&row.get::<_, String>("started_at_utc")?),
-        ended_at_utc: row.get::<_, Option<String>>("ended_at_utc")?.map(|s| parse_utc(&s)),
-        capture_rate_hz: row.get("capture_rate_hz")?,
-        channels: row.get("channels")?,
-        sample_format: row.get("sample_format")?,
-        channel_mapping: row.get("channel_mapping")?,
-        frame_count: u64::try_from(row.get::<_, i64>("frame_count")?.max(0)).unwrap_or(0),
-        size_bytes: u64::try_from(row.get::<_, i64>("size_bytes")?.max(0)).unwrap_or(0),
-        xrun_count: u64::try_from(row.get::<_, i64>("xrun_count")?.max(0)).unwrap_or(0),
-        gap_count: u64::try_from(row.get::<_, i64>("gap_count")?.max(0)).unwrap_or(0),
-        lost_frames_total: u64::try_from(row.get::<_, i64>("lost_frames_total")?.max(0)).unwrap_or(0),
-        time_quality: row.get("time_quality")?,
-        boot_id: row.get("boot_id")?,
-        clock_drift_ppm: row.get("clock_drift_ppm")?,
-        end_reason: row.get("end_reason")?,
-        status: row.get("status")?,
-        created_at_utc: parse_utc(&row.get::<_, String>("created_at_utc")?),
+/// One written WAV file: a stretch of audio and the facts it was recorded with.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingRow {
+    pub id: String,
+    pub relative_path: PathBuf,
+    pub started_at_utc: DateTime<Utc>,
+    pub ended_at_utc: DateTime<Utc>,
+    pub capture_rate_hz: u32,
+    pub channels: u16,
+    pub frame_count: u64,
+    pub size_bytes: u64,
+    pub lost_frames: u64,
+    pub created_at_utc: DateTime<Utc>,
+}
+
+/// A finished recording as the recorder hands it to the writer.
+#[derive(Debug, Clone)]
+pub struct RecordingDraft {
+    pub id: String,
+    pub relative_path: PathBuf,
+    pub started_at_utc: DateTime<Utc>,
+    pub ended_at_utc: DateTime<Utc>,
+    pub capture_rate_hz: u32,
+    pub channels: u16,
+    pub frame_count: u64,
+    pub size_bytes: u64,
+    pub lost_frames: u64,
+}
+
+/// One snore, from either detector.
+#[derive(Debug, Clone, Serialize)]
+pub struct EpisodeRow {
+    pub id: String,
+    pub recording_id: Option<String>,
+    pub started_at_utc: DateTime<Utc>,
+    pub ended_at_utc: DateTime<Utc>,
+    /// `rule-v1` or `apple-soundanalysis-v1`.
+    pub source: String,
+    pub label: Option<String>,
+    pub confidence: Option<f32>,
+    pub review_status: ReviewStatus,
+    pub created_at_utc: DateTime<Utc>,
+}
+
+/// One recognised phrase.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptRow {
+    pub id: String,
+    pub recording_id: Option<String>,
+    pub started_at_utc: DateTime<Utc>,
+    pub ended_at_utc: DateTime<Utc>,
+    pub text: String,
+    pub engine: String,
+    pub language: Option<String>,
+    pub created_at_utc: DateTime<Utc>,
+}
+
+fn map_recording(row: &Row<'_>) -> rusqlite::Result<RecordingRow> {
+    Ok(RecordingRow {
+        id: row.get(0)?,
+        relative_path: PathBuf::from(row.get::<_, String>(1)?),
+        started_at_utc: parse_utc(&row.get::<_, String>(2)?),
+        ended_at_utc: parse_utc(&row.get::<_, String>(3)?),
+        capture_rate_hz: u32::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(0),
+        channels: u16::try_from(row.get::<_, i64>(5)?.max(0)).unwrap_or(0),
+        frame_count: row.get::<_, i64>(6)?.max(0) as u64,
+        size_bytes: row.get::<_, i64>(7)?.max(0) as u64,
+        lost_frames: row.get::<_, i64>(8)?.max(0) as u64,
+        created_at_utc: parse_utc(&row.get::<_, String>(9)?),
     })
 }
 
-fn map_event(row: &Row<'_>) -> rusqlite::Result<EventRow> {
-    Ok(EventRow {
-        id: row.get("id")?,
-        segment_id: row.get("segment_id")?,
-        start_offset_frames: u64::try_from(row.get::<_, i64>("start_offset_frames")?.max(0)).unwrap_or(0),
-        end_offset_frames: u64::try_from(row.get::<_, i64>("end_offset_frames")?.max(0)).unwrap_or(0),
-        started_at_utc: parse_utc(&row.get::<_, String>("started_at_utc")?),
-        ended_at_utc: parse_utc(&row.get::<_, String>("ended_at_utc")?),
-        duration_ms: row.get("duration_ms")?,
-        source: row.get("source")?,
-        rule_score: row.get("rule_score")?,
-        detector_version: row.get("detector_version")?,
-        classifier_label: row.get("classifier_label")?,
-        classifier_confidence: row.get("classifier_confidence")?,
-        classifier_threshold: row.get("classifier_threshold")?,
-        peak_dbfs: row.get("peak_dbfs")?,
-        mean_level_dbfs: row.get("mean_level_dbfs")?,
-        mean_band_ratio: row.get("mean_band_ratio")?,
-        noise_floor_dbfs: row.get("noise_floor_dbfs")?,
-        end_reason: row.get("end_reason")?,
-        review_status: row.get("review_status")?,
-        continued: row.get::<_, i64>("continued")? != 0,
-        created_at_utc: parse_utc(&row.get::<_, String>("created_at_utc")?),
+fn map_episode(row: &Row<'_>) -> rusqlite::Result<EpisodeRow> {
+    let status: String = row.get(7)?;
+    Ok(EpisodeRow {
+        id: row.get(0)?,
+        recording_id: row.get(1)?,
+        started_at_utc: parse_utc(&row.get::<_, String>(2)?),
+        ended_at_utc: parse_utc(&row.get::<_, String>(3)?),
+        source: row.get(4)?,
+        label: row.get(5)?,
+        confidence: row.get::<_, Option<f64>>(6)?.map(|value| value as f32),
+        // The column is constrained to the three labels; an unparseable value
+        // can only mean a database edited by hand, and `unreviewed` is the one
+        // answer that does not invent a judgement.
+        review_status: ReviewStatus::try_from(status.as_str()).unwrap_or(ReviewStatus::Unreviewed),
+        created_at_utc: parse_utc(&row.get::<_, String>(8)?),
+    })
+}
+
+fn map_transcript(row: &Row<'_>) -> rusqlite::Result<TranscriptRow> {
+    Ok(TranscriptRow {
+        id: row.get(0)?,
+        recording_id: row.get(1)?,
+        started_at_utc: parse_utc(&row.get::<_, String>(2)?),
+        ended_at_utc: parse_utc(&row.get::<_, String>(3)?),
+        text: row.get(4)?,
+        engine: row.get(5)?,
+        language: row.get(6)?,
+        created_at_utc: parse_utc(&row.get::<_, String>(7)?),
     })
 }
 
 fn parse_utc(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value).map(|v| v.to_utc()).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
-}
-
-fn parse_gap_kind(value: &str) -> GapKind {
-    match value {
-        "xrun" => GapKind::Xrun,
-        "stream_error" => GapKind::StreamError,
-        "capture_ring_overflow" => GapKind::CaptureRingOverflow,
-        "queue_overflow" => GapKind::QueueOverflow,
-        _ => GapKind::StreamRebuild,
-    }
-}
-
-fn parse_estimate_source(value: &str) -> EstimateSource {
-    match value {
-        "timestamp" => EstimateSource::Timestamp,
-        "counter" => EstimateSource::Counter,
-        _ => EstimateSource::Unknown,
-    }
 }
 
 /// Strict ISO calendar date parsing for API query parameters.
@@ -902,17 +510,8 @@ pub fn local_day_range(date: NaiveDate, timezone: Option<chrono_tz::Tz>) -> (Dat
     }
 }
 
-
-/// Frames from the segment's start to `at`, at the rate the segment was captured
-/// at. Rounded rather than truncated: a sub-frame rounding error repeated across
-/// a night is a visible offset in the Portal.
-fn offset_frames(at: DateTime<Utc>, segment_start: DateTime<Utc>, rate: f64) -> i64 {
-    let micros = (at - segment_start).num_microseconds().unwrap_or(0).max(0);
-    ((micros as f64 / 1_000_000.0) * rate).round() as i64
-}
-
 /// Ids only need to be unique within one database.
-fn external_event_id() -> String {
+fn external_episode_id() -> String {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -924,209 +523,91 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn segment(id: &str, started: DateTime<Utc>, relative: &str) -> SegmentStarted {
-        SegmentStarted {
-            id: id.into(), relative_path: PathBuf::from(relative), started_at_utc: started,
-            capture_rate_hz: 16_000, channels: 1, sample_format: "S16_LE".into(),
-            channel_mapping: "mono:0".into(), time_quality: TimeQuality::Synced, boot_id: "boot".into(),
+    /// The newest shipped migration, so adding one does not break assertions about
+    /// "fully migrated" that were only ever asking "at the end".
+    fn newest_version() -> i32 {
+        crate::migrate::migration_files()
+            .expect("migrations")
+            .last()
+            .expect("at least one migration")
+            .version as i32
+    }
+
+    fn recording_draft(id: &str, start: DateTime<Utc>) -> RecordingDraft {
+        RecordingDraft {
+            id: id.into(),
+            relative_path: PathBuf::from(format!("2025/01/01/{id}.wav")),
+            started_at_utc: start,
+            ended_at_utc: start + chrono::Duration::hours(1),
+            capture_rate_hz: 16_000,
+            channels: 1,
+            frame_count: 57_600_000,
+            size_bytes: 115_200_044,
+            lost_frames: 0,
         }
     }
 
-    fn event(id: &str, segment_id: &str, start: DateTime<Utc>) -> EventDraft {
-        EventDraft {
-            id: id.into(), segment_id: segment_id.into(), start_offset_frames: 0, end_offset_frames: 3_200,
-            started_at_utc: start, ended_at_utc: start + chrono::Duration::milliseconds(200), duration_ms: 200,
-            rule_score: None, detector_version: "rule-v1".into(), peak_dbfs: Some(-10.0),
-            mean_level_dbfs: Some(-30.0), mean_band_ratio: Some(0.5), noise_floor_dbfs: Some(-60.0),
-            end_reason: steno_lib::detector::EndReason::Normal, continued: false,
+    fn episode(id: &str, recording_id: Option<&str>, start: DateTime<Utc>) -> EpisodeRow {
+        EpisodeRow {
+            id: id.into(),
+            recording_id: recording_id.map(str::to_string),
+            started_at_utc: start,
+            ended_at_utc: start + chrono::Duration::seconds(2),
+            source: "rule-v1".into(),
+            label: None,
+            confidence: Some(0.7),
+            review_status: ReviewStatus::Unreviewed,
+            created_at_utc: start,
         }
     }
 
     #[test]
-    fn a_classified_episode_becomes_one_row_per_segment_it_touches() {
+    fn a_recording_round_trips_through_the_schema() {
         let db = Database::in_memory().unwrap();
         let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        // Two consecutive one-second segments at 16 kHz.
-        for (id, offset) in [("seg-a", 0i64), ("seg-b", 1)] {
-            let began = start + chrono::Duration::seconds(offset);
-            db.insert_segment_started(&segment(id, began, &format!("2025/01/01/{id}.wav")))
-                .unwrap();
-            db.complete_segment(&SegmentCompleted {
-                id: id.into(),
-                ended_at_utc: began + chrono::Duration::seconds(1),
-                frame_count: 16_000,
-                size_bytes: 32_044,
-                end_reason: "duration".into(),
-                clock_drift_ppm: None,
-                xrun_count: 0,
-                gap_count: 0,
-                lost_frames_total: 0,
-                status: SegmentStatus::Complete,
-            })
-            .unwrap();
-        }
+        db.insert_recording(&recording_draft("rec", start)).unwrap();
 
-        // An episode from the middle of the first into the middle of the second:
-        // it cannot be one row, because the audio is two files.
-        let written = db
-            .insert_classified_event(&ClassifiedEvent {
-                started_at_utc: start + chrono::Duration::milliseconds(500),
-                ended_at_utc: start + chrono::Duration::milliseconds(1_500),
-                label: "snoring".into(),
-                confidence: 0.81,
-                threshold: 0.5,
-                source: "apple-soundanalysis-v1".into(),
-                end_reason: "normal".into(),
-            })
-            .unwrap();
-        assert_eq!(written, 2);
+        let row = db.recording("rec").unwrap().expect("recording row");
+        assert_eq!(row.relative_path, PathBuf::from("2025/01/01/rec.wav"));
+        assert_eq!(row.started_at_utc, start);
+        assert_eq!(row.ended_at_utc, start + chrono::Duration::hours(1));
+        assert_eq!(row.capture_rate_hz, 16_000);
+        assert_eq!(row.channels, 1);
+        assert_eq!(row.frame_count, 57_600_000);
+        assert_eq!(row.size_bytes, 115_200_044);
+        assert_eq!(row.lost_frames, 0);
 
-        let rows = db.events_between(start, start + chrono::Duration::seconds(2)).unwrap();
-        assert_eq!(rows.len(), 2);
-        // Offsets are derived from the clock at the segment's own capture rate.
-        assert_eq!(rows[0].segment_id, "seg-a");
-        assert_eq!(rows[0].start_offset_frames, 8_000);
-        assert_eq!(rows[0].end_offset_frames, 16_000);
-        assert!(!rows[0].continued);
-        assert_eq!(rows[1].segment_id, "seg-b");
-        assert_eq!(rows[1].start_offset_frames, 0);
-        assert_eq!(rows[1].end_offset_frames, 8_000);
-        assert!(rows[1].continued);
-        assert_eq!(rows[0].source, "apple-soundanalysis-v1");
-        assert_eq!(rows[0].classifier_label.as_deref(), Some("snoring"));
-        assert_eq!(rows[0].classifier_confidence, Some(0.81));
-        // The rule-based fields stay empty: a classifier has no rule score and no
-        // dBFS measurement, and inventing one would make a filter lie.
-        assert_eq!(rows[0].rule_score, None);
-        assert_eq!(rows[0].peak_dbfs, None);
+        let between = db
+            .recordings_between(start, start + chrono::Duration::hours(2))
+            .unwrap();
+        assert_eq!(between.len(), 1);
+        assert_eq!(between[0].id, "rec");
+        assert_eq!(
+            db.pool_summary().unwrap(),
+            PoolSummary { recordings: 1, bytes: 115_200_044 }
+        );
     }
 
     #[test]
-    fn v4_carries_rule_events_over_instead_of_dropping_them() {
-        // A v3 database as it exists in the field: `snore_events` with no
-        // `source`. The migration must keep the rows — before v4 the rule
-        // detector was the table's only writer, so every one of them is
-        // `rule-v1` by construction.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.db");
-        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            // Built from the shipped migration files rather than a hand-copied
-            // schema, so this fixture cannot drift from what v3 really was. No
-            // `_sqlx_migrations` row is written and `user_version` is set by
-            // hand: that is exactly the shape a pre-migrations binary left
-            // behind, and it is what the baseline path has to recognise.
-            for migration in crate::migrate::migration_files()
-                .unwrap()
-                .iter()
-                .filter(|m| m.version <= 3)
-            {
-                conn.execute_batch(migration.sql).unwrap();
-            }
-            conn.execute_batch("PRAGMA user_version = 3;").unwrap();
-            conn.execute(
-                "INSERT INTO recording_segments (id,relative_path,started_at_utc,capture_rate_hz,
-                    channels,sample_format,channel_mapping,time_quality,boot_id,status,created_at_utc)
-                 VALUES ('seg','x.wav',?1,16000,1,'S16_LE','mono','synced','b','complete',?1)",
-                [start.to_rfc3339()],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO snore_events (id,segment_id,start_offset_frames,end_offset_frames,
-                    started_at_utc,ended_at_utc,duration_ms,rule_score,detector_version,
-                    peak_dbfs,created_at_utc)
-                 VALUES ('old','seg',0,16000,?1,?2,1000,0.9,'rule-v1',-12.0,?1)",
-                [start.to_rfc3339(), (start + chrono::Duration::seconds(1)).to_rfc3339()],
-            )
-            .unwrap();
-        }
-
-        let db = Database::open(&path).unwrap();
-        let version: i32 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
-        let rows = db.events_between(start, start + chrono::Duration::hours(1)).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "old");
-        assert_eq!(rows[0].source, "rule-v1");
-        assert_eq!(rows[0].rule_score, Some(0.9));
-        assert_eq!(rows[0].peak_dbfs, Some(-12.0));
-        // The classifier columns are empty on a rule row, and stay empty.
-        assert_eq!(rows[0].classifier_label, None);
-        assert_eq!(rows[0].classifier_confidence, None);
-    }
-
-    #[test]
-    fn an_episode_over_unrecorded_time_writes_nothing() {
+    fn recordings_are_listed_oldest_first_and_deleting_one_keeps_its_annotations() {
         let db = Database::in_memory().unwrap();
         let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let written = db
-            .insert_classified_event(&ClassifiedEvent {
-                started_at_utc: start,
-                ended_at_utc: start + chrono::Duration::seconds(3),
-                label: "snoring".into(),
-                confidence: 0.9,
-                threshold: 0.5,
-                source: "apple-soundanalysis-v1".into(),
-                end_reason: "normal".into(),
-            })
+        db.insert_recording(&recording_draft("new", start + chrono::Duration::hours(2)))
             .unwrap();
-        // Zero, not an error: the caller has to report "no audio behind this".
-        assert_eq!(written, 0);
-    }
+        db.insert_recording(&recording_draft("old", start)).unwrap();
+        db.insert_episode(&episode("ep", Some("old"), start)).unwrap();
 
-    #[test]
-    fn migrations_are_idempotent_and_enable_foreign_keys() {
-        let db = Database::in_memory().unwrap();
-        db.migrate().unwrap();
-        let version: i32 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-        assert_eq!(version, 4);
-        // Each version is additive and both must be present after an in-place
-        // upgrade of an older database.
-        let transcripts: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM segment_transcripts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(transcripts, 0);
-        let utterances: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM utterances", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(utterances, 0);
-        let foreign_keys: i32 = db.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
-        assert_eq!(foreign_keys, 1);
-    }
+        let ordered = db.recordings_oldest_first().unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].id, "old");
+        assert_eq!(ordered[1].id, "new");
 
-    #[test]
-    fn segment_event_and_gap_constraints_and_queries_work() {
-        let db = Database::in_memory().unwrap();
-        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        db.insert_segment_started(&segment("seg", start, "2025/01/01/test.wav")).unwrap();
-        let completed = SegmentCompleted {
-            id: "seg".into(), ended_at_utc: start + chrono::Duration::hours(1), frame_count: 57_600_000,
-            size_bytes: 115_200_044, end_reason: "duration".into(), clock_drift_ppm: Some(4.2),
-            xrun_count: 1, gap_count: 1, lost_frames_total: 80, status: SegmentStatus::Complete,
-        };
-        db.complete_segment(&completed).unwrap();
-        let gap = GapRecord {
-            offset_frames: 16_000, lost_frames: 80, kind: GapKind::Xrun,
-            estimate_source: EstimateSource::Timestamp, at_utc: start + chrono::Duration::seconds(1),
-        };
-        db.insert_gap("seg", &gap).unwrap();
-        db.insert_event(&event("evt", "seg", start + chrono::Duration::seconds(2))).unwrap();
-        let rows = db.events_between(start, start + chrono::Duration::hours(1)).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].review_status, "unreviewed");
-        assert_eq!(db.gaps_for_segment("seg").unwrap().len(), 1);
-        assert_eq!(db.segment("seg").unwrap().unwrap().status, "complete");
-        assert_eq!(db.event_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn foreign_keys_reject_unknown_segment_events() {
-        let db = Database::in_memory().unwrap();
-        let t = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        assert!(db.insert_event(&event("evt", "missing", t)).is_err());
+        assert!(db.delete_recording("old").unwrap());
+        assert!(!db.delete_recording("old").unwrap());
+        // The snore outlives the audio: the row stays, its pointer is cleared.
+        let kept = db.episode("ep").unwrap().expect("episode stays");
+        assert_eq!(kept.recording_id, None);
+        assert_eq!(db.pool_summary().unwrap().recordings, 1);
     }
 
     #[test]
@@ -1134,12 +615,138 @@ mod tests {
         assert_eq!(ReviewStatus::try_from("snore").unwrap(), ReviewStatus::Snore);
         assert!(ReviewStatus::try_from("maybe").is_err());
         let db = Database::in_memory().unwrap();
-        let t = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        db.insert_segment_started(&segment("seg", t, "a.wav")).unwrap();
-        db.insert_event(&event("evt", "seg", t)).unwrap();
-        assert!(db.set_review_status("evt", ReviewStatus::NotSnore).unwrap());
-        assert!(!db.set_review_status("absent", ReviewStatus::Snore).unwrap());
-        assert_eq!(db.event("evt").unwrap().unwrap().review_status, "not_snore");
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        db.insert_episode(&episode("ep", None, start)).unwrap();
+
+        assert!(db.set_episode_review("ep", ReviewStatus::NotSnore).unwrap());
+        assert!(!db.set_episode_review("absent", ReviewStatus::Snore).unwrap());
+        assert_eq!(
+            db.episode("ep").unwrap().unwrap().review_status,
+            ReviewStatus::NotSnore
+        );
+        assert_eq!(
+            db.episodes_between(start, start + chrono::Duration::hours(1))
+                .unwrap()[0]
+                .review_status,
+            ReviewStatus::NotSnore
+        );
+    }
+
+    #[test]
+    fn episodes_and_transcripts_are_found_by_time_range() {
+        let db = Database::in_memory().unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        db.insert_recording(&recording_draft("rec", start)).unwrap();
+
+        // One rule episode and one classifier episode, both unattached: the
+        // recording row is written when the file closes, which can be after the
+        // event.
+        db.insert_episode(&episode("ep-rule", None, start + chrono::Duration::seconds(10)))
+            .unwrap();
+        db.insert_episode(
+            &ClassifiedEvent {
+                started_at_utc: start + chrono::Duration::seconds(30),
+                ended_at_utc: start + chrono::Duration::seconds(33),
+                label: "snoring".into(),
+                confidence: 0.9,
+                threshold: 0.5,
+                source: "apple-soundanalysis-v1".into(),
+            }
+            .episode_row(None),
+        )
+        .unwrap();
+        db.insert_transcript(&TranscriptRow {
+            id: "utt-1".into(),
+            recording_id: None,
+            started_at_utc: start + chrono::Duration::seconds(20),
+            ended_at_utc: start + chrono::Duration::seconds(21),
+            text: "good night".into(),
+            engine: "apple-speech".into(),
+            language: Some("en-US".into()),
+            created_at_utc: start,
+        })
+        .unwrap();
+
+        let early = db
+            .episodes_between(start, start + chrono::Duration::seconds(25))
+            .unwrap();
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].id, "ep-rule");
+        assert_eq!(early[0].label, None);
+        assert_eq!(early[0].confidence, Some(0.7));
+
+        let all = db
+            .episodes_between(start, start + chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].source, "apple-soundanalysis-v1");
+        assert_eq!(all[1].label.as_deref(), Some("snoring"));
+
+        let quiet = db
+            .transcripts_between(start, start + chrono::Duration::seconds(5))
+            .unwrap();
+        assert!(quiet.is_empty());
+        let spoken = db
+            .transcripts_between(start, start + chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!(spoken.len(), 1);
+        assert_eq!(spoken[0].text, "good night");
+        assert_eq!(spoken[0].recording_id, None);
+    }
+
+    #[test]
+    fn an_episode_and_a_transcript_without_a_recording_are_accepted() {
+        let db = Database::in_memory().unwrap();
+        let start = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        // No `recordings` row at all: both must still insert, because the audio
+        // that carried them may have been rotated away already.
+        db.insert_episode(&episode("ep", None, start)).unwrap();
+        db.insert_transcript(&TranscriptRow {
+            id: "t".into(),
+            recording_id: None,
+            started_at_utc: start,
+            ended_at_utc: start + chrono::Duration::seconds(1),
+            text: "hi".into(),
+            engine: "apple-speech".into(),
+            language: None,
+            created_at_utc: start,
+        })
+        .unwrap();
+        assert_eq!(
+            db.episodes_between(start, start + chrono::Duration::hours(1))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.transcripts_between(start, start + chrono::Duration::hours(1))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn migrations_are_idempotent_and_leave_only_the_three_tables() {
+        let db = Database::in_memory().unwrap();
+        db.migrate().unwrap();
+        let version: i32 = db.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, newest_version());
+
+        let mut tables: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        tables.retain(|name| !name.starts_with("_sqlx"));
+        tables.retain(|name| !name.starts_with("sqlite_"));
+        assert_eq!(tables, vec!["episodes", "recordings", "transcripts"]);
+
+        let foreign_keys: i32 = db.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+        assert_eq!(foreign_keys, 1);
     }
 
     #[test]
@@ -1151,15 +758,39 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_segments_are_returned_for_a_local_day_range() {
+    fn annotations_written_before_the_file_are_linked_when_it_closes() {
         let db = Database::in_memory().unwrap();
-        let t = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        db.insert_segment_started(&segment("seg", t, "a.wav")).unwrap();
-        db.complete_segment(&SegmentCompleted {
-            id: "seg".into(), ended_at_utc: t + chrono::Duration::hours(2), frame_count: 0, size_bytes: 44,
-            end_reason: "duration".into(), clock_drift_ppm: None, xrun_count: 0, gap_count: 0,
-            lost_frames_total: 0, status: SegmentStatus::Complete,
-        }).unwrap();
-        assert_eq!(db.segments_between(t + chrono::Duration::hours(1), t + chrono::Duration::hours(3)).unwrap().len(), 1);
+        let started = Utc::now();
+        let ended = started + chrono::Duration::seconds(60);
+        db.insert_episode(&EpisodeRow {
+            id: "e1".into(),
+            recording_id: None,
+            started_at_utc: started + chrono::Duration::seconds(10),
+            ended_at_utc: started + chrono::Duration::seconds(15),
+            source: "rule-v1".into(),
+            label: None,
+            confidence: Some(0.8),
+            review_status: ReviewStatus::Unreviewed,
+            created_at_utc: started,
+        })
+        .unwrap();
+        db.insert_recording(&RecordingDraft {
+            id: "r1".into(),
+            relative_path: PathBuf::from("recordings/r1.wav"),
+            started_at_utc: started,
+            ended_at_utc: ended,
+            capture_rate_hz: 16_000,
+            channels: 1,
+            frame_count: 960_000,
+            size_bytes: 1_920_000,
+            lost_frames: 0,
+        })
+        .unwrap();
+        let episode = db.episode("e1").unwrap().expect("episode");
+        assert_eq!(
+            episode.recording_id.as_deref(),
+            Some("r1"),
+            "an annotation produced before its file closed must be linked by wall clock"
+        );
     }
 }

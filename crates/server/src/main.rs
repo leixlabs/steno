@@ -34,10 +34,10 @@ use steno_lib::error::{Error, Result};
 use steno_server::http_server::{self, HttpState, MicrophoneState, RecordingState, RuntimeStatus};
 use steno_lib::metrics::{DetectorState, Metrics};
 use steno_server::net_capture;
-use steno_server::recorder::{WavFormat, WavRecorder, payload_limit, segment_relative_path};
+use steno_server::recorder::{WavFormat, WavRecorder, payload_limit, recording_relative_path};
 use steno_server::recovery;
 use steno_server::retention::{RetentionConfig, RetentionManager};
-use steno_server::storage::{Database, SegmentCompleted, SegmentStatus};
+use steno_server::storage::{Database, EpisodeRow, RecordingDraft};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -136,13 +136,7 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
             if !report.recovered.is_empty() {
                 tracing::warn!(
                     count = report.recovered.len(),
-                    "recovered interrupted recordings"
-                );
-            }
-            if !report.restored.is_empty() {
-                tracing::warn!(
-                    count = report.restored.len(),
-                    "restored segments a previous scan had marked missing"
+                    "recovered .partial files into recordings"
                 );
             }
             for partial in &report.unverifiable {
@@ -150,6 +144,9 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
             }
             for orphan in &report.orphans {
                 tracing::warn!(path = %orphan.display(), "WAV file has no database row");
+            }
+            for id in &report.missing {
+                tracing::warn!(recording_id = %id, "recording row has no file on disk");
             }
             if !report.unverifiable.is_empty() || !report.orphans.is_empty() {
                 metrics.degraded.store(true, Ordering::Relaxed);
@@ -300,7 +297,6 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
         recording_queue: Arc::clone(&recording_queue),
         detection_queue: Arc::clone(&detection_queue),
         stt_queue: stt_queue.clone(),
-        db: db_handle.clone(),
         shutting_down: Arc::clone(&shutting_down),
         negotiated: wire.clone(),
     });
@@ -511,9 +507,11 @@ fn run(config: Arc<Config>) -> steno_lib::error::Result<()> {
 /// This still honours SIGTERM/SIGINT: without a capture pipeline there is no
 /// segment to close, but the process must remain stoppable like any other
 /// service rather than needing `kill -9`.
-/// True when audio should be mirrored into the recogniser lane.
+/// True when audio should be mirrored into the recogniser lane. Streaming is the
+/// only mode the configuration accepts; there is no per-file transcription lane
+/// left to gate against.
 fn starts_streaming(config: &Config) -> bool {
-    config.stt.enabled && config.stt.mode == steno_lib::config::SttMode::Stream
+    config.stt.enabled
 }
 
 /// Starts the speech-to-text worker when `[stt] enabled = true`.
@@ -531,64 +529,37 @@ fn start_transcription(
         return None;
     }
     metrics.set_stt_engine(config.stt.engine.clone());
-    if config.stt.mode == steno_lib::config::SttMode::Stream {
-        let Some(queue) = stt_queue else {
-            tracing::warn!("streaming speech-to-text has no audio lane; it will stay idle");
-            return None;
-        };
-        let socket_path = if config.stt.socket_path.trim().is_empty() {
-            std::env::temp_dir().join(format!("steno-stt-{}.sock", std::process::id()))
-        } else {
-            std::path::PathBuf::from(config.stt.socket_path.trim())
-        };
-        // Recorded before the worker starts so the control centre shows the
-        // socket that is really in use (an empty config value is resolved here).
-        metrics.set_stt_launch(
-            config.stt.stream_command.clone(),
-            vec![socket_path.display().to_string()],
-        );
-        let options = steno_server::stt_stream::StreamOptions {
-            socket_path,
-            launcher: config.stt.stream_command.clone(),
-            engine: config.stt.engine.clone(),
-            locale: config.stt.locale.clone(),
-            database_path: config.storage.database_path.clone(),
-            ready_timeout: Duration::from_secs(30),
-            restart_delay: Duration::from_secs(5),
-        };
-        return match steno_server::stt_stream::spawn(queue, options, metrics, shutting_down, hub) {
-            Ok(handle) => {
-                tracing::info!(engine = %config.stt.engine, "streaming speech-to-text enabled");
-                Some(handle)
-            }
-            Err(error) => {
-                tracing::error!(%error, "cannot start the streaming speech-to-text worker");
-                None
-            }
-        };
-    }
-    metrics.set_stt_launch(config.stt.command.clone(), config.stt.args.clone());
-    let transcriber: Arc<dyn steno_server::stt::Transcriber> =
-        Arc::new(steno_server::stt::CommandTranscriber::new(
-            config.stt.command.clone(),
-            config.stt.args.clone(),
-            config.stt.engine.clone(),
-        ));
-    let options = steno_server::stt::WorkerOptions {
-        database_path: config.storage.database_path.clone(),
-        recording_dir: config.storage.recording_dir.clone(),
-        engine: config.stt.engine.clone(),
-        min_segment_seconds: config.stt.min_segment_seconds as f64,
-        poll_interval: Duration::from_secs(config.stt.poll_interval_seconds),
-        batch: 4,
+    let Some(queue) = stt_queue else {
+        tracing::warn!("streaming speech-to-text has no audio lane; it will stay idle");
+        return None;
     };
-    match steno_server::stt::spawn(transcriber, options, shutting_down) {
+    let socket_path = if config.stt.socket_path.trim().is_empty() {
+        std::env::temp_dir().join(format!("steno-stt-{}.sock", std::process::id()))
+    } else {
+        std::path::PathBuf::from(config.stt.socket_path.trim())
+    };
+    // Recorded before the worker starts so the control centre shows the
+    // socket that is really in use (an empty config value is resolved here).
+    metrics.set_stt_launch(
+        config.stt.stream_command.clone(),
+        vec![socket_path.display().to_string()],
+    );
+    let options = steno_server::stt_stream::StreamOptions {
+        socket_path,
+        launcher: config.stt.stream_command.clone(),
+        engine: config.stt.engine.clone(),
+        locale: config.stt.locale.clone(),
+        database_path: config.storage.database_path.clone(),
+        ready_timeout: Duration::from_secs(30),
+        restart_delay: Duration::from_secs(5),
+    };
+    match steno_server::stt_stream::spawn(queue, options, metrics, shutting_down, hub) {
         Ok(handle) => {
-            tracing::info!(engine = %config.stt.engine, "speech-to-text enabled");
+            tracing::info!(engine = %config.stt.engine, "streaming speech-to-text enabled");
             Some(handle)
         }
         Err(error) => {
-            tracing::error!(%error, "cannot start the speech-to-text worker");
+            tracing::error!(%error, "cannot start the streaming speech-to-text worker");
             None
         }
     }
@@ -654,7 +625,7 @@ fn spawn_recorder_worker(
     thread::Builder::new()
         .name("steno-recorder".into())
         .spawn(move || {
-            let mut open: Option<(String, WavRecorder, SegmentEndMeta)> = None;
+            let mut open: Option<(String, WavRecorder, RecordingEndMeta)> = None;
             let mut ok = true;
             loop {
                 match queue.pop_timeout(Duration::from_millis(100)) {
@@ -674,12 +645,11 @@ fn spawn_recorder_worker(
                     PopOutcome::Closed => break,
                 }
             }
-            // Queue closed: flush whatever segment is still open.
+            // Queue closed: flush whatever recording is still open.
             if let Some((id, recorder, meta)) = open.take()
-                && let Err(error) =
-                    finish_segment(&db, id, recorder, meta, SegmentEndReason::Shutdown)
+                && let Err(error) = finish_recording(&db, id, recorder, meta)
             {
-                tracing::error!(%error, "failed to finish the final segment");
+                tracing::error!(%error, "failed to finish the final recording");
                 ok = false;
             }
             ok
@@ -687,18 +657,21 @@ fn spawn_recorder_worker(
         .map_err(|e| steno_lib::error::Error::Internal(format!("recorder thread: {e}")))
 }
 
-/// Ending metadata the recorder needs to write a complete row.
+/// Ending metadata the recorder needs to publish a complete `recordings` row.
 #[derive(Debug, Clone)]
-struct SegmentEndMeta {
+struct RecordingEndMeta {
     started_at_utc: chrono::DateTime<chrono::Utc>,
     capture_rate_hz: u32,
+    channels: u16,
+    /// The path this file was created under, relative to `recording_dir`.
+    relative_path: PathBuf,
 }
 
 fn handle_recorder_message(
     config: &Config,
     db: &steno_server::db_writer::DbWriterHandle,
     metrics: &Metrics,
-    open: &mut Option<(String, WavRecorder, SegmentEndMeta)>,
+    open: &mut Option<(String, WavRecorder, RecordingEndMeta)>,
     message: DispatcherMessage,
 ) -> steno_lib::error::Result<()> {
     match message {
@@ -708,11 +681,11 @@ fn handle_recorder_message(
             format,
             ..
         } => {
-            // A segment can only start once the previous one has been closed.
+            // A window can only start once the previous one has been closed.
             if let Some((id, recorder, meta)) = open.take() {
-                finish_segment(db, id, recorder, meta, SegmentEndReason::Duration)?;
+                finish_recording(db, id, recorder, meta)?;
             }
-            let rel = segment_relative_path(started_at_utc, &segment_id);
+            let rel = recording_relative_path(started_at_utc, &segment_id);
             let wav_format = WavFormat::new(format.rate_hz, format.channels)?;
             let recorder = WavRecorder::create(
                 &config.storage.recording_dir,
@@ -724,9 +697,11 @@ fn handle_recorder_message(
             *open = Some((
                 segment_id,
                 recorder,
-                SegmentEndMeta {
+                RecordingEndMeta {
                     started_at_utc,
                     capture_rate_hz: format.rate_hz,
+                    channels: format.channels,
+                    relative_path: rel,
                 },
             ));
         }
@@ -758,17 +733,14 @@ fn handle_recorder_message(
             }
         }
         DispatcherMessage::Gap { .. } => {
-            // Gaps are registered with the DB by the dispatcher; the recorder only
-            // needs to know the stored-frame timeline, which the dispatcher owns.
+            // Gaps are timing facts; the recorder only needs the stored-frame
+            // timeline, which the dispatcher already accounted for in the offset
+            // it puts on each audio block.
         }
-        DispatcherMessage::SegmentEnd {
-            segment_id,
-            end_reason,
-            ..
-        } => {
+        DispatcherMessage::SegmentEnd { segment_id, .. } => {
             let Some((current_id, recorder, meta)) = open.take() else {
                 return Err(steno_lib::error::Error::Internal(format!(
-                    "SegmentEnd for {segment_id} with no open segment"
+                    "SegmentEnd for {segment_id} with no open recording"
                 )));
             };
             if current_id != segment_id {
@@ -776,37 +748,63 @@ fn handle_recorder_message(
                     "SegmentEnd for {segment_id} while {current_id} is open"
                 )));
             }
-            finish_segment(db, current_id, recorder, meta, end_reason)?;
+            finish_recording(db, current_id, recorder, meta)?;
         }
     }
     Ok(())
 }
 
-/// Completes a segment: update the header, sync, rename, then tell the DB.
-fn finish_segment(
+/// Completes a recording: update the header, sync, rename, then publish the row.
+///
+/// This is the only writer of `recordings`: the length is known only here, and
+/// the dispatcher's window is a timing boundary rather than a stored fact.
+fn finish_recording(
     db: &steno_server::db_writer::DbWriterHandle,
     id: String,
     recorder: WavRecorder,
-    meta: SegmentEndMeta,
-    reason: SegmentEndReason,
+    meta: RecordingEndMeta,
 ) -> steno_lib::error::Result<()> {
-    let (_path, frames, size_bytes) = recorder.close()?;
+    let (path, frames, size_bytes) = recorder.close()?;
     let ended_at = meta.started_at_utc
         + chrono::Duration::from_std(Duration::from_secs_f64(
             frames as f64 / f64::from(meta.capture_rate_hz.max(1)),
         ))
         .unwrap_or_else(|_| chrono::Duration::zero());
-    db.segment_completed(SegmentCompleted {
+    // A window is kept only if something happened in it. Two independent reasons:
+    // an annotation (text or an episode) landed inside it, or it is empty — which
+    // never is, so an empty window is removed rather than stored as a 44-byte file.
+    //
+    // The annotation count is the whole test on purpose. The recogniser and the
+    // rule detector both write before this runs, so "nothing was said and nothing
+    // sounded" is what zero means; the fallback that used to live here (peak above
+    // -45 dBFS) is gone with the per-block level tracking, and the rule detector
+    // now covers that case on its own.
+    let annotations = db
+        .count_between(meta.started_at_utc, ended_at, Duration::from_secs(2))
+        .unwrap_or(0);
+    if frames == 0 || annotations == 0 {
+        std::fs::remove_file(&path).map_err(|error| steno_lib::error::Error::io(&path, error))?;
+        tracing::info!(
+            path = %path.display(),
+            frames,
+            annotations,
+            "window had nothing in it; file removed and no row written"
+        );
+        return Ok(());
+    }
+
+    db.recording(RecordingDraft {
         id,
+        relative_path: meta.relative_path,
+        started_at_utc: meta.started_at_utc,
         ended_at_utc: ended_at,
+        capture_rate_hz: meta.capture_rate_hz,
+        channels: meta.channels,
         frame_count: frames,
         size_bytes,
-        end_reason: reason.as_str().to_string(),
-        clock_drift_ppm: None,
-        xrun_count: 0,
-        gap_count: 0,
-        lost_frames_total: 0,
-        status: SegmentStatus::Complete,
+        // The recorder sees only whole frames; anything the dispatcher dropped
+        // before the block reached this file is not in the WAV.
+        lost_frames: 0,
     })
     .map_err(steno_lib::error::Error::Internal)
 }
@@ -957,14 +955,29 @@ impl DetectorWorker {
         }
     }
 
-    /// Sends freshly produced events to the DB writer and counts them. An event
+    /// Sends freshly produced episodes to the DB writer and counts them. An event
     /// that cannot be enqueued is reported rather than silently dropped.
     fn deliver(&mut self, drained: Vec<EventDraft>) -> Result<()> {
         for event in drained {
             self.metrics.events_total.fetch_add(1, Ordering::Relaxed);
+            // The rule lane has no label; its score is the confidence.
+            let episode = EpisodeRow {
+                id: event.id,
+                // The recording row is written when the file closes, which is
+                // after this event; the link is left open rather than pointing at
+                // a row that does not exist yet.
+                recording_id: None,
+                started_at_utc: event.started_at_utc,
+                ended_at_utc: event.ended_at_utc,
+                source: "rule-v1".to_string(),
+                label: None,
+                confidence: event.rule_score,
+                review_status: steno_server::storage::ReviewStatus::Unreviewed,
+                created_at_utc: chrono::Utc::now(),
+            };
             self.db
-                .event(event)
-                .map_err(|e| Error::Internal(format!("event write failed: {e}")))?;
+                .episode(episode)
+                .map_err(|e| Error::Internal(format!("episode write failed: {e}")))?;
         }
         Ok(())
     }

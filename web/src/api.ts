@@ -39,17 +39,16 @@ export interface Status {
     event_fk_retries: number
   }
   storage: {
-    /** null when the database could not answer — not the same as an empty pool. */
-    used_bytes: number | null
+    /** Bytes in the recordings table; null when the database could not answer. */
+    bytes: number | null
     max_bytes: number
     cleanup_target_bytes: number
     reserve_bytes: number
     free_bytes: number | null
     recording_dir: string
     storage_pressure: boolean
-    segment_count: number | null
-    oldest_started_at_utc: string | null
-    newest_ended_at_utc: string | null
+    /** Rows the byte total is made of. */
+    recordings: number | null
   }
   capture: {
     /** Peak of the newest block, in dBFS; null before the first block. */
@@ -159,45 +158,51 @@ export interface Utterance {
   text: string
 }
 
-export interface Segment {
+/** One written WAV file: a stretch of audio the server has on disk. */
+export interface Recording {
   id: string
   started_at_utc: string
-  ended_at_utc: string | null
+  ended_at_utc: string
+  capture_rate_hz: number
+  channels: number
+  frame_count: number
+  size_bytes: number
   duration_ms: number
-  status: string
-  time_quality: string
-  end_reason: string | null
-  gap_count: number
-  xrun_count: number
-  lost_frames_total: number
-  clock_drift_ppm: number | null
+  lost_frames: number
   audio_url: string
 }
 
 /**
- * A segment the detector flagged as *candidate*. It is not a diagnosis: the
+ * One snore the detector or the classifier reported. It is not a diagnosis: the
  * labels below only record what the reviewer decided.
+ *
+ * Two annotators write these rows and the page must not mix them up: the
+ * server's own `rule-v1` (band energy above the noise floor — it fires on
+ * speech, a TV and a bed-time story just as readily as on snoring) and the
+ * sidecar's `apple-soundanalysis-v1` (a classifier that returns the label
+ * `snoring` with a confidence). `source` carries the name in both cases, which
+ * is how a row can be told apart.
  */
-export interface CandidateEvent {
+export interface Episode {
   id: string
-  segment_id: string
+  /** The recording that holds this episode's audio; null when none is known. */
+  recording_id: string | null
   started_at_utc: string
   ended_at_utc: string
   duration_ms: number
-  rule_score: number | null
-  peak_dbfs: number | null
-  mean_level_dbfs: number | null
-  mean_band_ratio: number | null
+  /** `rule-v1` or `apple-soundanalysis-v1`. */
+  source: string
+  label: string | null
+  confidence: number | null
   review_status: 'snore' | 'not_snore' | 'unreviewed'
-  continued: boolean
 }
 
 export interface Day {
   date: string
-  segment_count: number
-  event_count: number
+  recording_count: number
+  episode_count: number
   recorded_ms: number
-  lost_frames_total: number
+  lost_frames: number
 }
 
 async function get<T>(path: string): Promise<T> {
@@ -238,13 +243,13 @@ export const api = {
     return data.days
   },
 
-  async segments(date: string): Promise<Segment[]> {
-    const data = await get<{ segments: Segment[] }>(`/api/v1/segments?date=${date}`)
-    return data.segments
+  async recordings(date: string): Promise<Recording[]> {
+    const data = await get<{ recordings: Recording[] }>(`/api/v1/recordings?date=${date}`)
+    return data.recordings
   },
 
-  async events(date: string): Promise<CandidateEvent[]> {
-    const data = await get<{ events: CandidateEvent[] }>(`/api/v1/events?date=${date}`)
+  async events(date: string): Promise<Episode[]> {
+    const data = await get<{ events: Episode[] }>(`/api/v1/events?date=${date}`)
     return data.events
   },
 

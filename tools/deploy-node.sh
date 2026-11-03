@@ -2,8 +2,14 @@
 # One-shot deployment of the capture node (crates/node) to a Raspberry Pi.
 #
 # Cross-compiles the node for armv7 with cargo-zigbuild, pins glibc 2.28, then
-# installs the binary, config, service user and systemd unit on the device and
-# restarts it. Idempotent: re-running it upgrades in place.
+# installs the binary, config, service user and systemd unit on the device,
+# enables the unit at boot and restarts it. Idempotent: re-running it upgrades in
+# place.
+#
+# Enable-at-boot is the default because a bedside capture node that does not
+# come back after a power cut is not a whole-night recorder: it is a device that
+# records until the first power failure and then quietly stops. `--no-enable`
+# exists for the case where the boot state is deliberately someone else's.
 #
 # Why zigbuild and not `cross`: cross ships a glibc 2.31 image, which refuses to
 # run on Raspberry Pi OS buster (2.28). See docs/operations/2026-10-29-pi-deploy.md §3.1.
@@ -27,11 +33,14 @@ DEVICE_ID=1
 DEVICE_NAME=""
 ALSA_DEVICE=""
 DO_BUILD=1
-DO_ENABLE=0
+DO_ENABLE=1
 DRY_RUN=0
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Header is prose that grows; derive its end instead of hardcoding a range.
+  local last
+  last="$(grep -n '^set -euo pipefail' "${BASH_SOURCE[0]}" | head -1 | cut -d: -f1)"
+  sed -n "2,$((last - 2))p" "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   cat <<'EOF'
 
 Options:
@@ -43,7 +52,8 @@ Options:
   --device-name NAME   label shown in /status (default: the Pi's hostname)
   --alsa-device NAME   CPAL device description; omit to keep the Pi's current value
   --no-build           reuse target/<target>/release/steno-node as-is
-  --enable             also enable at boot (default: leave the boot state alone)
+  --enable             enable at boot (the default; kept for muscle memory)
+  --no-enable          leave the boot state alone
   --dry-run            print what would happen, change nothing
   -h, --help           this text
 EOF
@@ -60,6 +70,7 @@ while [ $# -gt 0 ]; do
     --alsa-device) ALSA_DEVICE="$2"; shift 2 ;;
     --no-build) DO_BUILD=0; shift ;;
     --enable) DO_ENABLE=1; shift ;;
+    --no-enable) DO_ENABLE=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -253,12 +264,18 @@ else
 fi
 
 # --- 6. (re)start and verify ------------------------------------------------
+# `enable --now` is not enough here: `--now` only *starts* a unit, so a node that
+# was already running would keep executing the binary this deploy just replaced.
+# Enable and restart are two separate promises — persist across a power cut, and
+# run the build that was just installed.
 say "restarting steno-node"
 if [ "$DO_ENABLE" = 1 ]; then
-  run remote 'sudo -n systemctl enable --now steno-node'
-else
-  run remote 'sudo -n systemctl restart steno-node'
+  # Enable first, and fail the deploy if it does not stick: a node that comes
+  # back from a power cut unstarted is the failure this default exists to avoid.
+  run remote 'sudo -n systemctl enable steno-node' \
+    || die "could not enable steno-node at boot"
 fi
+run remote 'sudo -n systemctl restart steno-node'
 
 if [ "$DRY_RUN" = 1 ]; then
   say "dry run complete; nothing changed"
@@ -271,6 +288,17 @@ if [ "$STATE" != "active" ]; then
   printf '\n--- last log lines ---\n' >&2
   remote 'sudo -n journalctl -u steno-node -n 30 --no-pager' >&2 || true
   die "steno-node is $STATE"
+fi
+
+# `is-active` says nothing about the next boot, which is exactly the state the
+# last Pi deployment was left in: running tonight, absent after the first power
+# cut. Read the unit file state back instead of trusting the enable that ran.
+if [ "$DO_ENABLE" = 1 ]; then
+  BOOT_STATE="$(remote 'systemctl is-enabled steno-node' || true)"
+  case "$BOOT_STATE" in
+    enabled|enabled-runtime|static) say "enabled at boot: $BOOT_STATE" ;;
+    *) die "steno-node is running but not enabled at boot (is-enabled: $BOOT_STATE)" ;;
+  esac
 fi
 
 ALSA_MSG="$(remote 'sudo -n journalctl -u steno-node -n 200 --no-pager -o cat | grep -iE "capture device negotiated|no usable capture|MultipleDevices|DeviceNotFound|capture running" | tail -2' || true)"
